@@ -1,0 +1,25 @@
+[package]
+name = "qubit-operation"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+authors = ["Haixing Hu <starfish.hu@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/qubit-ltd/rs-operation"
+homepage = "https://qubit-ltd.github.io/rs-operation/"
+documentation = "https://docs.rs/qubit-operation"
+description = "Managed operation lifecycles and composition for Rust"
+readme = "README.md"
+keywords = ["operation", "lifecycle", "cancellation", "async", "composition"]
+categories = ["asynchronous", "concurrency", "rust-patterns"]
+include = ["/Cargo.toml", "/LICENSE", "/README.md", "/README.zh_CN.md", "/src/**", "/doc/**"]
+
+[lib]
+name = "qubit_operation"
+doctest = true
+
+[features]
+default = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
