@@ -145,7 +145,7 @@ fn cancelled_pipeline_keeps_input_owned_until_the_helper_exits_then_cleans_once(
 }
 
 #[test]
-fn upload_error_remains_primary_when_resource_cleanup_also_panics() {
+fn upload_error_remains_primary_when_cleanup_panic_leaves_release_unconfirmed() {
     let supervisor = OperationSupervisor::new(SupervisorLimits::default());
     let mut operation = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
@@ -172,12 +172,13 @@ fn upload_error_remains_primary_when_resource_cleanup_also_panics() {
     );
     let settlement = operation
         .released_blocking()
-        .expect("cleanup panic has a stable settlement report");
-    assert_eq!(settlement.cleanup_failures.len(), 1);
+        .expect("cleanup panic has a stable settlement snapshot");
     assert_eq!(
-        settlement.cleanup_failures[0].summary.as_str(),
-        "cleanup panicked"
+        settlement.resource_phase,
+        qubit_operation::report::ResourcePhase::Unconfirmed
     );
+    assert_eq!(settlement.unconfirmed_count, 1);
+    assert!(!settlement.all_released);
 }
 
 #[test]
