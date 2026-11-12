@@ -18,6 +18,7 @@ struct GateCleanup {
 struct RecoveryCleanup {
     id: Arc<std::sync::Mutex<Option<qubit_operation::report::ResourceId>>>,
     registry: qubit_operation::resource::RecoveryRegistry,
+    typed_key: Arc<std::sync::Mutex<Option<qubit_operation::report::RecoveryKey<String>>>>,
 }
 
 impl qubit_operation::protocol::OwnedCleanup for RecoveryCleanup {
@@ -36,10 +37,11 @@ impl qubit_operation::protocol::OwnedCleanup for RecoveryCleanup {
             .lock()
             .unwrap()
             .expect("resource ID set before cleanup");
-        let (_, owner) = self
+        let (typed_key, owner) = self
             .registry
             .register_with_capsule(id, String::from("capsule"), String::from("failure owner"))
             .unwrap();
+        *self.typed_key.lock().unwrap() = Some(typed_key);
         let failure = qubit_operation::report::CleanupFailure {
             resource_id: id,
             stage: qubit_operation::report::CleanupStage::Removing,
@@ -48,6 +50,22 @@ impl qubit_operation::protocol::OwnedCleanup for RecoveryCleanup {
         };
         Box::pin(std::future::ready(
             qubit_operation::report::CleanupOutcome::FailedWithRecovery(failure, owner),
+        ))
+    }
+}
+
+struct CountCleanup(Arc<std::sync::atomic::AtomicUsize>);
+
+impl qubit_operation::protocol::OwnedCleanup for CountCleanup {
+    fn begin(
+        self: Box<Self>,
+        _: qubit_operation::protocol::CleanupContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = qubit_operation::report::CleanupOutcome> + Send>,
+    > {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::ready(
+            qubit_operation::report::CleanupOutcome::Cleaned,
         ))
     }
 }
@@ -109,6 +127,12 @@ impl Wake for ThreadWake {
     fn wake_by_ref(self: &std::sync::Arc<Self>) {
         self.0.unpark();
     }
+}
+
+struct WakerProbe;
+
+impl Wake for WakerProbe {
+    fn wake(self: Arc<Self>) {}
 }
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     let waker = Waker::from(std::sync::Arc::new(ThreadWake(std::thread::current())));
@@ -312,6 +336,87 @@ fn async_shutdown_returns_reusable_observer_after_timeout() {
 }
 
 #[test]
+fn timed_out_shutdown_observer_unregisters_its_waker() {
+    let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+    let gate = gate::Gate::new();
+    let body_gate = gate.clone();
+    let mut operation = supervisor
+        .start::<_, _, (), std::convert::Infallible>(ScopeOptions::default(), move |_| async move {
+            body_gate.wait().await;
+            Ok(())
+        })
+        .unwrap();
+    gate.wait_started();
+    supervisor.close();
+
+    use qubit_operation::context::Deadline;
+    use qubit_operation::report::{ClockDomainId, MonotonicTime};
+    let clock = Arc::new(manual_clock::ManualClock::new(ClockDomainId(908)));
+    let wake_owner = Arc::new(WakerProbe);
+    let waker = Waker::from(Arc::clone(&wake_owner));
+    let mut context = Context::from_waker(&waker);
+    let observer = supervisor.shutdown_observer();
+    let mut wait = Box::pin(observer.wait_async(
+        Deadline::at(MonotonicTime::new(ClockDomainId(908), 1)),
+        clock.clone(),
+    ));
+    assert!(wait.as_mut().poll(&mut context).is_pending());
+    clock.advance_by(1);
+    assert!(matches!(
+        wait.as_mut().poll(&mut context),
+        Poll::Ready(Ok(_))
+    ));
+    drop(wait);
+    assert_eq!(Arc::strong_count(&wake_owner), 2);
+
+    gate.release();
+    let _ = operation.result_blocking().unwrap();
+    let _ = operation.released_blocking().unwrap();
+}
+
+#[test]
+fn shutdown_observer_waiters_respect_finite_capacity() {
+    let supervisor = OperationSupervisor::new(SupervisorLimits {
+        admission_waiters: 1,
+        ..SupervisorLimits::default()
+    });
+    let gate = gate::Gate::new();
+    let body_gate = gate.clone();
+    let mut operation = supervisor
+        .start::<_, _, (), std::convert::Infallible>(ScopeOptions::default(), move |_| async move {
+            body_gate.wait().await;
+            Ok(())
+        })
+        .unwrap();
+    gate.wait_started();
+    supervisor.close();
+    use qubit_operation::context::Deadline;
+    use qubit_operation::report::{ClockDomainId, MonotonicTime};
+    let clock = Arc::new(manual_clock::ManualClock::new(ClockDomainId(909)));
+    let deadline = Deadline::at(MonotonicTime::new(ClockDomainId(909), 10));
+    let observer = supervisor.shutdown_observer();
+    let first_waker = Waker::noop();
+    let mut first_context = Context::from_waker(first_waker);
+    let mut first_wait = Box::pin(observer.wait_async(deadline, clock.clone()));
+    assert!(first_wait.as_mut().poll(&mut first_context).is_pending());
+
+    let second_waker = Waker::noop();
+    let mut second_context = Context::from_waker(second_waker);
+    let mut second_wait = Box::pin(observer.wait_async(deadline, clock));
+    assert!(matches!(
+        second_wait.as_mut().poll(&mut second_context),
+        Poll::Ready(Err(
+            qubit_operation::context::ContextError::WaiterCapacityExceeded
+        ))
+    ));
+
+    drop(first_wait);
+    gate.release();
+    let _ = operation.result_blocking().unwrap();
+    let _ = operation.released_blocking().unwrap();
+}
+
+#[test]
 fn dropping_last_public_supervisor_clone_cancels_but_observer_does_not_keep_it_public() {
     let supervisor = OperationSupervisor::new(SupervisorLimits::default());
     let another_public = supervisor.clone();
@@ -424,6 +529,8 @@ fn unresolved_recovery_owner_is_reported_as_shutdown_responsibility() {
     let id_for_body = Arc::clone(&id_slot);
     let scope_for_body = Arc::clone(&scope_slot);
     let registry_for_cleanup = cleanup_registry.clone();
+    let typed_key_slot = Arc::new(std::sync::Mutex::new(None));
+    let typed_key_for_cleanup = Arc::clone(&typed_key_slot);
     let mut operation = group
         .start(ScopeOptions::default(), move |scope| async move {
             *scope_for_body.lock().unwrap() = Some(scope.clone());
@@ -431,6 +538,7 @@ fn unresolved_recovery_owner_is_reported_as_shutdown_responsibility() {
                 .register_resource(RecoveryCleanup {
                     id: Arc::clone(&id_for_body),
                     registry: registry_for_cleanup,
+                    typed_key: typed_key_for_cleanup,
                 })
                 .unwrap();
             *id_for_body.lock().unwrap() = Some(id);
@@ -457,6 +565,59 @@ fn unresolved_recovery_owner_is_reported_as_shutdown_responsibility() {
         .shutdown_observer()
         .wait_blocking(std::time::Duration::from_secs(1));
     assert!(complete.report.is_complete());
+}
+
+#[test]
+fn dropping_service_group_retains_and_runs_service_resource_cleanup() {
+    let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+    let group = supervisor.service_group(2).unwrap();
+    let resource_scope = group.resource_scope(1).unwrap();
+    let cleanup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    resource_scope
+        .register_resource(CountCleanup(Arc::clone(&cleanup_calls)))
+        .unwrap();
+
+    drop(resource_scope);
+    drop(group);
+
+    let report =
+        supervisor.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_secs(1));
+    assert!(
+        report.is_complete(),
+        "dropped service group must settle: {report:?}"
+    );
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn service_resource_scope_can_extract_its_typed_recovery_owner() {
+    let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+    let group = supervisor.service_group(2).unwrap();
+    let resource_scope = group.resource_scope(1).unwrap();
+    let id_slot = Arc::new(std::sync::Mutex::new(None));
+    let typed_key_slot = Arc::new(std::sync::Mutex::new(None));
+    let cleanup_registry = qubit_operation::resource::RecoveryRegistry::new(1);
+    let id = resource_scope
+        .register_resource(RecoveryCleanup {
+            id: Arc::clone(&id_slot),
+            registry: cleanup_registry,
+            typed_key: Arc::clone(&typed_key_slot),
+        })
+        .unwrap();
+    *id_slot.lock().unwrap() = Some(id);
+    let report = group.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_secs(1));
+    assert_eq!(report.pending_recovery, 1);
+    let outer_key = resource_scope.take_recovery_key().unwrap();
+    let recovery_owner = resource_scope.take_recovery(outer_key).unwrap();
+    let typed_key = typed_key_slot.lock().unwrap().take().unwrap();
+    assert_eq!(recovery_owner.take(typed_key).unwrap(), "failure owner");
+    assert!(
+        supervisor
+            .shutdown_observer()
+            .wait_blocking(std::time::Duration::from_secs(1))
+            .report
+            .is_complete()
+    );
 }
 
 #[test]

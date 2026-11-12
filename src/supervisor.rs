@@ -19,8 +19,10 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+mod shutdown_wait_registration;
+use shutdown_wait_registration::ShutdownWaitRegistration;
+
 type SharedServiceGroupState = Arc<(Mutex<ServiceGroupState>, std::sync::Condvar)>;
-type WeakServiceGroupState = Weak<(Mutex<ServiceGroupState>, std::sync::Condvar)>;
 
 struct Inner {
     limits: SupervisorLimits,
@@ -31,7 +33,7 @@ struct Inner {
     changed: std::sync::Condvar,
     recovery_registries: Mutex<Vec<RecoveryRegistry>>,
     public_handles: AtomicUsize,
-    service_groups: Mutex<Vec<WeakServiceGroupState>>,
+    service_groups: Mutex<Vec<SharedServiceGroupState>>,
 }
 
 struct State {
@@ -44,7 +46,8 @@ struct State {
     next_waiter: u64,
     cancel: bool,
     contexts: Vec<(Weak<Mutex<LeaseState>>, OperationContext)>,
-    shutdown_waiters: Vec<Waker>,
+    shutdown_waiters: Vec<(u64, Waker)>,
+    next_shutdown_waiter: u64,
 }
 
 #[derive(Default)]
@@ -116,7 +119,8 @@ struct ServiceGroupState {
     mode: ShutdownMode,
     next_id: u64,
     requests: std::collections::BTreeMap<u64, ServiceRequestEntry>,
-    shutdown_waiters: Vec<Waker>,
+    shutdown_waiters: Vec<(u64, Waker)>,
+    next_shutdown_waiter: u64,
     resource_scopes: std::collections::BTreeMap<
         u64,
         (
@@ -245,6 +249,21 @@ impl ServiceResourceScope {
             self.scope.close_body_resources();
         }
     }
+
+    /// Take the one-use recovery key for a cleanup owner retained by this scope.
+    pub fn take_recovery_key(
+        &self,
+    ) -> Option<crate::report::RecoveryKey<crate::report::RecoveryOwner>> {
+        self.scope.take_recovery_key()
+    }
+
+    /// Recover a typed owner using the key returned by [`Self::take_recovery_key`].
+    pub fn take_recovery<R: Send + 'static>(
+        &self,
+        key: crate::report::RecoveryKey<R>,
+    ) -> Result<R, crate::report::RecoveryKey<R>> {
+        self.scope.take_recovery(key)
+    }
 }
 
 impl Drop for ServiceResourceScope {
@@ -301,12 +320,13 @@ impl OperationSupervisor {
                 next_id: 1,
                 requests: std::collections::BTreeMap::new(),
                 shutdown_waiters: Vec::new(),
+                next_shutdown_waiter: 1,
                 resource_scopes: std::collections::BTreeMap::new(),
                 next_resource_id: 1,
             }),
             std::sync::Condvar::new(),
         ));
-        lock(&self.inner.service_groups).push(Arc::downgrade(&state));
+        lock(&self.inner.service_groups).push(Arc::clone(&state));
         Ok(ServiceGroup {
             state,
             supervisor: self.internal_handle(),
@@ -478,6 +498,16 @@ impl ServiceGroup {
     }
 }
 
+impl Drop for ServiceGroup {
+    fn drop(&mut self) {
+        begin_service_group_state(
+            Arc::clone(&self.state),
+            ShutdownMode::Cancel,
+            self.supervisor.internal_handle(),
+        );
+    }
+}
+
 impl Drop for ServiceRequest {
     fn drop(&mut self) {
         if !self.released {
@@ -491,7 +521,7 @@ impl Drop for ServiceRequest {
                 (std::mem::take(&mut state.shutdown_waiters), ())
             };
             changed.notify_all();
-            wake(waiters);
+            wake_shutdown(waiters);
             notify_shutdown(&self.supervisor);
             start_service_resource_cleanup(
                 Arc::clone(&self.state),
@@ -521,6 +551,9 @@ fn start_service_resource_cleanup(state: SharedServiceGroupState, supervisor: Op
             })
             .collect::<Vec<_>>()
     };
+    if ready.is_empty() {
+        remove_completed_service_group(&supervisor, &state);
+    }
     for (id, scope) in ready {
         let task_state = Arc::clone(&state);
         let task_supervisor = supervisor.internal_handle();
@@ -532,8 +565,9 @@ fn start_service_resource_cleanup(state: SharedServiceGroupState, supervisor: Op
                 std::mem::take(&mut guard.shutdown_waiters)
             };
             task_state.1.notify_all();
-            wake(waiters);
+            wake_shutdown(waiters);
             notify_shutdown(&task_supervisor);
+            remove_completed_service_group(&task_supervisor, &task_state);
             drop(task_supervisor);
         });
         if result.is_err() {
@@ -551,7 +585,15 @@ fn notify_shutdown(supervisor: &OperationSupervisor) {
         std::mem::take(&mut state.shutdown_waiters)
     };
     supervisor.inner.changed.notify_all();
-    wake(waiters);
+    wake_shutdown(waiters);
+}
+
+fn retry_service_cleanups_after_capacity_change(inner: &Arc<Inner>) {
+    let supervisor = OperationSupervisor {
+        inner: Arc::clone(inner),
+        public: false,
+    };
+    retry_closed_service_group_cleanups(&supervisor);
 }
 
 fn begin_service_group_state(
@@ -582,24 +624,34 @@ fn begin_service_group_state(
     for context in contexts {
         context.request_stop(crate::report::StopReason::ParentStopped);
     }
-    wake(waiters);
+    wake_shutdown(waiters);
     start_service_resource_cleanup(state, supervisor);
 }
 
 fn retry_closed_service_group_cleanups(supervisor: &OperationSupervisor) {
-    let groups = {
-        let mut groups = lock(&supervisor.inner.service_groups);
-        groups.retain(|group| group.strong_count() > 0);
-        groups.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
-    };
+    let groups = lock(&supervisor.inner.service_groups).clone();
     for group in groups {
         let ready = {
             let state = lock(&group.0);
             state.closed && state.requests.is_empty()
         };
         if ready {
-            start_service_resource_cleanup(group, supervisor.internal_handle());
+            start_service_resource_cleanup(Arc::clone(&group), supervisor.internal_handle());
+            remove_completed_service_group(supervisor, &group);
         }
+    }
+}
+
+fn remove_completed_service_group(
+    supervisor: &OperationSupervisor,
+    group: &SharedServiceGroupState,
+) {
+    let complete = {
+        let state = lock(&group.0);
+        state.closed && state.requests.is_empty() && state.resource_scopes.is_empty()
+    };
+    if complete {
+        lock(&supervisor.inner.service_groups).retain(|candidate| !Arc::ptr_eq(candidate, group));
     }
 }
 
@@ -623,26 +675,30 @@ impl ShutdownObserver {
             ..Default::default()
         });
         let mut timer = context.signal_at(deadline)?;
+        let mut registration = ShutdownWaitRegistration::new(self.0.clone());
         let report = core::future::poll_fn(|cx| {
             let report = self.snapshot();
             if report.is_complete() {
-                return Poll::Ready(report);
+                return Poll::Ready(Ok(report));
             }
             if Pin::new(&mut timer).poll(cx).is_ready() {
-                return Poll::Ready(report);
+                return Poll::Ready(Ok(report));
             }
-            self.register_waker(cx.waker());
+            if let Err(error) = registration.register(cx.waker()) {
+                return Poll::Ready(Err(error));
+            }
             match &self.0 {
                 ShutdownSource::Supervisor(supervisor) | ShutdownSource::Service(_, supervisor) => {
                     supervisor.register_recovery_wakers(cx.waker());
                 }
             }
             if self.snapshot().is_complete() {
-                return Poll::Ready(self.snapshot());
+                return Poll::Ready(Ok(self.snapshot()));
             }
             Poll::Pending
         })
-        .await;
+        .await?;
+        registration.unregister();
         Ok(ShutdownObservation {
             report,
             observer: self.clone(),
@@ -725,51 +781,6 @@ impl ShutdownObserver {
             }
         }
     }
-
-    fn register_waker(&self, waker: &Waker) {
-        match &self.0 {
-            ShutdownSource::Supervisor(supervisor) => {
-                let duplicate = lock(&supervisor.inner.state)
-                    .shutdown_waiters
-                    .iter()
-                    .any(|old| old.will_wake(waker));
-                if !duplicate {
-                    let replacement = waker.clone();
-                    let mut state = lock(&supervisor.inner.state);
-                    if state
-                        .shutdown_waiters
-                        .iter()
-                        .any(|old| old.will_wake(waker))
-                    {
-                        drop(state);
-                        drop(replacement);
-                    } else {
-                        state.shutdown_waiters.push(replacement);
-                    }
-                }
-            }
-            ShutdownSource::Service(state, _) => {
-                let duplicate = lock(&state.0)
-                    .shutdown_waiters
-                    .iter()
-                    .any(|old| old.will_wake(waker));
-                if !duplicate {
-                    let replacement = waker.clone();
-                    let mut state = lock(&state.0);
-                    if state
-                        .shutdown_waiters
-                        .iter()
-                        .any(|old| old.will_wake(waker))
-                    {
-                        drop(state);
-                        drop(replacement);
-                    } else {
-                        state.shutdown_waiters.push(replacement);
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl OperationSupervisor {
@@ -791,6 +802,7 @@ impl OperationSupervisor {
                     cancel: false,
                     contexts: Vec::new(),
                     shutdown_waiters: Vec::new(),
+                    next_shutdown_waiter: 1,
                 }),
                 driver: Mutex::new(None),
                 cleanup_scheduler,
@@ -830,11 +842,7 @@ impl OperationSupervisor {
     }
 
     fn service_totals(&self) -> (usize, usize) {
-        let groups = {
-            let mut groups = lock(&self.inner.service_groups);
-            groups.retain(|group| group.strong_count() > 0);
-            groups.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
-        };
+        let groups = { lock(&self.inner.service_groups).clone() };
         groups
             .into_iter()
             .fold((0, 0), |(requests, resources), group| {
@@ -1058,7 +1066,7 @@ impl OperationSupervisor {
     }
 
     fn begin_shutdown(&self, mode: ShutdownMode) {
-        let (contexts, waiters) = {
+        let (contexts, waiters, shutdown_waiters) = {
             let mut state = lock(&self.inner.state);
             state.closed = true;
             if mode == ShutdownMode::Cancel {
@@ -1074,20 +1082,22 @@ impl OperationSupervisor {
             } else {
                 Vec::new()
             };
-            (contexts, take_waiter_wakers(&mut state))
+            (
+                contexts,
+                take_waiter_wakers(&mut state),
+                std::mem::take(&mut state.shutdown_waiters),
+            )
         };
         for context in contexts {
             context.request_stop(crate::report::StopReason::ParentStopped);
         }
-        let groups = {
-            let mut groups = lock(&self.inner.service_groups);
-            groups.retain(|group| group.strong_count() > 0);
-            groups.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
-        };
+        let groups = lock(&self.inner.service_groups).clone();
         for group in groups {
-            begin_service_group_state(group, mode, self.internal_handle());
+            begin_service_group_state(Arc::clone(&group), mode, self.internal_handle());
+            remove_completed_service_group(self, &group);
         }
         wake(waiters);
+        wake_shutdown(shutdown_waiters);
         self.inner.changed.notify_all();
     }
 
@@ -1269,7 +1279,7 @@ impl Drop for ResultLease {
 }
 
 fn release_execution(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
-    let waiters = {
+    let (waiters, shutdown_waiters) = {
         let mut state = lock(&inner.state);
         let mut lease_state = lock(lease);
         if lease_state.execution_released {
@@ -1291,11 +1301,12 @@ fn release_execution(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
             });
         }
         promoted.extend(take_waiter_wakers(&mut state));
-        promoted.append(&mut state.shutdown_waiters);
-        promoted
+        (promoted, std::mem::take(&mut state.shutdown_waiters))
     };
     wake(waiters);
+    wake_shutdown(shutdown_waiters);
     inner.changed.notify_all();
+    retry_service_cleanups_after_capacity_change(inner);
 }
 
 fn release_result(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
@@ -1313,7 +1324,7 @@ fn release_result(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
 }
 
 fn release_all(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
-    let waiters = {
+    let (waiters, shutdown_waiters) = {
         let mut state = lock(&inner.state);
         let mut lease_state = lock(lease);
         let mut promoted = Vec::new();
@@ -1338,9 +1349,12 @@ fn release_all(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
             state.results = state.results.saturating_sub(1);
         }
         promoted.extend(take_waiter_wakers(&mut state));
-        promoted
+        (promoted, std::mem::take(&mut state.shutdown_waiters))
     };
     wake(waiters);
+    wake_shutdown(shutdown_waiters);
+    inner.changed.notify_all();
+    retry_service_cleanups_after_capacity_change(inner);
 }
 
 /// A bounded waiter for root admission. Dropping it removes its registration;
@@ -1537,6 +1551,12 @@ fn take_waiter_wakers(state: &mut State) -> Vec<Waker> {
 
 fn wake(waiters: Vec<Waker>) {
     for waker in waiters {
+        waker.wake();
+    }
+}
+
+fn wake_shutdown(waiters: Vec<(u64, Waker)>) {
+    for (_, waker) in waiters {
         waker.wake();
     }
 }
