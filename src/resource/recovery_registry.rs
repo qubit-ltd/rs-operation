@@ -3,6 +3,7 @@ use crate::report::{RecoveryKey, RecoveryOwner, ResourceId};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Waker;
 use std::{future::Future, pin::Pin};
 
 static NEXT_RECOVERY_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
@@ -70,6 +71,7 @@ struct RecoveryInner {
     capacity: usize,
     next_nonce: AtomicU64,
     owners: Mutex<BTreeMap<(u64, ResourceId, u64), RecoveryOwner>>,
+    waiters: Mutex<Vec<Waker>>,
 }
 
 impl RecoveryRegistry {
@@ -81,6 +83,7 @@ impl RecoveryRegistry {
                 capacity,
                 next_nonce: AtomicU64::new(1),
                 owners: Mutex::new(BTreeMap::new()),
+                waiters: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -159,8 +162,20 @@ impl RecoveryRegistry {
         let Some(owner) = owners.remove(&(key.registry_id, key.resource_id(), key.nonce)) else {
             return Err(key);
         };
+        drop(owners);
         match owner.take(key) {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                let waiters = self
+                    .inner
+                    .waiters
+                    .lock()
+                    .map(|mut waiters| std::mem::take(&mut *waiters))
+                    .unwrap_or_default();
+                for waiter in waiters {
+                    waiter.wake();
+                }
+                Ok(value)
+            }
             Err(owner) => {
                 // A key issued by this registry cannot mismatch its stored entry.
                 // Preserve the payload if internal corruption ever violates that invariant.
@@ -213,5 +228,37 @@ impl RecoveryRegistry {
     /// Configured recovery capacity.
     pub fn capacity(&self) -> usize {
         self.inner.capacity
+    }
+
+    /// Register a wakeup while at least one recovery owner remains.
+    pub(crate) fn register_waker_if_nonempty(&self, waker: &Waker) -> bool {
+        let replacement = waker.clone();
+        let owners = match self.inner.owners.lock() {
+            Ok(owners) => owners,
+            Err(_) => return false,
+        };
+        if owners.is_empty() {
+            drop(owners);
+            drop(replacement);
+            return false;
+        }
+        let mut waiters = match self.inner.waiters.lock() {
+            Ok(waiters) => waiters,
+            Err(_) => {
+                drop(owners);
+                drop(replacement);
+                return true;
+            }
+        };
+        if waiters.iter().any(|old| old.will_wake(waker)) {
+            drop(waiters);
+            drop(owners);
+            drop(replacement);
+        } else {
+            waiters.push(replacement);
+            drop(waiters);
+            drop(owners);
+        }
+        true
     }
 }

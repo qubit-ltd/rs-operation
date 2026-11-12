@@ -3,16 +3,24 @@
 //! This module owns admission bookkeeping only. Operation execution and result
 //! observation are attached by the operation handle layer.
 
-use crate::context::{ContextError, DeadlineSignal, OperationContext, StopSignal};
+use crate::context::{ContextError, Deadline, DeadlineSignal, OperationContext, StopSignal};
 use crate::driver::{PortableDriver, PortableDriverConfig, PortableDriverError, TaskHandle};
-use crate::report::{AdmissionError, StartError, SupervisorLimits};
-use crate::resource::{CleanupResponsibility, CleanupScheduler};
+use crate::operation::OperationHandle;
+use crate::protocol::ClockSource;
+use crate::report::{
+    AdmissionError, OperationId, ResourceId, ScopeLimits, StartError, SupervisorLimits,
+};
+use crate::resource::{CleanupResponsibility, CleanupScheduler, RecoveryRegistry};
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+
+type SharedServiceGroupState = Arc<(Mutex<ServiceGroupState>, std::sync::Condvar)>;
+type WeakServiceGroupState = Weak<(Mutex<ServiceGroupState>, std::sync::Condvar)>;
 
 struct Inner {
     limits: SupervisorLimits,
@@ -20,6 +28,10 @@ struct Inner {
     driver: Mutex<Option<Arc<PortableDriver>>>,
     cleanup_scheduler: CleanupScheduler,
     cleanup_responsibility: CleanupResponsibility,
+    changed: std::sync::Condvar,
+    recovery_registries: Mutex<Vec<RecoveryRegistry>>,
+    public_handles: AtomicUsize,
+    service_groups: Mutex<Vec<WeakServiceGroupState>>,
 }
 
 struct State {
@@ -30,6 +42,9 @@ struct State {
     cleanup_active: usize,
     waiters: Vec<(u64, Option<Waker>)>,
     next_waiter: u64,
+    cancel: bool,
+    contexts: Vec<(Weak<Mutex<LeaseState>>, OperationContext)>,
+    shutdown_waiters: Vec<Waker>,
 }
 
 #[derive(Default)]
@@ -42,9 +57,717 @@ struct LeaseState {
 }
 
 /// Application-owned bounded root operation admission service.
-#[derive(Clone)]
 pub struct OperationSupervisor {
     inner: Arc<Inner>,
+    public: bool,
+}
+
+impl Clone for OperationSupervisor {
+    fn clone(&self) -> Self {
+        self.inner.public_handles.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: Arc::clone(&self.inner),
+            public: true,
+        }
+    }
+}
+
+impl Drop for OperationSupervisor {
+    fn drop(&mut self) {
+        if self.public && self.inner.public_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let handle = Self {
+                inner: Arc::clone(&self.inner),
+                public: false,
+            };
+            handle.begin_shutdown(ShutdownMode::Cancel);
+        }
+    }
+}
+
+/// Shutdown policy for an admission service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownMode {
+    /// Stop new roots while allowing already admitted work to finish.
+    Drain,
+    /// Stop admission and request cancellation of managed work.
+    Cancel,
+}
+
+/// Snapshot returned when waiting for service-group work to finish.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShutdownReport {
+    /// Number of group requests still holding an admission lease.
+    pub pending_requests: usize,
+    /// Recovery owners still retained by accepted operations.
+    pub pending_recovery: usize,
+    /// Service resource scopes still awaiting cleanup confirmation.
+    pub pending_resources: usize,
+}
+
+impl ShutdownReport {
+    pub fn is_complete(&self) -> bool {
+        self.pending_requests == 0 && self.pending_recovery == 0 && self.pending_resources == 0
+    }
+}
+
+struct ServiceGroupState {
+    closed: bool,
+    limit: usize,
+    mode: ShutdownMode,
+    next_id: u64,
+    requests: std::collections::BTreeMap<u64, ServiceRequestEntry>,
+    shutdown_waiters: Vec<Waker>,
+    resource_scopes: std::collections::BTreeMap<
+        u64,
+        (
+            crate::scope::OperationScope,
+            Arc<std::sync::atomic::AtomicBool>,
+            bool,
+        ),
+    >,
+    next_resource_id: u64,
+}
+
+enum ServiceRequestEntry {
+    Standalone,
+    Managed(Option<OperationContext>),
+}
+
+/// Bounded admission group for long-lived services. It consumes no root slot.
+pub struct ServiceGroup {
+    state: SharedServiceGroupState,
+    supervisor: OperationSupervisor,
+}
+
+/// Reusable observer for a supervisor or service-group shutdown.
+pub struct ShutdownObserver(ShutdownSource);
+
+#[derive(Clone)]
+enum ShutdownSource {
+    Supervisor(OperationSupervisor),
+    Service(SharedServiceGroupState, OperationSupervisor),
+}
+
+impl Clone for ShutdownObserver {
+    fn clone(&self) -> Self {
+        Self(match &self.0 {
+            ShutdownSource::Supervisor(supervisor) => {
+                ShutdownSource::Supervisor(supervisor.internal_handle())
+            }
+            ShutdownSource::Service(state, supervisor) => {
+                ShutdownSource::Service(Arc::clone(state), supervisor.internal_handle())
+            }
+        })
+    }
+}
+
+/// A shutdown snapshot and an observer that can wait again after a timeout.
+#[derive(Clone)]
+pub struct ShutdownObservation {
+    pub report: ShutdownReport,
+    pub observer: ShutdownObserver,
+}
+
+/// Admission lease held for the lifetime of one service request.
+pub struct ServiceRequest {
+    state: SharedServiceGroupState,
+    id: u64,
+    supervisor: OperationSupervisor,
+    released: bool,
+}
+
+/// A managed operation whose service-group lease lasts through resource settlement.
+pub struct ServiceOperationHandle<T, E> {
+    inner: OperationHandle<T, E>,
+}
+
+/// Independent finite resource owner scope associated with a service group.
+pub struct ServiceResourceScope {
+    scope: crate::scope::OperationScope,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A service resource registration was rejected before ownership transfer.
+pub struct ServiceResourceError {
+    pub reason: AdmissionError,
+    owner: Box<dyn crate::protocol::OwnedCleanup>,
+}
+
+impl fmt::Debug for ServiceResourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceResourceError")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServiceResourceError {
+    /// Recover the exact unaccepted cleanup owner.
+    pub fn into_owner(self) -> Box<dyn crate::protocol::OwnedCleanup> {
+        self.owner
+    }
+}
+
+impl ServiceResourceScope {
+    /// Register one resource while the service group remains open.
+    pub fn register_resource<C: crate::protocol::OwnedCleanup>(
+        &self,
+        owner: C,
+    ) -> Result<ResourceId, ServiceResourceError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ServiceResourceError {
+                reason: AdmissionError::Closed,
+                owner: Box::new(owner),
+            });
+        }
+        self.scope
+            .register_resource(owner)
+            .map_err(|error| ServiceResourceError {
+                reason: AdmissionError::ReservationLimit,
+                owner: error.into_owner(),
+            })
+    }
+
+    /// Acquire one lease for a registered service resource.
+    pub fn acquire_use(
+        &self,
+        id: ResourceId,
+    ) -> Result<crate::resource::ResourceUse, crate::resource::ResourceError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(crate::resource::ResourceError::ClosedForUse);
+        }
+        self.scope.acquire_use(id)
+    }
+
+    /// Close new resource use. Existing leases remain until returned.
+    pub fn close(&self) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.scope.close_body_resources();
+        }
+    }
+}
+
+impl Drop for ServiceResourceScope {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl<T, E> ServiceOperationHandle<T, E> {
+    pub fn request_cancel(&self, reason: crate::report::StopReason) {
+        self.inner.request_cancel(reason);
+    }
+    pub fn observer(&self) -> crate::operation::OperationObserver<T, E> {
+        self.inner.observer()
+    }
+    pub async fn result(
+        &mut self,
+    ) -> Result<crate::report::OperationOutcome<T, E>, crate::report::ObservationError> {
+        self.inner.result().await
+    }
+    pub fn result_blocking(
+        &mut self,
+    ) -> Result<crate::report::OperationOutcome<T, E>, crate::report::ObservationError> {
+        self.inner.result_blocking()
+    }
+    pub async fn released(&self) -> crate::report::SettlementReport {
+        self.inner.released().await
+    }
+    pub fn released_blocking(
+        &self,
+    ) -> Result<crate::report::SettlementReport, crate::report::ObservationError> {
+        self.inner.released_blocking()
+    }
+}
+
+impl OperationSupervisor {
+    pub(crate) fn internal_handle(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            public: false,
+        }
+    }
+
+    /// Create a service admission group with its own finite request capacity.
+    pub fn service_group(&self, capacity: usize) -> Result<ServiceGroup, AdmissionError> {
+        if capacity == 0 {
+            return Err(AdmissionError::ReservationLimit);
+        }
+        let state = Arc::new((
+            Mutex::new(ServiceGroupState {
+                closed: false,
+                limit: capacity,
+                mode: ShutdownMode::Drain,
+                next_id: 1,
+                requests: std::collections::BTreeMap::new(),
+                shutdown_waiters: Vec::new(),
+                resource_scopes: std::collections::BTreeMap::new(),
+                next_resource_id: 1,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        lock(&self.inner.service_groups).push(Arc::downgrade(&state));
+        Ok(ServiceGroup {
+            state,
+            supervisor: self.internal_handle(),
+        })
+    }
+}
+
+impl ServiceGroup {
+    /// Create a resource owner scope with a finite quota independent from root admission.
+    pub fn resource_scope(&self, capacity: usize) -> Result<ServiceResourceScope, AdmissionError> {
+        if capacity == 0 || capacity > self.supervisor.inner.limits.scope.resources {
+            return Err(AdmissionError::ReservationLimit);
+        }
+        let mut state = lock(&self.state.0);
+        if state.closed {
+            return Err(AdmissionError::Closed);
+        }
+        if state.resource_scopes.len() >= state.limit {
+            return Err(AdmissionError::Busy);
+        }
+        let id = state.next_resource_id;
+        state.next_resource_id = id.checked_add(1).ok_or(AdmissionError::Busy)?;
+        let operation = OperationId::new((1_u128 << 120) | id as u128);
+        let scope = crate::scope::OperationScope::new(
+            operation,
+            ScopeLimits {
+                child_operations: 0,
+                resources: capacity,
+            },
+            crate::scope::ScopePolicy::FailFast,
+            self.supervisor.cleanup_scheduler(),
+        );
+        self.supervisor.track_scope_recovery(&scope);
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        state
+            .resource_scopes
+            .insert(id, (scope.clone(), Arc::clone(&closed), false));
+        Ok(ServiceResourceScope { scope, closed })
+    }
+
+    /// Atomically reserve one request slot unless this group is closed or full.
+    pub fn try_admit(&self) -> Result<ServiceRequest, AdmissionError> {
+        self.reserve_request(false)
+    }
+
+    fn reserve_request(&self, managed: bool) -> Result<ServiceRequest, AdmissionError> {
+        let (lock, _) = &*self.state;
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return Err(AdmissionError::Closed);
+        }
+        if state.requests.len() >= state.limit {
+            return Err(AdmissionError::Busy);
+        }
+        let id = state.next_id;
+        state.next_id = id.checked_add(1).ok_or(AdmissionError::Busy)?;
+        state.requests.insert(
+            id,
+            if managed {
+                ServiceRequestEntry::Managed(None)
+            } else {
+                ServiceRequestEntry::Standalone
+            },
+        );
+        Ok(ServiceRequest {
+            state: Arc::clone(&self.state),
+            id,
+            supervisor: self.supervisor.internal_handle(),
+            released: false,
+        })
+    }
+
+    /// Admit and supervise one real root operation under this service group.
+    pub fn start<F, Fut, T, E>(
+        &self,
+        options: crate::scope::ScopeOptions,
+        body: F,
+    ) -> Result<ServiceOperationHandle<T, E>, StartError<F>>
+    where
+        F: FnOnce(crate::scope::OperationScope) -> Fut + Send + 'static,
+        Fut: core::future::Future<Output = Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        let request = match self.reserve_request(true) {
+            Ok(request) => request,
+            Err(reason) => return Err(StartError::new(reason, body)),
+        };
+        let handle = match self.supervisor.start(options, body) {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(request);
+                return Err(error);
+            }
+        };
+        let context = handle.cancellation_context();
+        {
+            let mut state = lock(&self.state.0);
+            if let Some(ServiceRequestEntry::Managed(slot)) = state.requests.get_mut(&request.id) {
+                *slot = Some(context.clone());
+            }
+            if state.mode == ShutdownMode::Cancel {
+                context.request_stop(crate::report::StopReason::ParentStopped);
+            }
+        }
+        handle.hold_until_released(Box::new(request));
+        Ok(ServiceOperationHandle { inner: handle })
+    }
+
+    /// Stop group admission and wait up to `timeout` for request leases to return.
+    pub fn shutdown_blocking(
+        &self,
+        mode: ShutdownMode,
+        timeout: std::time::Duration,
+    ) -> ShutdownReport {
+        self.begin_shutdown(mode);
+        let (mutex, changed) = &*self.state;
+        let state = mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, _) = changed
+            .wait_timeout_while(state, timeout, |state| {
+                !state.requests.is_empty() || !state.resource_scopes.is_empty()
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ShutdownReport {
+            pending_requests: state.requests.len(),
+            pending_recovery: self.supervisor.pending_recovery(),
+            pending_resources: state.resource_scopes.len(),
+        }
+    }
+
+    /// Current number of live request leases.
+    pub fn active_requests(&self) -> usize {
+        self.state
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .requests
+            .len()
+    }
+
+    /// Stop this group and observe its shutdown asynchronously.
+    pub async fn shutdown_async(
+        &self,
+        mode: ShutdownMode,
+        deadline: Deadline,
+        clock: Arc<dyn ClockSource>,
+    ) -> Result<ShutdownObservation, ContextError> {
+        self.begin_shutdown(mode);
+        ShutdownObserver(ShutdownSource::Service(
+            Arc::clone(&self.state),
+            self.supervisor.internal_handle(),
+        ))
+        .wait_async(deadline, clock)
+        .await
+    }
+
+    fn begin_shutdown(&self, mode: ShutdownMode) {
+        begin_service_group_state(
+            Arc::clone(&self.state),
+            mode,
+            self.supervisor.internal_handle(),
+        );
+    }
+}
+
+impl Drop for ServiceRequest {
+    fn drop(&mut self) {
+        if !self.released {
+            let (lock, changed) = &*self.state;
+            let (waiters, _) = {
+                let mut state = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.requests.remove(&self.id);
+                self.released = true;
+                (std::mem::take(&mut state.shutdown_waiters), ())
+            };
+            changed.notify_all();
+            wake(waiters);
+            notify_shutdown(&self.supervisor);
+            start_service_resource_cleanup(
+                Arc::clone(&self.state),
+                self.supervisor.internal_handle(),
+            );
+        }
+    }
+}
+
+fn start_service_resource_cleanup(state: SharedServiceGroupState, supervisor: OperationSupervisor) {
+    let ready = {
+        let mut guard = lock(&state.0);
+        if !guard.closed || !guard.requests.is_empty() {
+            return;
+        }
+        guard
+            .resource_scopes
+            .iter_mut()
+            .filter_map(|(id, (scope, closed, started))| {
+                if *started {
+                    return None;
+                }
+                *started = true;
+                closed.store(true, Ordering::Release);
+                scope.close_body_resources();
+                Some((*id, scope.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+    for (id, scope) in ready {
+        let task_state = Arc::clone(&state);
+        let task_supervisor = supervisor.internal_handle();
+        let result = supervisor.spawn_managed(async move {
+            let _ = scope.join().await;
+            let waiters = {
+                let mut guard = lock(&task_state.0);
+                guard.resource_scopes.remove(&id);
+                std::mem::take(&mut guard.shutdown_waiters)
+            };
+            task_state.1.notify_all();
+            wake(waiters);
+            notify_shutdown(&task_supervisor);
+            drop(task_supervisor);
+        });
+        if result.is_err() {
+            let mut guard = lock(&state.0);
+            if let Some((_, _, started)) = guard.resource_scopes.get_mut(&id) {
+                *started = false;
+            }
+        }
+    }
+}
+
+fn notify_shutdown(supervisor: &OperationSupervisor) {
+    let waiters = {
+        let mut state = lock(&supervisor.inner.state);
+        std::mem::take(&mut state.shutdown_waiters)
+    };
+    supervisor.inner.changed.notify_all();
+    wake(waiters);
+}
+
+fn begin_service_group_state(
+    state: SharedServiceGroupState,
+    mode: ShutdownMode,
+    supervisor: OperationSupervisor,
+) {
+    let (contexts, waiters) = {
+        let mut guard = lock(&state.0);
+        guard.closed = true;
+        if mode == ShutdownMode::Cancel {
+            guard.mode = ShutdownMode::Cancel;
+        }
+        let contexts = if guard.mode == ShutdownMode::Cancel {
+            guard
+                .requests
+                .values()
+                .filter_map(|entry| match entry {
+                    ServiceRequestEntry::Managed(Some(context)) => Some(context.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        (contexts, std::mem::take(&mut guard.shutdown_waiters))
+    };
+    for context in contexts {
+        context.request_stop(crate::report::StopReason::ParentStopped);
+    }
+    wake(waiters);
+    start_service_resource_cleanup(state, supervisor);
+}
+
+fn retry_closed_service_group_cleanups(supervisor: &OperationSupervisor) {
+    let groups = {
+        let mut groups = lock(&supervisor.inner.service_groups);
+        groups.retain(|group| group.strong_count() > 0);
+        groups.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+    };
+    for group in groups {
+        let ready = {
+            let state = lock(&group.0);
+            state.closed && state.requests.is_empty()
+        };
+        if ready {
+            start_service_resource_cleanup(group, supervisor.internal_handle());
+        }
+    }
+}
+
+impl ShutdownObserver {
+    /// Wait again for active work to settle, or return a fresh pending snapshot at deadline.
+    pub async fn wait_async(
+        &self,
+        deadline: Deadline,
+        clock: Arc<dyn ClockSource>,
+    ) -> Result<ShutdownObservation, ContextError> {
+        match &self.0 {
+            ShutdownSource::Service(state, supervisor) => {
+                start_service_resource_cleanup(Arc::clone(state), supervisor.internal_handle())
+            }
+            ShutdownSource::Supervisor(supervisor) => {
+                retry_closed_service_group_cleanups(supervisor)
+            }
+        }
+        let context = OperationContext::new(crate::context::ContextOptions {
+            clock: Some(clock),
+            ..Default::default()
+        });
+        let mut timer = context.signal_at(deadline)?;
+        let report = core::future::poll_fn(|cx| {
+            let report = self.snapshot();
+            if report.is_complete() {
+                return Poll::Ready(report);
+            }
+            if Pin::new(&mut timer).poll(cx).is_ready() {
+                return Poll::Ready(report);
+            }
+            self.register_waker(cx.waker());
+            match &self.0 {
+                ShutdownSource::Supervisor(supervisor) | ShutdownSource::Service(_, supervisor) => {
+                    supervisor.register_recovery_wakers(cx.waker());
+                }
+            }
+            if self.snapshot().is_complete() {
+                return Poll::Ready(self.snapshot());
+            }
+            Poll::Pending
+        })
+        .await;
+        Ok(ShutdownObservation {
+            report,
+            observer: self.clone(),
+        })
+    }
+
+    /// Wait synchronously for active work to settle or timeout.
+    pub fn wait_blocking(&self, timeout: std::time::Duration) -> ShutdownObservation {
+        match &self.0 {
+            ShutdownSource::Service(state, supervisor) => {
+                start_service_resource_cleanup(Arc::clone(state), supervisor.internal_handle())
+            }
+            ShutdownSource::Supervisor(supervisor) => {
+                retry_closed_service_group_cleanups(supervisor)
+            }
+        }
+        let report = match &self.0 {
+            ShutdownSource::Supervisor(supervisor) => {
+                let state = lock(&supervisor.inner.state);
+                let (state, _) = supervisor
+                    .inner
+                    .changed
+                    .wait_timeout_while(state, timeout, |s| {
+                        s.active > 0
+                            || !s.queued.is_empty()
+                            || supervisor.service_totals().1 > 0
+                            || supervisor.service_totals().0 > 0
+                    })
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ShutdownReport {
+                    pending_requests: state.active
+                        + state.queued.len()
+                        + supervisor.service_totals().0,
+                    pending_recovery: supervisor.pending_recovery(),
+                    pending_resources: supervisor.service_totals().1,
+                }
+            }
+            ShutdownSource::Service(state, supervisor) => {
+                let (mutex, changed) = &**state;
+                let guard = mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (guard, _) = changed
+                    .wait_timeout_while(guard, timeout, |s| {
+                        !s.requests.is_empty() || !s.resource_scopes.is_empty()
+                    })
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                ShutdownReport {
+                    pending_requests: guard.requests.len(),
+                    pending_recovery: supervisor.pending_recovery(),
+                    pending_resources: guard.resource_scopes.len(),
+                }
+            }
+        };
+        ShutdownObservation {
+            report,
+            observer: self.clone(),
+        }
+    }
+
+    fn snapshot(&self) -> ShutdownReport {
+        match &self.0 {
+            ShutdownSource::Supervisor(supervisor) => {
+                let state = lock(&supervisor.inner.state);
+                ShutdownReport {
+                    pending_requests: state.active
+                        + state.queued.len()
+                        + supervisor.service_totals().0,
+                    pending_recovery: supervisor.pending_recovery(),
+                    pending_resources: supervisor.service_totals().1,
+                }
+            }
+            ShutdownSource::Service(state, supervisor) => {
+                let guard = lock(&state.0);
+                ShutdownReport {
+                    pending_requests: guard.requests.len(),
+                    pending_recovery: supervisor.pending_recovery(),
+                    pending_resources: guard.resource_scopes.len(),
+                }
+            }
+        }
+    }
+
+    fn register_waker(&self, waker: &Waker) {
+        match &self.0 {
+            ShutdownSource::Supervisor(supervisor) => {
+                let duplicate = lock(&supervisor.inner.state)
+                    .shutdown_waiters
+                    .iter()
+                    .any(|old| old.will_wake(waker));
+                if !duplicate {
+                    let replacement = waker.clone();
+                    let mut state = lock(&supervisor.inner.state);
+                    if state
+                        .shutdown_waiters
+                        .iter()
+                        .any(|old| old.will_wake(waker))
+                    {
+                        drop(state);
+                        drop(replacement);
+                    } else {
+                        state.shutdown_waiters.push(replacement);
+                    }
+                }
+            }
+            ShutdownSource::Service(state, _) => {
+                let duplicate = lock(&state.0)
+                    .shutdown_waiters
+                    .iter()
+                    .any(|old| old.will_wake(waker));
+                if !duplicate {
+                    let replacement = waker.clone();
+                    let mut state = lock(&state.0);
+                    if state
+                        .shutdown_waiters
+                        .iter()
+                        .any(|old| old.will_wake(waker))
+                    {
+                        drop(state);
+                        drop(replacement);
+                    } else {
+                        state.shutdown_waiters.push(replacement);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl OperationSupervisor {
@@ -63,16 +786,68 @@ impl OperationSupervisor {
                     cleanup_active: 0,
                     waiters: Vec::new(),
                     next_waiter: 1,
+                    cancel: false,
+                    contexts: Vec::new(),
+                    shutdown_waiters: Vec::new(),
                 }),
                 driver: Mutex::new(None),
                 cleanup_scheduler,
                 cleanup_responsibility,
+                changed: std::sync::Condvar::new(),
+                recovery_registries: Mutex::new(Vec::new()),
+                public_handles: AtomicUsize::new(1),
+                service_groups: Mutex::new(Vec::new()),
             }),
+            public: true,
         }
     }
 
     pub(crate) fn cleanup_scheduler(&self) -> CleanupScheduler {
         self.inner.cleanup_scheduler.clone()
+    }
+
+    pub(crate) fn track_scope_recovery(&self, scope: &crate::scope::OperationScope) {
+        let registry = scope.recovery_registry();
+        let mut registries = lock(&self.inner.recovery_registries);
+        registries.retain(|entry| !entry.is_empty());
+        registries.push(registry);
+    }
+
+    fn pending_recovery(&self) -> usize {
+        lock(&self.inner.recovery_registries)
+            .iter()
+            .map(RecoveryRegistry::len)
+            .sum()
+    }
+
+    fn register_recovery_wakers(&self, waker: &Waker) {
+        let registries = lock(&self.inner.recovery_registries).clone();
+        for registry in registries {
+            registry.register_waker_if_nonempty(waker);
+        }
+    }
+
+    fn service_totals(&self) -> (usize, usize) {
+        let groups = {
+            let mut groups = lock(&self.inner.service_groups);
+            groups.retain(|group| group.strong_count() > 0);
+            groups.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+        };
+        groups
+            .into_iter()
+            .fold((0, 0), |(requests, resources), group| {
+                let state = lock(&group.0);
+                (
+                    requests.saturating_add(
+                        state
+                            .requests
+                            .values()
+                            .filter(|entry| matches!(entry, ServiceRequestEntry::Standalone))
+                            .count(),
+                    ),
+                    resources.saturating_add(state.resource_scopes.len()),
+                )
+            })
     }
 
     /// Number of cleanup permits retained by this shared supervisor.
@@ -160,7 +935,19 @@ impl OperationSupervisor {
                 body,
             ));
         }
-        self.try_admit_body(body)
+        let admission = self.try_admit_body(body)?;
+        let cancel = {
+            let mut state = lock(&self.inner.state);
+            state.contexts.retain(|(lease, _)| lease.strong_count() > 0);
+            state
+                .contexts
+                .push((Arc::downgrade(&admission.lease), context.clone()));
+            state.cancel
+        };
+        if cancel {
+            context.request_stop(crate::report::StopReason::ParentStopped);
+        }
+        Ok(admission)
     }
 
     /// Create a bounded asynchronous admission waiter.
@@ -203,7 +990,7 @@ impl OperationSupervisor {
         let deadline_signal = context.as_ref().and_then(OperationContext::deadline_signal);
         let stop_signal = context.as_ref().map(OperationContext::stop_signal);
         Ok(AdmissionWait {
-            supervisor: self.clone(),
+            supervisor: self.internal_handle(),
             waiter_id: id,
             body: Some(body),
             context,
@@ -221,6 +1008,85 @@ impl OperationSupervisor {
             take_waiter_wakers(&mut state)
         };
         wake(waiters);
+        self.inner.changed.notify_all();
+    }
+
+    /// Stop root admission and wait up to the caller-owned timeout for accepted work.
+    /// Drain can only be upgraded to Cancel; every call observes the shared lifecycle.
+    pub fn shutdown_blocking(
+        &self,
+        mode: ShutdownMode,
+        timeout: std::time::Duration,
+    ) -> ShutdownReport {
+        self.begin_shutdown(mode);
+        let state = lock(&self.inner.state);
+        let (state, _) = self
+            .inner
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.active > 0
+                    || !state.queued.is_empty()
+                    || self.service_totals().1 > 0
+                    || self.service_totals().0 > 0
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ShutdownReport {
+            pending_requests: state.active + state.queued.len() + self.service_totals().0,
+            pending_recovery: self.pending_recovery(),
+            pending_resources: self.service_totals().1,
+        }
+    }
+
+    /// Begin shutdown and return a reusable observer after `timeout` expires or work settles.
+    pub async fn shutdown_async(
+        &self,
+        mode: ShutdownMode,
+        deadline: Deadline,
+        clock: Arc<dyn ClockSource>,
+    ) -> Result<ShutdownObservation, ContextError> {
+        self.begin_shutdown(mode);
+        ShutdownObserver(ShutdownSource::Supervisor(self.internal_handle()))
+            .wait_async(deadline, clock)
+            .await
+    }
+
+    /// Create a reusable observer for an already requested or future shutdown.
+    pub fn shutdown_observer(&self) -> ShutdownObserver {
+        ShutdownObserver(ShutdownSource::Supervisor(self.internal_handle()))
+    }
+
+    fn begin_shutdown(&self, mode: ShutdownMode) {
+        let (contexts, waiters) = {
+            let mut state = lock(&self.inner.state);
+            state.closed = true;
+            if mode == ShutdownMode::Cancel {
+                state.cancel = true;
+            }
+            state.contexts.retain(|(lease, _)| lease.strong_count() > 0);
+            let contexts = if state.cancel {
+                state
+                    .contexts
+                    .iter()
+                    .map(|(_, context)| context.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (contexts, take_waiter_wakers(&mut state))
+        };
+        for context in contexts {
+            context.request_stop(crate::report::StopReason::ParentStopped);
+        }
+        let groups = {
+            let mut groups = lock(&self.inner.service_groups);
+            groups.retain(|group| group.strong_count() > 0);
+            groups.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+        };
+        for group in groups {
+            begin_service_group_state(group, mode, self.internal_handle());
+        }
+        wake(waiters);
+        self.inner.changed.notify_all();
     }
 
     /// Number of root bodies currently holding execution capacity.
@@ -423,9 +1289,11 @@ fn release_execution(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
             });
         }
         promoted.extend(take_waiter_wakers(&mut state));
+        promoted.append(&mut state.shutdown_waiters);
         promoted
     };
     wake(waiters);
+    inner.changed.notify_all();
 }
 
 fn release_result(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {

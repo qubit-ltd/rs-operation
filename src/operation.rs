@@ -34,6 +34,7 @@ struct State<T, E> {
     result_waiters: Vec<Waker>,
     release_waiters: Vec<Waker>,
     result_lease: Option<ResultLease>,
+    completion_guards: Vec<Box<dyn Send>>,
 }
 
 /// Unique typed result consumer for one accepted operation.
@@ -53,6 +54,20 @@ impl<T, E> OperationHandle<T, E> {
     /// Request cooperative cancellation. This never runs domain code inline.
     pub fn request_cancel(&self, reason: StopReason) {
         self.context.request_stop(reason);
+    }
+
+    pub(crate) fn cancellation_context(&self) -> OperationContext {
+        self.context.clone()
+    }
+
+    pub(crate) fn hold_until_released(&self, guard: Box<dyn Send>) {
+        let mut state = lock(&self.shared.state);
+        if state.released.is_some() {
+            drop(state);
+            drop(guard);
+        } else {
+            state.completion_guards.push(guard);
+        }
     }
     /// Create a cloneable observer that cannot consume the typed result.
     pub fn observer(&self) -> OperationObserver<T, E> {
@@ -461,6 +476,7 @@ impl OperationSupervisor {
                 result_waiters: Vec::new(),
                 release_waiters: Vec::new(),
                 result_lease: Some(result_lease),
+                completion_guards: Vec::new(),
             }),
             changed: Condvar::new(),
             context: context.clone(),
@@ -476,11 +492,13 @@ impl OperationSupervisor {
         let manager_completion = Arc::clone(&completion);
         let manager_scope = scope.clone();
         let manager_shared = Arc::clone(&shared);
+        let manager_supervisor = self.internal_handle();
         let manager_context = context.clone();
         let manager_stop = manager_context.stop_signal();
         let lease = Arc::new(Mutex::new(Some(task_lease)));
         let worker_lease = Arc::clone(&lease);
         let manager = async move {
+            manager_supervisor.track_scope_recovery(&manager_scope);
             let result = Cancellable {
                 future: Box::pin(std::future::poll_fn(|cx| {
                     let mut state = lock(&manager_completion);
@@ -496,9 +514,10 @@ impl OperationSupervisor {
                 stop: manager_stop,
                 scope: manager_scope.clone(),
                 stopped: false,
+                stop_reason: None,
             }
             .await;
-            let Some(result) = result else {
+            let (Some(result), stopped) = result else {
                 return;
             };
             manager_scope.close_body();
@@ -508,21 +527,32 @@ impl OperationSupervisor {
             }
             let mut facts = JoinFacts::default();
             std::future::poll_fn(|cx| poll_scope_business(&manager_scope, cx, &mut facts)).await;
-            let outcome = match result {
-                BlockingBodyResult::Panicked => OperationOutcome::Panicked(PanicSummary {
-                    operation_id: id,
-                    phase: DiagnosticSummary::new("blocking body"),
-                }),
-                BlockingBodyResult::Returned(Ok(value)) if facts.failed_required.is_some() => {
-                    drop(value);
-                    let child = facts.failed_required.as_ref().expect("checked");
-                    OperationOutcome::ChildFailed(ChildFailureSummary {
-                        operation_id: child.operation_id,
-                        summary: child.summary.clone(),
-                    })
+            let outcome = if let Some(reason) = stopped {
+                match result {
+                    BlockingBodyResult::Returned(result) => drop(result),
+                    BlockingBodyResult::Panicked => {}
                 }
-                BlockingBodyResult::Returned(Ok(value)) => OperationOutcome::Succeeded(value),
-                BlockingBodyResult::Returned(Err(error)) => OperationOutcome::Failed(error),
+                OperationOutcome::Stopped(StopReport {
+                    reason,
+                    accepted_at: None,
+                })
+            } else {
+                match result {
+                    BlockingBodyResult::Panicked => OperationOutcome::Panicked(PanicSummary {
+                        operation_id: id,
+                        phase: DiagnosticSummary::new("blocking body"),
+                    }),
+                    BlockingBodyResult::Returned(Ok(value)) if facts.failed_required.is_some() => {
+                        drop(value);
+                        let child = facts.failed_required.as_ref().expect("checked");
+                        OperationOutcome::ChildFailed(ChildFailureSummary {
+                            operation_id: child.operation_id,
+                            summary: child.summary.clone(),
+                        })
+                    }
+                    BlockingBodyResult::Returned(Ok(value)) => OperationOutcome::Succeeded(value),
+                    BlockingBodyResult::Returned(Err(error)) => OperationOutcome::Failed(error),
+                }
             };
             publish_result(&manager_shared, outcome);
             std::future::poll_fn(|cx| poll_scope_releases(&manager_scope, cx, &mut facts)).await;
@@ -630,6 +660,7 @@ impl OperationSupervisor {
                 result_waiters: Vec::new(),
                 release_waiters: Vec::new(),
                 result_lease: Some(result_lease),
+                completion_guards: Vec::new(),
             }),
             changed: Condvar::new(),
             context: context.clone(),
@@ -641,32 +672,43 @@ impl OperationSupervisor {
         let mut admission_stop = worker_context.stop_signal();
         let worker_body = Arc::clone(&body_cell);
         let cleanup_scheduler = self.cleanup_scheduler();
+        let manager_supervisor = self.internal_handle();
         let future = async move {
             let scope = OperationScope::new(id, options.limits, options.policy, cleanup_scheduler);
+            manager_supervisor.track_scope_recovery(&scope);
             let f = lock(&worker_body).take().expect("body invoked once");
             let body_future = f(scope.clone());
-            let result = Cancellable {
+            let (result, stopped) = Cancellable {
                 future: Box::pin(body_future),
                 stop: body_context.stop_signal(),
                 scope: scope.clone(),
                 stopped: false,
+                stop_reason: None,
             }
             .await;
             scope.close_body();
             scope.close_body_resources();
             let mut facts = JoinFacts::default();
             std::future::poll_fn(|cx| poll_scope_business(&scope, cx, &mut facts)).await;
-            let outcome = match result {
-                Ok(value) if facts.failed_required.is_some() => {
-                    drop(value);
-                    let child = facts.failed_required.as_ref().expect("checked");
-                    OperationOutcome::ChildFailed(ChildFailureSummary {
-                        operation_id: child.operation_id,
-                        summary: child.summary.clone(),
-                    })
+            let outcome = if let Some(reason) = stopped {
+                drop(result);
+                OperationOutcome::Stopped(StopReport {
+                    reason,
+                    accepted_at: None,
+                })
+            } else {
+                match result {
+                    Ok(value) if facts.failed_required.is_some() => {
+                        drop(value);
+                        let child = facts.failed_required.as_ref().expect("checked");
+                        OperationOutcome::ChildFailed(ChildFailureSummary {
+                            operation_id: child.operation_id,
+                            summary: child.summary.clone(),
+                        })
+                    }
+                    Ok(value) => OperationOutcome::Succeeded(value),
+                    Err(error) => OperationOutcome::Failed(error),
                 }
-                Ok(value) => OperationOutcome::Succeeded(value),
-                Err(error) => OperationOutcome::Failed(error),
             };
             publish_result(&worker_shared, outcome);
             std::future::poll_fn(|cx| poll_scope_releases(&scope, cx, &mut facts)).await;
@@ -812,11 +854,15 @@ fn publish_result<T, E>(shared: &Shared<T, E>, outcome: OperationOutcome<T, E>) 
     }
 }
 fn publish_released<T, E>(shared: &Shared<T, E>, report: SettlementReport) {
-    let waiters = {
+    let (waiters, guards) = {
         let mut state = lock(&shared.state);
         state.released = Some(report);
-        std::mem::take(&mut state.release_waiters)
+        (
+            std::mem::take(&mut state.release_waiters),
+            std::mem::take(&mut state.completion_guards),
+        )
     };
+    drop(guards);
     shared.changed.notify_all();
     for waiter in waiters {
         waiter.wake();
@@ -995,19 +1041,21 @@ struct Cancellable<F> {
     stop: crate::context::StopSignal,
     scope: OperationScope,
     stopped: bool,
+    stop_reason: Option<StopReason>,
 }
 impl<F: Future> Future for Cancellable<F> {
-    type Output = F::Output;
+    type Output = (F::Output, Option<StopReason>);
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Poll::Ready(output) = self.future.as_mut().poll(cx) {
-            return Poll::Ready(output);
-        }
         if !self.stopped
             && let Poll::Ready(Ok(reason)) = Pin::new(&mut self.stop).poll(cx)
         {
             self.stopped = true;
+            self.stop_reason = Some(reason);
             self.scope.request_cancel(reason);
         }
-        Poll::Pending
+        match self.future.as_mut().poll(cx) {
+            Poll::Ready(output) => Poll::Ready((output, self.stop_reason)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
