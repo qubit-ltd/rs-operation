@@ -18,6 +18,30 @@ pub trait BudgetLease: Send + Sync {
     fn check(&self) -> Result<(), BudgetLeaseError>;
 }
 
+struct CombinedBudgetLease {
+    parent: Arc<dyn BudgetLease>,
+    child: Arc<dyn BudgetLease>,
+}
+
+impl BudgetLease for CombinedBudgetLease {
+    fn check(&self) -> Result<(), BudgetLeaseError> {
+        self.parent.check()?;
+        self.child.check()
+    }
+}
+
+fn inherit_budget(
+    parent: Option<Arc<dyn BudgetLease>>,
+    child: Option<Arc<dyn BudgetLease>>,
+) -> Option<Arc<dyn BudgetLease>> {
+    match (parent, child) {
+        (Some(parent), Some(child)) => Some(Arc::new(CombinedBudgetLease { parent, child })),
+        (Some(parent), None) => Some(parent),
+        (None, Some(child)) => Some(child),
+        (None, None) => None,
+    }
+}
+
 /// The caller-owned budget lease cannot authorize further work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BudgetLeaseError;
@@ -166,7 +190,7 @@ impl OperationContext {
             node,
             clock,
             deadline,
-            budget: options.budget.or_else(|| self.budget.clone()),
+            budget: inherit_budget(self.budget.clone(), options.budget),
         })
     }
 

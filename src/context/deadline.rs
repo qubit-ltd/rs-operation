@@ -59,6 +59,7 @@ pub struct DeadlineSignal {
     clock: Arc<dyn ClockSource>,
     node: Weak<super::Node>,
     registration: Option<Box<dyn TimerRegistration>>,
+    registered_waker: Option<core::task::Waker>,
     fired: bool,
 }
 
@@ -73,6 +74,7 @@ impl DeadlineSignal {
             clock,
             node,
             registration: None,
+            registered_waker: None,
             fired: false,
         }
     }
@@ -94,9 +96,18 @@ impl Future for DeadlineSignal {
             if let Some(registration) = self.registration.take() {
                 registration.cancel();
             }
+            self.registered_waker = None;
             return Poll::Ready(());
         }
-        if self.registration.is_none() {
+        let waker_changed = self
+            .registered_waker
+            .as_ref()
+            .is_none_or(|registered| !registered.will_wake(cx.waker()));
+        if waker_changed {
+            if let Some(registration) = self.registration.take() {
+                registration.cancel();
+            }
+            self.registered_waker = Some(cx.waker().clone());
             self.registration = Some(
                 self.clock
                     .register_deadline(self.deadline.at, cx.waker().clone()),
