@@ -7,6 +7,7 @@
 // =============================================================================
 
 use std::cell::Cell;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Context;
@@ -86,14 +87,25 @@ pub fn portable_worker_loop(shared: Arc<PortableShared>) {
                 continue;
             };
             let mut context = Context::from_waker(&task.wake);
-            let poll = future.as_mut().poll(&mut context);
+            let poll = catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(&mut context)));
             completed_this_turn += 1;
-            if poll.is_ready() {
-                let removed = lock(&shared.state).tasks.remove(&id);
-                drop(removed);
-                drop(future);
-            } else {
-                *lock(&task.future) = Some(future);
+            match poll {
+                Ok(std::task::Poll::Ready(())) => {
+                    let removed = lock(&shared.state).tasks.remove(&id);
+                    drop(removed);
+                    // A user future destructor can also panic. Isolate that panic so one
+                    // failed task cannot terminate a fixed driver worker.
+                    let _ = catch_unwind(AssertUnwindSafe(|| drop(future)));
+                }
+                Err(payload) => {
+                    let removed = lock(&shared.state).tasks.remove(&id);
+                    drop(removed);
+                    let _ = catch_unwind(AssertUnwindSafe(|| drop(future)));
+                    let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
+                }
+                Ok(std::task::Poll::Pending) => {
+                    *lock(&task.future) = Some(future);
+                }
             }
         }
         thread::yield_now();
