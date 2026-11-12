@@ -10,8 +10,8 @@
 //!
 //! Foundation for managed operation lifecycles and composition.
 //!
-//! The crate exposes lifecycle contracts, portable drivers, and resource
-//! registry primitives used to compose managed operations.
+//! The crate exposes lifecycle contracts, portable drivers, resource registry
+//! primitives, and bounded admission for managed operations.
 
 mod internal;
 
@@ -20,3 +20,4 @@ pub mod driver;
 pub mod protocol;
 pub mod report;
 pub mod resource;
+pub mod supervisor;
