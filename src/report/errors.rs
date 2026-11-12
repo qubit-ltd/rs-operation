@@ -82,6 +82,8 @@ pub enum ObservationError {
     WouldDeadlock,
     /// The observer does not refer to a registered operation.
     InvalidObserver,
+    /// The operation already has the maximum number of asynchronous result waiters.
+    WaiterCapacityExceeded,
 }
 
 impl fmt::Display for ObservationError {
@@ -91,6 +93,9 @@ impl fmt::Display for ObservationError {
             Self::ResultDiscarded => "operation result was discarded",
             Self::WouldDeadlock => "blocking observation would deadlock",
             Self::InvalidObserver => "operation observer is invalid",
+            Self::WaiterCapacityExceeded => {
+                "operation has reached its asynchronous waiter capacity"
+            }
         })
     }
 }

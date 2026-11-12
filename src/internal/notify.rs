@@ -18,6 +18,13 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 
+use crate::report::ObservationError;
+
+/// Maximum number of asynchronous waiters retained by one notification source.
+///
+/// Additional registrations fail with [`ObservationError::WaiterCapacityExceeded`].
+pub(crate) const ASYNC_WAITER_CAPACITY: usize = 64;
+
 /// Mutable waiter list guarded with the notification generation.
 #[derive(Default)]
 struct WaitState {
@@ -110,19 +117,19 @@ pub(crate) struct Notified {
 }
 
 impl Future for Notified {
-    type Output = ();
+    type Output = Result<(), ObservationError>;
 
     /// Register this future or complete when its notification generation advances.
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let Some(inner) = self.inner.upgrade() else {
             self.waiter_id = None;
-            return Poll::Ready(());
+            return Poll::Ready(Ok(()));
         };
         let id = *self
             .waiter_id
             .get_or_insert_with(|| inner.next_waiter.fetch_add(1, Ordering::Relaxed));
         let mut replaced_waker = None;
-        let ready = {
+        let registration = {
             let mut state = lock(&inner.state);
             if state.generation != self.generation {
                 if let Some(index) = state
@@ -132,7 +139,7 @@ impl Future for Notified {
                 {
                     replaced_waker = Some(state.waiters.swap_remove(index).1);
                 }
-                true
+                Ok(true)
             } else if let Some((_, existing)) = state
                 .waiters
                 .iter_mut()
@@ -141,18 +148,24 @@ impl Future for Notified {
                 if !existing.will_wake(context.waker()) {
                     replaced_waker = Some(std::mem::replace(existing, context.waker().clone()));
                 }
-                false
+                Ok(false)
             } else {
-                state.waiters.push((id, context.waker().clone()));
-                false
+                if state.waiters.len() >= ASYNC_WAITER_CAPACITY {
+                    Err(ObservationError::WaiterCapacityExceeded)
+                } else {
+                    state.waiters.push((id, context.waker().clone()));
+                    Ok(false)
+                }
             }
         };
         drop(replaced_waker);
-        if ready {
-            self.waiter_id = None;
-            Poll::Ready(())
-        } else {
-            Poll::Pending
+        match registration {
+            Ok(true) => {
+                self.waiter_id = None;
+                Poll::Ready(Ok(()))
+            }
+            Ok(false) => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
         }
     }
 }
@@ -186,7 +199,9 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use super::ASYNC_WAITER_CAPACITY;
     use super::Notify;
+    use crate::report::ObservationError;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -227,7 +242,7 @@ mod tests {
 
         assert!(matches!(
             Pin::as_mut(&mut notified).poll(&mut context),
-            Poll::Ready(())
+            Poll::Ready(Ok(()))
         ));
     }
 
@@ -247,7 +262,7 @@ mod tests {
         assert_eq!(*wake_count.lock().unwrap(), 1);
         assert!(matches!(
             Pin::as_mut(&mut notified).poll(&mut context),
-            Poll::Ready(())
+            Poll::Ready(Ok(()))
         ));
     }
 
@@ -303,5 +318,33 @@ mod tests {
 
         assert_eq!(*first_count.lock().unwrap(), 0);
         assert_eq!(*second_count.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_async_waiter_capacity_is_enforced_and_reclaimed_on_drop() {
+        let notify = Notify::new();
+        let (waker, _) = counting_waker();
+        let mut context = Context::from_waker(&waker);
+        let mut waiters = (0..ASYNC_WAITER_CAPACITY)
+            .map(|_| Box::pin(notify.notified()))
+            .collect::<Vec<_>>();
+
+        for waiter in &mut waiters {
+            assert!(matches!(waiter.as_mut().poll(&mut context), Poll::Pending));
+        }
+
+        let mut overflow = Box::pin(notify.notified());
+        assert!(matches!(
+            overflow.as_mut().poll(&mut context),
+            Poll::Ready(Err(ObservationError::WaiterCapacityExceeded))
+        ));
+        drop(overflow);
+
+        drop(waiters.pop());
+        let mut replacement = Box::pin(notify.notified());
+        assert!(matches!(
+            replacement.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
     }
 }

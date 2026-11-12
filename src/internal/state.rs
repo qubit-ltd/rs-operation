@@ -236,7 +236,8 @@ impl<T, E> Future for ResultFuture<'_, T, E> {
             }
             let notification = self.notification.as_mut().expect("notification was set");
             match Pin::new(notification).poll(context) {
-                Poll::Ready(()) => self.notification = None,
+                Poll::Ready(Ok(())) => self.notification = None,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -400,6 +401,26 @@ mod tests {
         assert!(matches!(
             result.as_mut().poll(&mut context),
             Poll::Ready(Ok(OperationOutcome::Succeeded(29)))
+        ));
+    }
+
+    #[test]
+    fn test_result_waiter_capacity_error_is_propagated() {
+        let cell = StateCell::<usize, NonCloneError>::new();
+        let (waker, _) = counting_waker();
+        let mut context = Context::from_waker(&waker);
+        let mut waiters = (0..super::super::notify::ASYNC_WAITER_CAPACITY)
+            .map(|_| Box::pin(cell.result()))
+            .collect::<Vec<_>>();
+
+        for waiter in &mut waiters {
+            assert!(matches!(waiter.as_mut().poll(&mut context), Poll::Pending));
+        }
+
+        let mut overflow = Box::pin(cell.result());
+        assert!(matches!(
+            overflow.as_mut().poll(&mut context),
+            Poll::Ready(Err(ObservationError::WaiterCapacityExceeded))
         ));
     }
 
