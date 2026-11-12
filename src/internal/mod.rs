@@ -6,21 +6,22 @@ mod notify;
 // Single-consumer result state and repeatable terminal snapshots.
 mod state;
 
-use crate::{
-    protocol::{ManagedOperationControl, OwnedCleanup},
-    report::{AdmissionError, CleanupOutcome, OperationId, SettlementReport},
-};
-use core::{future::Future, pin::Pin};
+use core::future::Future;
+use core::pin::Pin;
+
+use crate::protocol::ManagedOperationControl;
+use crate::protocol::OwnedCleanup;
+use crate::report::AdmissionError;
+use crate::report::CleanupOutcome;
+use crate::report::OperationId;
+use crate::report::SettlementReport;
 
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 /// A driver accepts already-owned work and returns a control handle only when
 /// it can guarantee that the task is registered before execution begins.
 pub(crate) trait Driver: Send + Sync {
-    fn submit(
-        &self,
-        task: BoxFuture<()>,
-    ) -> Result<Box<dyn ManagedOperationControl>, DriverRejected>;
+    fn submit(&self, task: BoxFuture<()>) -> Result<Box<dyn ManagedOperationControl>, DriverRejected>;
 }
 
 /// Whether an unhandled child failure blocks the parent result.
@@ -38,10 +39,7 @@ pub(crate) struct ChildOptions {
 /// Two-phase registration port; work cannot start until the returned commit
 /// permit is consumed successfully.
 pub(crate) trait ChildRegistry: Send + Sync {
-    fn reserve_child(
-        &self,
-        options: ChildOptions,
-    ) -> Result<Box<dyn ChildReservation>, AdmissionError>;
+    fn reserve_child(&self, options: ChildOptions) -> Result<Box<dyn ChildReservation>, AdmissionError>;
 }
 
 /// Uncommitted reservation. Dropping it releases only the unused reservation;
@@ -58,7 +56,8 @@ pub(crate) struct AttachRejected {
     pub control: Box<dyn ManagedOperationControl>,
 }
 
-/// The only capability that authorizes the already-registered operation to start.
+/// The only capability that authorizes the already-registered operation to
+/// start.
 pub(crate) trait ChildCommit: Send {
     fn commit(self: Box<Self>) -> Result<(), AdmissionError>;
 }
@@ -87,11 +86,7 @@ pub(crate) struct BlockingRejected {
 
 /// Cleanup registration boundary: only ready owners may cross this port.
 pub(crate) trait CleanupPort: Send + Sync {
-    fn begin_cleanup(
-        &self,
-        operation: OperationId,
-        cleanup: Box<dyn OwnedCleanup>,
-    ) -> Result<(), CleanupRejected>;
+    fn begin_cleanup(&self, operation: OperationId, cleanup: Box<dyn OwnedCleanup>) -> Result<(), CleanupRejected>;
     fn record_cleanup(&self, outcome: CleanupOutcome);
     fn settlement(&self, operation: OperationId) -> Option<SettlementReport>;
 }

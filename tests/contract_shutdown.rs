@@ -1,10 +1,16 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
+
 use qubit_operation::report::SupervisorLimits;
 use qubit_operation::scope::ScopeOptions;
-use qubit_operation::supervisor::{OperationSupervisor, ShutdownMode};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::task::{Context, Poll, Wake, Waker};
+use qubit_operation::supervisor::OperationSupervisor;
+use qubit_operation::supervisor::ShutdownMode;
 #[path = "support/gate.rs"]
 mod gate;
 #[path = "support/clock.rs"]
@@ -25,18 +31,9 @@ impl qubit_operation::protocol::OwnedCleanup for RecoveryCleanup {
     fn begin(
         self: Box<Self>,
         _: qubit_operation::protocol::CleanupContext,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = qubit_operation::report::CleanupOutcome>
-                + Send
-                + 'static,
-        >,
-    > {
-        let id = self
-            .id
-            .lock()
-            .unwrap()
-            .expect("resource ID set before cleanup");
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = qubit_operation::report::CleanupOutcome> + Send + 'static>>
+    {
+        let id = self.id.lock().unwrap().expect("resource ID set before cleanup");
         let (typed_key, owner) = self
             .registry
             .register_with_capsule(id, String::from("capsule"), String::from("failure owner"))
@@ -60,13 +57,9 @@ impl qubit_operation::protocol::OwnedCleanup for CountCleanup {
     fn begin(
         self: Box<Self>,
         _: qubit_operation::protocol::CleanupContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = qubit_operation::report::CleanupOutcome> + Send>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = qubit_operation::report::CleanupOutcome> + Send>> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Box::pin(std::future::ready(
-            qubit_operation::report::CleanupOutcome::Cleaned,
-        ))
+        Box::pin(std::future::ready(qubit_operation::report::CleanupOutcome::Cleaned))
     }
 }
 
@@ -82,10 +75,7 @@ impl qubit_operation::protocol::ManagedOperationControl for ReadyControl {
             released: true,
         }
     }
-    fn poll_business(
-        &self,
-        _: &mut Context<'_>,
-    ) -> Poll<qubit_operation::report::ChildBusinessSummary> {
+    fn poll_business(&self, _: &mut Context<'_>) -> Poll<qubit_operation::report::ChildBusinessSummary> {
         Poll::Ready(qubit_operation::report::ChildBusinessSummary {
             operation_id: self.0,
             outcome: qubit_operation::report::ChildBusinessOutcome::Succeeded,
@@ -104,13 +94,8 @@ impl qubit_operation::protocol::OwnedCleanup for GateCleanup {
     fn begin(
         self: Box<Self>,
         _: qubit_operation::protocol::CleanupContext,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = qubit_operation::report::CleanupOutcome>
-                + Send
-                + 'static,
-        >,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = qubit_operation::report::CleanupOutcome> + Send + 'static>>
+    {
         Box::pin(async move {
             self.started.store(true, Ordering::SeqCst);
             self.gate.wait().await;
@@ -172,9 +157,7 @@ fn service_group_drain_does_not_close_shared_supervisor() {
         })
         .unwrap();
     rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-    other_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap();
+    other_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
     gate.wait_started();
     other_gate.wait_started();
     assert!(gate.started());
@@ -214,8 +197,7 @@ fn global_pending_request_count_sums_independent_service_groups_without_root_dou
     let second = supervisor.service_group(2).unwrap();
     let request_a = first.try_admit().unwrap();
     let request_b = second.try_admit().unwrap();
-    let report =
-        supervisor.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_millis(1));
+    let report = supervisor.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_millis(1));
     assert_eq!(report.pending_requests, 2);
     drop(request_a);
     drop(request_b);
@@ -259,27 +241,18 @@ fn drain_timeout_keeps_work_alive_then_cancel_upgrade_waits_for_release() {
             Ok(())
         })
         .unwrap();
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .unwrap();
+    started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
     gate.wait_started();
 
-    let pending =
-        supervisor.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_millis(1));
+    let pending = supervisor.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_millis(1));
     assert_eq!(pending.pending_requests, 1);
-    let pending =
-        supervisor.shutdown_blocking(ShutdownMode::Cancel, std::time::Duration::from_millis(1));
+    let pending = supervisor.shutdown_blocking(ShutdownMode::Cancel, std::time::Duration::from_millis(1));
     assert_eq!(pending.pending_requests, 1);
     gate.release();
-    let complete =
-        supervisor.shutdown_blocking(ShutdownMode::Cancel, std::time::Duration::from_secs(2));
+    let complete = supervisor.shutdown_blocking(ShutdownMode::Cancel, std::time::Duration::from_secs(2));
     assert!(complete.is_complete());
     assert_eq!(
-        handle
-            .observer()
-            .released_blocking()
-            .unwrap()
-            .resource_phase,
+        handle.observer().released_blocking().unwrap().resource_phase,
         qubit_operation::report::ResourcePhase::Released
     );
     assert!(matches!(
@@ -302,7 +275,8 @@ fn async_shutdown_returns_reusable_observer_after_timeout() {
         .unwrap();
     gate.wait_started();
     use qubit_operation::context::Deadline;
-    use qubit_operation::report::{ClockDomainId, MonotonicTime};
+    use qubit_operation::report::ClockDomainId;
+    use qubit_operation::report::MonotonicTime;
     let clock = std::sync::Arc::new(manual_clock::ManualClock::new(ClockDomainId(907)));
     let timer_clock = clock.clone();
     let timer = std::thread::spawn(move || {
@@ -319,18 +293,15 @@ fn async_shutdown_returns_reusable_observer_after_timeout() {
     assert_eq!(clock.pending_timers(), 0);
     assert_eq!(pending.report.pending_requests, 1);
     gate.release();
-    let complete = block_on(pending.observer.wait_async(
-        Deadline::at(MonotonicTime::new(ClockDomainId(907), 2)),
-        clock,
-    ))
+    let complete = block_on(
+        pending
+            .observer
+            .wait_async(Deadline::at(MonotonicTime::new(ClockDomainId(907), 2)), clock),
+    )
     .unwrap();
     assert!(complete.report.is_complete());
     assert!(matches!(
-        handle
-            .observer()
-            .released_blocking()
-            .unwrap()
-            .resource_phase,
+        handle.observer().released_blocking().unwrap().resource_phase,
         qubit_operation::report::ResourcePhase::Released
     ));
 }
@@ -350,22 +321,18 @@ fn timed_out_shutdown_observer_unregisters_its_waker() {
     supervisor.close();
 
     use qubit_operation::context::Deadline;
-    use qubit_operation::report::{ClockDomainId, MonotonicTime};
+    use qubit_operation::report::ClockDomainId;
+    use qubit_operation::report::MonotonicTime;
     let clock = Arc::new(manual_clock::ManualClock::new(ClockDomainId(908)));
     let wake_owner = Arc::new(WakerProbe);
     let waker = Waker::from(Arc::clone(&wake_owner));
     let mut context = Context::from_waker(&waker);
     let observer = supervisor.shutdown_observer();
-    let mut wait = Box::pin(observer.wait_async(
-        Deadline::at(MonotonicTime::new(ClockDomainId(908), 1)),
-        clock.clone(),
-    ));
+    let mut wait =
+        Box::pin(observer.wait_async(Deadline::at(MonotonicTime::new(ClockDomainId(908), 1)), clock.clone()));
     assert!(wait.as_mut().poll(&mut context).is_pending());
     clock.advance_by(1);
-    assert!(matches!(
-        wait.as_mut().poll(&mut context),
-        Poll::Ready(Ok(_))
-    ));
+    assert!(matches!(wait.as_mut().poll(&mut context), Poll::Ready(Ok(_))));
     drop(wait);
     assert_eq!(Arc::strong_count(&wake_owner), 2);
 
@@ -391,7 +358,8 @@ fn shutdown_observer_waiters_respect_finite_capacity() {
     gate.wait_started();
     supervisor.close();
     use qubit_operation::context::Deadline;
-    use qubit_operation::report::{ClockDomainId, MonotonicTime};
+    use qubit_operation::report::ClockDomainId;
+    use qubit_operation::report::MonotonicTime;
     let clock = Arc::new(manual_clock::ManualClock::new(ClockDomainId(909)));
     let deadline = Deadline::at(MonotonicTime::new(ClockDomainId(909), 10));
     let observer = supervisor.shutdown_observer();
@@ -405,9 +373,7 @@ fn shutdown_observer_waiters_respect_finite_capacity() {
     let mut second_wait = Box::pin(observer.wait_async(deadline, clock));
     assert!(matches!(
         second_wait.as_mut().poll(&mut second_context),
-        Poll::Ready(Err(
-            qubit_operation::context::ContextError::WaiterCapacityExceeded
-        ))
+        Poll::Ready(Err(qubit_operation::context::ContextError::WaiterCapacityExceeded))
     ));
 
     drop(first_wait);
@@ -469,8 +435,7 @@ fn service_resource_scope_has_independent_quota_and_cleanup_is_kept_alive() {
     drop(rejected.into_owner());
     assert_eq!(supervisor.active_roots(), 0);
 
-    let pending =
-        group.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_millis(10));
+    let pending = group.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_millis(10));
     assert_eq!(pending.pending_resources, 1);
     assert!(started.load(Ordering::SeqCst));
     assert!(matches!(
@@ -501,8 +466,7 @@ fn global_cancel_closes_service_groups_and_waits_for_service_resource_cleanup() 
         })
         .unwrap();
 
-    let pending =
-        supervisor.shutdown_blocking(ShutdownMode::Cancel, std::time::Duration::from_millis(10));
+    let pending = supervisor.shutdown_blocking(ShutdownMode::Cancel, std::time::Duration::from_millis(10));
     assert_eq!(pending.pending_resources, 1);
     cleanup_gate.wait_started();
     assert!(started.load(Ordering::SeqCst));
@@ -554,8 +518,7 @@ fn unresolved_recovery_owner_is_reported_as_shutdown_responsibility() {
         settlement.resource_phase,
         qubit_operation::report::ResourcePhase::RecoveryRequired
     );
-    let report =
-        supervisor.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_secs(1));
+    let report = supervisor.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_secs(1));
     assert_eq!(report.pending_recovery, 1);
     assert!(!report.is_complete());
     let scope = scope_slot.lock().unwrap().take().unwrap();
@@ -580,12 +543,8 @@ fn dropping_service_group_retains_and_runs_service_resource_cleanup() {
     drop(resource_scope);
     drop(group);
 
-    let report =
-        supervisor.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_secs(1));
-    assert!(
-        report.is_complete(),
-        "dropped service group must settle: {report:?}"
-    );
+    let report = supervisor.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_secs(1));
+    assert!(report.is_complete(), "dropped service group must settle: {report:?}");
     assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
 }
 
@@ -634,9 +593,9 @@ fn drain_allows_existing_root_to_commit_children_but_cancel_rejects_commit() {
                     .reserve_child(qubit_operation::scope::ChildRequirement::Required)
                     .unwrap();
                 reservation
-                    .attach(Arc::new(ReadyControl(
-                        qubit_operation::report::OperationId::new(900_000),
-                    )))
+                    .attach(Arc::new(ReadyControl(qubit_operation::report::OperationId::new(
+                        900_000,
+                    ))))
                     .unwrap();
                 let committed = reservation.commit().is_ok();
                 commit_tx.send(committed).unwrap();
@@ -652,9 +611,7 @@ fn drain_allows_existing_root_to_commit_children_but_cancel_rejects_commit() {
         );
         gate.release();
         assert_eq!(
-            commit_rx
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .unwrap(),
+            commit_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
             expected_commit
         );
         assert!(

@@ -1,4 +1,6 @@
-use super::{DiagnosticSummary, OperationId, ResourceId};
+use super::DiagnosticSummary;
+use super::OperationId;
+use super::ResourceId;
 
 /// Typed business result, kept separate from resource settlement.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,7 +46,8 @@ pub enum ChildBusinessOutcome {
     Panicked,
 }
 
-/// Stop cause recorded by the supervisor; acceptance does not prove work has stopped.
+/// Stop cause recorded by the supervisor; acceptance does not prove work has
+/// stopped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StopReason {
     /// Cancellation explicitly requested by the caller.
@@ -59,7 +62,8 @@ pub enum StopReason {
     RequiredChildFailed,
 }
 
-/// Caller-level stop request; the supervisor maps it to a lifecycle `StopReason`.
+/// Caller-level stop request; the supervisor maps it to a lifecycle
+/// `StopReason`.
 pub type CancelReason = StopReason;
 
 /// Immutable stop fact attached to a business result.
@@ -80,7 +84,8 @@ pub struct PanicSummary {
     pub phase: DiagnosticSummary,
 }
 
-/// Caller-declared side-effect fact; the framework does not independently verify it.
+/// Caller-declared side-effect fact; the framework does not independently
+/// verify it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectRecord {
     /// Operation that reported the effect.

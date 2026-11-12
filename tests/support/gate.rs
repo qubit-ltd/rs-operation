@@ -50,20 +50,12 @@ impl Gate {
 
     /// Report whether a waiter has actually polled the gate.
     pub fn started(&self) -> bool {
-        self.inner
-            .state
-            .lock()
-            .expect("gate mutex poisoned")
-            .started
+        self.inner.state.lock().expect("gate mutex poisoned").started
     }
 
     /// Report whether the release phase has been opened.
     pub fn is_released(&self) -> bool {
-        self.inner
-            .state
-            .lock()
-            .expect("gate mutex poisoned")
-            .released
+        self.inner.state.lock().expect("gate mutex poisoned").released
     }
 
     /// Open the release phase and wake futures that reached the gate.
@@ -84,18 +76,12 @@ impl Gate {
 
     /// Wait for the started phase, failing after a bounded test watchdog.
     pub fn wait_started(&self) {
-        self.wait_for_phase(
-            |state| state.started,
-            "gate was not started before watchdog",
-        );
+        self.wait_for_phase(|state| state.started, "gate was not started before watchdog");
     }
 
     /// Wait for the released phase, failing after a bounded test watchdog.
     pub fn wait_released(&self) {
-        self.wait_for_phase(
-            |state| state.released,
-            "gate was not released before watchdog",
-        );
+        self.wait_for_phase(|state| state.released, "gate was not released before watchdog");
     }
 
     fn wait_for_phase(&self, ready: impl Fn(&GateState) -> bool, message: &str) {
@@ -124,11 +110,7 @@ impl Future for GateWait {
         if state.released {
             return Poll::Ready(());
         }
-        if !state
-            .waiters
-            .iter()
-            .any(|waiter| waiter.will_wake(context.waker()))
-        {
+        if !state.waiters.iter().any(|waiter| waiter.will_wake(context.waker())) {
             state.waiters.push(context.waker().clone());
         }
         Poll::Pending

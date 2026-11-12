@@ -24,8 +24,7 @@ use support::ManualDriver;
 #[test]
 fn test_gate_reports_start_before_release_and_drop_probe_tracks_real_drop() {
     let gate = Gate::new();
-    let (probe, probe_counter): (support::DropProbe, support::DropProbeCounter) =
-        support::DropProbe::new();
+    let (probe, probe_counter): (support::DropProbe, support::DropProbeCounter) = support::DropProbe::new();
     let driver = ManualDriver::new();
     let gate_future = gate.wait();
     let probe_future = async move {
@@ -85,10 +84,7 @@ fn test_fake_control_records_real_stop_calls_and_separates_business_from_release
     let task_waker = waker.waker();
     let mut context = Context::from_waker(&task_waker);
 
-    assert_eq!(
-        control.poll_business(&mut context),
-        std::task::Poll::Pending
-    );
+    assert_eq!(control.poll_business(&mut context), std::task::Poll::Pending);
     control.request_stop(StopReason::UserCancelled);
     control.request_stop(StopReason::Timeout);
     assert_eq!(control.stop_requests(), 2);
@@ -96,20 +92,11 @@ fn test_fake_control_records_real_stop_calls_and_separates_business_from_release
     assert_eq!(waker.wake_count(), 0);
     control.complete_business(support::BusinessResult::Succeeded);
     assert_eq!(waker.wake_count(), 1);
-    assert!(matches!(
-        control.poll_business(&mut context),
-        std::task::Poll::Ready(_)
-    ));
-    assert_eq!(
-        control.poll_released(&mut context),
-        std::task::Poll::Pending
-    );
+    assert!(matches!(control.poll_business(&mut context), std::task::Poll::Ready(_)));
+    assert_eq!(control.poll_released(&mut context), std::task::Poll::Pending);
     control.confirm_release();
     assert_eq!(waker.wake_count(), 2);
-    assert!(matches!(
-        control.poll_released(&mut context),
-        std::task::Poll::Ready(_)
-    ));
+    assert!(matches!(control.poll_released(&mut context), std::task::Poll::Ready(_)));
     assert_eq!(control.snapshot().operation_id, control.operation_id());
 
     let failed_control = FakeControl::new();
@@ -173,10 +160,7 @@ fn test_fake_cleanup_success_and_panic_follow_the_selected_branch() {
             qubit_operation::report::CleanupOutcome::Cleaned
         ));
     });
-    assert_eq!(
-        success_driver.poll_once(success_task),
-        std::task::Poll::Ready(())
-    );
+    assert_eq!(success_driver.poll_once(success_task), std::task::Poll::Ready(()));
 
     let panic_waker = CountingWaker::new();
     let panic_task_waker = panic_waker.waker();
@@ -186,10 +170,7 @@ fn test_fake_cleanup_success_and_panic_follow_the_selected_branch() {
         std::future::Future::poll(panicking.as_mut(), &mut context)
     }));
 
-    assert!(
-        panic.is_err(),
-        "the scripted panic branch must panic when polled"
-    );
+    assert!(panic.is_err(), "the scripted panic branch must panic when polled");
 }
 
 #[test]

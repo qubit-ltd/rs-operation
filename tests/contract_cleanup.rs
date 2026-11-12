@@ -1,18 +1,32 @@
-use qubit_operation::protocol::CleanupContext;
-use qubit_operation::protocol::OwnedCleanup;
-use qubit_operation::report::{
-    CleanupFailure, CleanupOutcome, CleanupStage, DiagnosticSummary, RecoveryOwner, ResourcePhase,
-    SettlementReport,
-};
-use qubit_operation::report::{ClockDomainId, MonotonicTime, OperationId, ResourceId};
-use qubit_operation::resource::{
-    CleanupObservation, CleanupResponsibility, CleanupScheduler, RecoveryRegistry, ResourceRegistry,
-};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
+
+use qubit_operation::protocol::CleanupContext;
+use qubit_operation::protocol::OwnedCleanup;
+use qubit_operation::report::CleanupFailure;
+use qubit_operation::report::CleanupOutcome;
+use qubit_operation::report::CleanupStage;
+use qubit_operation::report::ClockDomainId;
+use qubit_operation::report::DiagnosticSummary;
+use qubit_operation::report::MonotonicTime;
+use qubit_operation::report::OperationId;
+use qubit_operation::report::RecoveryOwner;
+use qubit_operation::report::ResourceId;
+use qubit_operation::report::ResourcePhase;
+use qubit_operation::report::SettlementReport;
+use qubit_operation::resource::CleanupObservation;
+use qubit_operation::resource::CleanupResponsibility;
+use qubit_operation::resource::CleanupScheduler;
+use qubit_operation::resource::RecoveryRegistry;
+use qubit_operation::resource::ResourceRegistry;
 
 struct NoopWake;
 impl Wake for NoopWake {
@@ -45,10 +59,7 @@ impl Drop for ControlledPending {
 struct CountCleanup(Arc<AtomicUsize>);
 
 impl OwnedCleanup for CountCleanup {
-    fn begin(
-        self: Box<Self>,
-        _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+    fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { CleanupOutcome::Cleaned })
     }
@@ -59,10 +70,7 @@ struct FailedCleanup {
     owner: RecoveryOwner,
 }
 impl OwnedCleanup for FailedCleanup {
-    fn begin(
-        self: Box<Self>,
-        _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+    fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
         let failure = CleanupFailure {
             resource_id: self.resource_id,
             stage: CleanupStage::Removing,
@@ -89,20 +97,13 @@ fn receiver_receipt_requires_acceptance_and_source_tombstone_waits_for_release()
     let source = ResourceRegistry::new(OperationId::new(1), 1);
     let destination = ResourceRegistry::new(OperationId::new(2), 1);
     let calls = Arc::new(AtomicUsize::new(0));
-    let handle = source
-        .register(Box::new(CountCleanup(Arc::clone(&calls))))
-        .unwrap();
+    let handle = source.register(Box::new(CountCleanup(Arc::clone(&calls)))).unwrap();
     handle.close_for_use().unwrap();
     let ready = source.take_ready_cleanup().unwrap();
     let (resource_id, owner) = ready.into_parts();
-    let (_, receipt) = destination
-        .accept_cleanup_transfer(resource_id, owner)
-        .unwrap();
+    let (_, receipt) = destination.accept_cleanup_transfer(resource_id, owner).unwrap();
     source.confirm_transferred(resource_id, receipt).unwrap();
-    assert!(
-        source.contains(resource_id),
-        "source tombstone survives transfer"
-    );
+    assert!(source.contains(resource_id), "source tombstone survives transfer");
     let destination_cleanup = destination.take_ready_cleanup().unwrap();
     let (destination_id, owner) = destination_cleanup.into_parts();
     let _future = owner.begin(CleanupContext { deadline: None });
@@ -122,9 +123,7 @@ fn receiver_receipt_requires_acceptance_and_source_tombstone_waits_for_release()
         source.confirm_released(resource_id).is_err(),
         "source cannot self-confirm external release"
     );
-    source
-        .confirm_transferred_released(resource_id, release)
-        .unwrap();
+    source.confirm_transferred_released(resource_id, release).unwrap();
     assert!(!source.contains(resource_id));
 }
 
@@ -132,9 +131,7 @@ fn receiver_receipt_requires_acceptance_and_source_tombstone_waits_for_release()
 fn recovery_registry_preserves_typed_owner_until_single_extraction() {
     let id = ResourceId::new(OperationId::new(4), 2, 9);
     let recovery = RecoveryRegistry::new(1);
-    let key = recovery
-        .register(id, String::from("reopen handle"))
-        .unwrap();
+    let key = recovery.register(id, String::from("reopen handle")).unwrap();
     assert_eq!(recovery.len(), 1);
     assert_eq!(recovery.take_recovery(key).unwrap(), "reopen handle");
     assert_eq!(recovery.len(), 0);
@@ -163,11 +160,10 @@ fn responsibility_owner_retains_pending_task_after_scheduler_and_observer_drop()
     let responsibility: CleanupResponsibility = scheduler.responsibility_owner();
     let ready = Arc::new(AtomicBool::new(false));
     let drops = Arc::new(AtomicUsize::new(0));
-    let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> =
-        Box::pin(ControlledPending {
-            ready: Arc::clone(&ready),
-            drops: Arc::clone(&drops),
-        });
+    let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> = Box::pin(ControlledPending {
+        ready: Arc::clone(&ready),
+        drops: Arc::clone(&drops),
+    });
     let mut observer = scheduler
         .schedule_until(id, MonotonicTime::new(ClockDomainId(3), 5), future)
         .unwrap_or_else(|_| unreachable!());
@@ -184,9 +180,7 @@ fn responsibility_owner_retains_pending_task_after_scheduler_and_observer_drop()
     assert_eq!(responsibility.active(), 1);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
 
-    let mut observer = responsibility
-        .task(id)
-        .expect("supervisor responsibility retains task");
+    let mut observer = responsibility.task(id).expect("supervisor responsibility retains task");
     assert!(matches!(
         observer.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(3), 6)),
         Poll::Ready(CleanupObservation::Pending)
@@ -205,9 +199,7 @@ fn responsibility_owner_retains_pending_task_after_scheduler_and_observer_drop()
 fn cleanup_panic_is_reported_and_independent_capsule_remains_retrievable() {
     let id = ResourceId::new(OperationId::new(7), 1, 2);
     let recovery = RecoveryRegistry::new(1);
-    let key = recovery
-        .register(id, String::from("reopen resource"))
-        .unwrap();
+    let key = recovery.register(id, String::from("reopen resource")).unwrap();
     let scheduler = CleanupScheduler::new(1);
     let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> = Box::pin(async {
         panic!("cleanup adapter panicked");
@@ -238,8 +230,7 @@ fn cleanup_panic_is_reported_and_independent_capsule_remains_retrievable() {
 fn expired_deadline_reports_unconfirmed_without_dropping_task_or_permit() {
     let id = ResourceId::new(OperationId::new(8), 1, 0);
     let scheduler = CleanupScheduler::new(1);
-    let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> =
-        Box::pin(async { CleanupOutcome::Cleaned });
+    let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> = Box::pin(async { CleanupOutcome::Cleaned });
     let mut task_handle = Box::pin(
         scheduler
             .schedule_until(id, MonotonicTime::new(ClockDomainId(9), 5), future)
@@ -259,33 +250,21 @@ fn expired_deadline_reports_unconfirmed_without_dropping_task_or_permit() {
             Poll::Ready(CleanupObservation::Unconfirmed { resource_id }) if resource_id == id
         ));
     }
-    assert_eq!(
-        scheduler.active(),
-        1,
-        "Unconfirmed keeps cleanup capacity reserved"
-    );
+    assert_eq!(scheduler.active(), 1, "Unconfirmed keeps cleanup capacity reserved");
     drop(task_handle);
-    let mut task = scheduler
-        .task(id)
-        .expect("scheduler retains task after observer drop");
+    let mut task = scheduler.task(id).expect("scheduler retains task after observer drop");
     assert!(matches!(
         task.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(9), 6)),
         Poll::Ready(CleanupObservation::Settled(Ok(CleanupOutcome::Cleaned)))
     ));
-    assert_eq!(
-        scheduler.active(),
-        0,
-        "confirmed completion releases cleanup capacity"
-    );
+    assert_eq!(scheduler.active(), 0, "confirmed completion releases cleanup capacity");
 }
 
 #[test]
 fn failed_prerequisite_blocks_dependent_even_after_capsule_is_taken() {
     let registry = ResourceRegistry::new(OperationId::new(10), 2);
     let calls = Arc::new(AtomicUsize::new(0));
-    let dependent = registry
-        .register(Box::new(CountCleanup(Arc::clone(&calls))))
-        .unwrap();
+    let dependent = registry.register(Box::new(CountCleanup(Arc::clone(&calls)))).unwrap();
     let prerequisite_id = ResourceId::new(OperationId::new(10), 1, 0);
     let recovery = RecoveryRegistry::new(1);
     let (key, failure_owner) = recovery
@@ -316,10 +295,7 @@ fn failed_prerequisite_blocks_dependent_even_after_capsule_is_taken() {
     );
     let waker = Waker::from(Arc::new(NoopWake));
     let mut cx = Context::from_waker(&waker);
-    let Poll::Ready(CleanupObservation::Settled(Ok(CleanupOutcome::FailedWithRecovery(
-        failure,
-        _owner,
-    )))) = task
+    let Poll::Ready(CleanupObservation::Settled(Ok(CleanupOutcome::FailedWithRecovery(failure, _owner)))) = task
         .as_mut()
         .get_mut()
         .poll_at(&mut cx, MonotonicTime::new(ClockDomainId(1), 0))
@@ -344,9 +320,7 @@ fn recovery_key_is_single_use_and_capacity_failure_returns_owner() {
     let id = ResourceId::new(OperationId::new(11), 0, 4);
     let old_generation = ResourceId::new(OperationId::new(11), 0, 3);
     let recovery = RecoveryRegistry::new(1);
-    let key = recovery
-        .register(id, String::from("current owner"))
-        .unwrap();
+    let key = recovery.register(id, String::from("current owner")).unwrap();
     let rejected = recovery
         .register(old_generation, String::from("old owner"))
         .unwrap_err();
@@ -393,11 +367,7 @@ fn retry_keeps_capsule_and_dependency_group_transfer_is_atomic() {
         )
         .unwrap_or_else(|_| unreachable!());
     let scheduler = CleanupScheduler::new(1);
-    let mut task = Box::pin(
-        scheduler
-            .schedule(id, retry)
-            .unwrap_or_else(|_| unreachable!()),
-    );
+    let mut task = Box::pin(scheduler.schedule(id, retry).unwrap_or_else(|_| unreachable!()));
     let waker = Waker::from(Arc::new(NoopWake));
     let mut cx = Context::from_waker(&waker);
     assert!(matches!(
@@ -407,10 +377,7 @@ fn retry_keeps_capsule_and_dependency_group_transfer_is_atomic() {
         Poll::Ready(CleanupObservation::Settled(Ok(CleanupOutcome::Cleaned)))
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(
-        recovery.keep(&key),
-        "retry does not discard the retained capsule"
-    );
+    assert!(recovery.keep(&key), "retry does not discard the retained capsule");
     assert_eq!(recovery.take_recovery(key).unwrap(), "capsule");
 
     let source = ResourceRegistry::new(OperationId::new(13), 2);
@@ -424,10 +391,6 @@ fn retry_keeps_capsule_and_dependency_group_transfer_is_atomic() {
     dependent.cleanup_after(&prerequisite).unwrap();
     let source_ids = [prerequisite.id(), dependent.id()];
     source.transfer_to(&prerequisite, &destination).unwrap();
-    assert!(
-        source_ids
-            .iter()
-            .all(|resource| !source.contains(*resource))
-    );
+    assert!(source_ids.iter().all(|resource| !source.contains(*resource)));
     assert!(destination.contains(prerequisite.id()) && destination.contains(dependent.id()));
 }

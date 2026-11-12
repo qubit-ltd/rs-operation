@@ -43,10 +43,7 @@ pub fn thread_worker_loop(shared: Arc<ThreadShared>) {
                 if state.closed {
                     return;
                 }
-                state = shared
-                    .ready
-                    .wait(state)
-                    .unwrap_or_else(|error| error.into_inner());
+                state = shared.ready.wait(state).unwrap_or_else(|error| error.into_inner());
             }
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));

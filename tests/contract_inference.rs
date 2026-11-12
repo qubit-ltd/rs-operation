@@ -7,21 +7,36 @@
 #[path = "support/gate.rs"]
 mod gate;
 
-use gate::Gate;
-use qubit_operation::protocol::{CleanupContext, ManagedOperationControl, OwnedCleanup};
-use qubit_operation::report::{
-    ChildBusinessOutcome, ChildBusinessSummary, ChildSettlement, ChildSnapshot, CleanupOutcome,
-    DiagnosticSummary, OperationId, OperationOutcome, OperationPhase, ResourcePhase, StopReason,
-    SupervisorLimits,
-};
-use qubit_operation::scope::{ChildRequirement, ScopeOptions};
-use qubit_operation::supervisor::OperationSupervisor;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
+
+use gate::Gate;
+use qubit_operation::protocol::CleanupContext;
+use qubit_operation::protocol::ManagedOperationControl;
+use qubit_operation::protocol::OwnedCleanup;
+use qubit_operation::report::ChildBusinessOutcome;
+use qubit_operation::report::ChildBusinessSummary;
+use qubit_operation::report::ChildSettlement;
+use qubit_operation::report::ChildSnapshot;
+use qubit_operation::report::CleanupOutcome;
+use qubit_operation::report::DiagnosticSummary;
+use qubit_operation::report::OperationId;
+use qubit_operation::report::OperationOutcome;
+use qubit_operation::report::OperationPhase;
+use qubit_operation::report::ResourcePhase;
+use qubit_operation::report::StopReason;
+use qubit_operation::report::SupervisorLimits;
+use qubit_operation::scope::ChildRequirement;
+use qubit_operation::scope::ScopeOptions;
+use qubit_operation::supervisor::OperationSupervisor;
 
 static NEXT_CHILD: AtomicU64 = AtomicU64::new(20_000);
 
@@ -112,11 +127,7 @@ impl ManagedOperationControl for InferenceChild {
                 summary: DiagnosticSummary::new("fake inference child stopped"),
             }),
             None => {
-                if !state
-                    .business_waiters
-                    .iter()
-                    .any(|w| w.will_wake(cx.waker()))
-                {
+                if !state.business_waiters.iter().any(|w| w.will_wake(cx.waker())) {
                     state.business_waiters.push(cx.waker().clone());
                 }
                 Poll::Pending
@@ -133,11 +144,7 @@ impl ManagedOperationControl for InferenceChild {
                 summary: DiagnosticSummary::new("fake inference child released"),
             })
         } else {
-            if !state
-                .release_waiters
-                .iter()
-                .any(|w| w.will_wake(cx.waker()))
-            {
+            if !state.release_waiters.iter().any(|w| w.will_wake(cx.waker())) {
                 state.release_waiters.push(cx.waker().clone());
             }
             Poll::Pending
@@ -148,10 +155,7 @@ impl ManagedOperationControl for InferenceChild {
 struct FeatureCleanup(Arc<AtomicUsize>);
 
 impl OwnedCleanup for FeatureCleanup {
-    fn begin(
-        self: Box<Self>,
-        _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+    fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { CleanupOutcome::Cleaned })
     }
@@ -233,7 +237,8 @@ fn sampling_stops_but_native_feature_lease_survives_until_worker_exit() {
                 native_exit_tx.send(()).expect("test observes native exit");
             });
 
-            // Sampling is interruptible; cancellation releases this gate and lets the body return.
+            // Sampling is interruptible; cancellation releases this gate and lets the body
+            // return.
             body_sampling_gate.wait().await;
             Ok::<_, &'static str>("sampled")
         })
@@ -260,9 +265,7 @@ fn sampling_stops_but_native_feature_lease_survives_until_worker_exit() {
     native_exit_rx
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("native worker exits after explicit gate release");
-    let settlement = operation
-        .released_blocking()
-        .expect("native resource settles");
+    let settlement = operation.released_blocking().expect("native resource settles");
     assert!(settlement.all_released);
     assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
 }

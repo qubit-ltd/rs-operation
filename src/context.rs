@@ -3,15 +3,23 @@
 #[path = "context/deadline.rs"]
 mod deadline;
 
-pub use deadline::{ClockDomainMismatch, Deadline, DeadlineSignal};
-
-use crate::protocol::{ClockSource, StopReason};
-use crate::report::MonotonicTime;
 use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
-use std::sync::{Arc, Mutex, Weak};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
+
+pub use deadline::ClockDomainMismatch;
+pub use deadline::Deadline;
+pub use deadline::DeadlineSignal;
+
+use crate::protocol::ClockSource;
+use crate::protocol::StopReason;
+use crate::report::MonotonicTime;
 
 /// A borrowed policy reference for a caller-owned finite budget.
 ///
@@ -64,7 +72,8 @@ pub struct ContextOptions {
     pub clock: Option<Arc<dyn ClockSource>>,
     /// Absolute deadline; it must use the selected clock's domain.
     pub deadline: Option<Deadline>,
-    /// Optional caller-owned budget policy; no measurement semantics are imposed.
+    /// Optional caller-owned budget policy; no measurement semantics are
+    /// imposed.
     pub budget: Option<Arc<dyn BudgetLease>>,
 }
 
@@ -135,11 +144,7 @@ impl Node {
             }
             state.stop_reason = Some(reason);
             state.children.retain(|child| child.strong_count() > 0);
-            let children = state
-                .children
-                .iter()
-                .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>();
+            let children = state.children.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
             (children, std::mem::take(&mut state.stop_waiters))
         };
         for waker in waiters.into_iter().map(|(_, waker)| waker) {
@@ -183,11 +188,7 @@ impl OperationContext {
     pub fn child(&self, options: ContextOptions) -> Result<Self, ContextError> {
         let clock = options.clock.or_else(|| self.clock.clone());
         let deadline = match (self.deadline, options.deadline) {
-            (Some(parent), Some(child)) => Some(
-                parent
-                    .earliest(child)
-                    .map_err(|_| ContextError::ClockDomainMismatch)?,
-            ),
+            (Some(parent), Some(child)) => Some(parent.earliest(child).map_err(|_| ContextError::ClockDomainMismatch)?),
             (Some(parent), None) => Some(parent),
             (None, child) => child,
         };
@@ -218,7 +219,8 @@ impl OperationContext {
         Self::new(options)
     }
 
-    /// Request stop; the first accepted cause is stable and propagates downward.
+    /// Request stop; the first accepted cause is stable and propagates
+    /// downward.
     pub fn request_stop(&self, reason: StopReason) -> bool {
         self.node.request_stop(reason)
     }
@@ -228,7 +230,8 @@ impl OperationContext {
         self.node.stop_reason()
     }
 
-    /// Observe the first stop request asynchronously. The node retains at most 64 waiters.
+    /// Observe the first stop request asynchronously. The node retains at most
+    /// 64 waiters.
     pub fn stop_signal(&self) -> StopSignal {
         StopSignal {
             node: Arc::clone(&self.node),
@@ -242,7 +245,8 @@ impl OperationContext {
         self.deadline
     }
 
-    /// Check stop, deadline, and the optional caller-owned lease before work begins.
+    /// Check stop, deadline, and the optional caller-owned lease before work
+    /// begins.
     pub fn admission_check(&self) -> Result<(), ContextError> {
         if self.node.stop_reason().is_some() {
             return Err(ContextError::Stopped);
@@ -253,9 +257,7 @@ impl OperationContext {
             return Err(ContextError::DeadlineExpired);
         }
         if let Some(budget) = &self.budget {
-            budget
-                .check()
-                .map_err(|_| ContextError::BudgetUnavailable)?;
+            budget.check().map_err(|_| ContextError::BudgetUnavailable)?;
         }
         Ok(())
     }
@@ -265,8 +267,7 @@ impl OperationContext {
         match (self.deadline, self.clock.as_ref()) {
             (Some(deadline), Some(clock)) => {
                 let now = clock.now();
-                now.domain == deadline.time_point().domain
-                    && now.ticks >= deadline.time_point().ticks
+                now.domain == deadline.time_point().domain && now.ticks >= deadline.time_point().ticks
             }
             _ => false,
         }
@@ -279,11 +280,7 @@ impl OperationContext {
         if clock.now().domain != deadline.time_point().domain {
             return None;
         }
-        Some(DeadlineSignal::new(
-            deadline,
-            clock,
-            Arc::downgrade(&self.node),
-        ))
+        Some(DeadlineSignal::new(deadline, clock, Arc::downgrade(&self.node)))
     }
 
     /// Register an observer-only timer in this context's clock domain.
@@ -293,11 +290,7 @@ impl OperationContext {
             return Err(ContextError::ClockDomainMismatch);
         }
         let observer_node = Arc::new(Node::new());
-        Ok(DeadlineSignal::new(
-            deadline,
-            clock,
-            Arc::downgrade(&observer_node),
-        ))
+        Ok(DeadlineSignal::new(deadline, clock, Arc::downgrade(&observer_node)))
     }
 }
 
@@ -325,20 +318,11 @@ impl Future for StopSignal {
                 let old_waker = this
                     .waiter_id
                     .take()
-                    .and_then(|id| {
-                        state
-                            .stop_waiters
-                            .iter()
-                            .position(|(candidate, _)| *candidate == id)
-                    })
+                    .and_then(|id| state.stop_waiters.iter().position(|(candidate, _)| *candidate == id))
                     .map(|index| state.stop_waiters.swap_remove(index).1);
                 (Some(Ok(reason)), old_waker, Some(replacement))
             } else if let Some(id) = this.waiter_id {
-                let Some((_, stored)) = state
-                    .stop_waiters
-                    .iter_mut()
-                    .find(|(candidate, _)| *candidate == id)
-                else {
+                let Some((_, stored)) = state.stop_waiters.iter_mut().find(|(candidate, _)| *candidate == id) else {
                     this.completed = true;
                     return Poll::Ready(Err(ContextError::Stopped));
                 };
@@ -349,11 +333,7 @@ impl Future for StopSignal {
                 }
             } else if state.stop_waiters.len() >= STOP_WAITER_CAPACITY {
                 this.completed = true;
-                (
-                    Some(Err(ContextError::WaiterCapacityExceeded)),
-                    None,
-                    Some(replacement),
-                )
+                (Some(Err(ContextError::WaiterCapacityExceeded)), None, Some(replacement))
             } else {
                 let id = state.next_waiter;
                 let Some(next) = id.checked_add(1) else {
@@ -392,15 +372,10 @@ impl Drop for StopSignal {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn validate_clock(
-    clock: Option<&dyn ClockSource>,
-    deadline: Option<Deadline>,
-) -> Result<(), ContextError> {
+fn validate_clock(clock: Option<&dyn ClockSource>, deadline: Option<Deadline>) -> Result<(), ContextError> {
     if let Some(deadline) = deadline {
         let Some(clock) = clock else {
             return Err(ContextError::ClockUnavailable);

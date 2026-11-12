@@ -94,7 +94,8 @@ pub struct TransferReceipt {
 }
 
 impl TransferReceipt {
-    /// Create a receipt only after the receiving registry accepted responsibility.
+    /// Create a receipt only after the receiving registry accepted
+    /// responsibility.
     #[allow(dead_code)] // Called by the recovery registry after accepting an owner.
     pub(crate) const fn accepted_by_registry(resource: ResourceId, receiver: ResourceId) -> Self {
         Self {

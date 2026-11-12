@@ -1,12 +1,16 @@
 /// Finite capacity reserved for one root operation and its descendants.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Per-root finite registration capacity. Exhaustion rejects registration before work starts.
+/// Per-root finite registration capacity. Exhaustion rejects registration
+/// before work starts.
 pub struct ScopeLimits {
-    /// Maximum child-operation registrations, including attached but unreleased children.
+    /// Maximum child-operation registrations, including attached but unreleased
+    /// children.
     pub child_operations: usize,
-    /// Maximum resource registrations, including resources retained for recovery.
+    /// Maximum resource registrations, including resources retained for
+    /// recovery.
     pub resources: usize,
-    /// Maximum caller-declared side-effect records retained in the root settlement.
+    /// Maximum caller-declared side-effect records retained in the root
+    /// settlement.
     pub effect_records: usize,
 }
 

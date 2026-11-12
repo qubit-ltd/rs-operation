@@ -1,5 +1,7 @@
+use core::future::Future;
+use core::pin::Pin;
+
 pub use crate::report::CleanupOutcome;
-use core::{future::Future, pin::Pin};
 
 /// Cleanup-only authority; its deadline does not inherit business cancellation.
 #[derive(Clone, Copy, Debug)]
@@ -34,9 +36,9 @@ pub struct CleanupContext {
 /// }
 /// ```
 pub trait OwnedCleanup: Send + 'static {
-    /// Consume the cleanup action and produce an owned, independently driven future.
-    /// The future must report only confirmed cleanup, accepted transfer, or a
-    /// failure that retains recovery ownership.
+    /// Consume the cleanup action and produce an owned, independently driven
+    /// future. The future must report only confirmed cleanup, accepted
+    /// transfer, or a failure that retains recovery ownership.
     fn begin(
         self: Box<Self>,
         context: CleanupContext,

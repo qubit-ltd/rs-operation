@@ -69,18 +69,17 @@ impl ManualClock {
         }
     }
 
-    /// Advance by a number of ticks and wake every timer crossed by the advance.
+    /// Advance by a number of ticks and wake every timer crossed by the
+    /// advance.
     pub fn advance_by(&self, ticks: u64) -> MonotonicTime {
         let current = self.now();
-        let target = current
-            .ticks
-            .checked_add(ticks)
-            .expect("manual clock tick overflow");
+        let target = current.ticks.checked_add(ticks).expect("manual clock tick overflow");
         self.advance_to(MonotonicTime::new(self.inner.domain, target))
             .expect("same-domain manual clock advance must succeed")
     }
 
-    /// Advance to a point in this clock's domain, rejecting other domains or reversal.
+    /// Advance to a point in this clock's domain, rejecting other domains or
+    /// reversal.
     pub fn advance_to(&self, target: MonotonicTime) -> Result<MonotonicTime, ClockAdvanceError> {
         if target.domain != self.inner.domain {
             return Err(ClockAdvanceError::WrongDomain {
@@ -112,7 +111,8 @@ impl ManualClock {
         Ok(target)
     }
 
-    /// Return the number of timer registrations that have not fired or been cancelled.
+    /// Return the number of timer registrations that have not fired or been
+    /// cancelled.
     pub fn pending_timers(&self) -> usize {
         self.inner
             .state

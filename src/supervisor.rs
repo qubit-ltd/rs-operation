@@ -3,21 +3,39 @@
 //! This module owns admission bookkeeping only. Operation execution and result
 //! observation are attached by the operation handle layer.
 
-use crate::context::{ContextError, Deadline, DeadlineSignal, OperationContext, StopSignal};
-use crate::driver::{PortableDriver, PortableDriverConfig, PortableDriverError, TaskHandle};
-use crate::operation::OperationHandle;
-use crate::protocol::ClockSource;
-use crate::report::{
-    AdmissionError, OperationId, ResourceId, ScopeLimits, StartError, SupervisorLimits,
-};
-use crate::resource::{CleanupResponsibility, CleanupScheduler, RecoveryRegistry};
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll, Waker};
+use core::task::Context;
+use core::task::Poll;
+use core::task::Waker;
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
+use crate::context::ContextError;
+use crate::context::Deadline;
+use crate::context::DeadlineSignal;
+use crate::context::OperationContext;
+use crate::context::StopSignal;
+use crate::driver::PortableDriver;
+use crate::driver::PortableDriverConfig;
+use crate::driver::PortableDriverError;
+use crate::driver::TaskHandle;
+use crate::operation::OperationHandle;
+use crate::protocol::ClockSource;
+use crate::report::AdmissionError;
+use crate::report::OperationId;
+use crate::report::ResourceId;
+use crate::report::ScopeLimits;
+use crate::report::StartError;
+use crate::report::SupervisorLimits;
+use crate::resource::CleanupResponsibility;
+use crate::resource::CleanupScheduler;
+use crate::resource::RecoveryRegistry;
 
 mod shutdown_wait_registration;
 use shutdown_wait_registration::ShutdownWaitRegistration;
@@ -121,14 +139,8 @@ struct ServiceGroupState {
     requests: std::collections::BTreeMap<u64, ServiceRequestEntry>,
     shutdown_waiters: Vec<(u64, Waker)>,
     next_shutdown_waiter: u64,
-    resource_scopes: std::collections::BTreeMap<
-        u64,
-        (
-            crate::scope::OperationScope,
-            Arc<std::sync::atomic::AtomicBool>,
-            bool,
-        ),
-    >,
+    resource_scopes:
+        std::collections::BTreeMap<u64, (crate::scope::OperationScope, Arc<std::sync::atomic::AtomicBool>, bool)>,
     next_resource_id: u64,
 }
 
@@ -155,9 +167,7 @@ enum ShutdownSource {
 impl Clone for ShutdownObserver {
     fn clone(&self) -> Self {
         Self(match &self.0 {
-            ShutdownSource::Supervisor(supervisor) => {
-                ShutdownSource::Supervisor(supervisor.internal_handle())
-            }
+            ShutdownSource::Supervisor(supervisor) => ShutdownSource::Supervisor(supervisor.internal_handle()),
             ShutdownSource::Service(state, supervisor) => {
                 ShutdownSource::Service(Arc::clone(state), supervisor.internal_handle())
             }
@@ -180,7 +190,8 @@ pub struct ServiceRequest {
     released: bool,
 }
 
-/// A managed operation whose service-group lease lasts through resource settlement.
+/// A managed operation whose service-group lease lasts through resource
+/// settlement.
 pub struct ServiceOperationHandle<T, E> {
     inner: OperationHandle<T, E>,
 }
@@ -233,10 +244,7 @@ impl ServiceResourceScope {
     }
 
     /// Acquire one lease for a registered service resource.
-    pub fn acquire_use(
-        &self,
-        id: ResourceId,
-    ) -> Result<crate::resource::ResourceUse, crate::resource::ResourceError> {
+    pub fn acquire_use(&self, id: ResourceId) -> Result<crate::resource::ResourceUse, crate::resource::ResourceError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(crate::resource::ResourceError::ClosedForUse);
         }
@@ -250,14 +258,14 @@ impl ServiceResourceScope {
         }
     }
 
-    /// Take the one-use recovery key for a cleanup owner retained by this scope.
-    pub fn take_recovery_key(
-        &self,
-    ) -> Option<crate::report::RecoveryKey<crate::report::RecoveryOwner>> {
+    /// Take the one-use recovery key for a cleanup owner retained by this
+    /// scope.
+    pub fn take_recovery_key(&self) -> Option<crate::report::RecoveryKey<crate::report::RecoveryOwner>> {
         self.scope.take_recovery_key()
     }
 
-    /// Recover a typed owner using the key returned by [`Self::take_recovery_key`].
+    /// Recover a typed owner using the key returned by
+    /// [`Self::take_recovery_key`].
     pub fn take_recovery<R: Send + 'static>(
         &self,
         key: crate::report::RecoveryKey<R>,
@@ -279,9 +287,7 @@ impl<T, E> ServiceOperationHandle<T, E> {
     pub fn observer(&self) -> crate::operation::OperationObserver<T, E> {
         self.inner.observer()
     }
-    pub async fn result(
-        &mut self,
-    ) -> Result<crate::report::OperationOutcome<T, E>, crate::report::ObservationError> {
+    pub async fn result(&mut self) -> Result<crate::report::OperationOutcome<T, E>, crate::report::ObservationError> {
         self.inner.result().await
     }
     pub fn result_blocking(
@@ -292,9 +298,7 @@ impl<T, E> ServiceOperationHandle<T, E> {
     pub async fn released(&self) -> crate::report::SettlementReport {
         self.inner.released().await
     }
-    pub fn released_blocking(
-        &self,
-    ) -> Result<crate::report::SettlementReport, crate::report::ObservationError> {
+    pub fn released_blocking(&self) -> Result<crate::report::SettlementReport, crate::report::ObservationError> {
         self.inner.released_blocking()
     }
 }
@@ -335,7 +339,8 @@ impl OperationSupervisor {
 }
 
 impl ServiceGroup {
-    /// Create a resource owner scope with a finite quota independent from root admission.
+    /// Create a resource owner scope with a finite quota independent from root
+    /// admission.
     pub fn resource_scope(&self, capacity: usize) -> Result<ServiceResourceScope, AdmissionError> {
         if capacity == 0 || capacity > self.supervisor.inner.limits.scope.resources {
             return Err(AdmissionError::ReservationLimit);
@@ -376,9 +381,7 @@ impl ServiceGroup {
 
     fn reserve_request(&self, managed: bool) -> Result<ServiceRequest, AdmissionError> {
         let (lock, _) = &*self.state;
-        let mut state = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.closed {
             return Err(AdmissionError::Closed);
         }
@@ -440,17 +443,12 @@ impl ServiceGroup {
         Ok(ServiceOperationHandle { inner: handle })
     }
 
-    /// Stop group admission and wait up to `timeout` for request leases to return.
-    pub fn shutdown_blocking(
-        &self,
-        mode: ShutdownMode,
-        timeout: std::time::Duration,
-    ) -> ShutdownReport {
+    /// Stop group admission and wait up to `timeout` for request leases to
+    /// return.
+    pub fn shutdown_blocking(&self, mode: ShutdownMode, timeout: std::time::Duration) -> ShutdownReport {
         self.begin_shutdown(mode);
         let (mutex, changed) = &*self.state;
-        let state = mutex
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (state, _) = changed
             .wait_timeout_while(state, timeout, |state| {
                 !state.requests.is_empty() || !state.resource_scopes.is_empty()
@@ -490,11 +488,7 @@ impl ServiceGroup {
     }
 
     fn begin_shutdown(&self, mode: ShutdownMode) {
-        begin_service_group_state(
-            Arc::clone(&self.state),
-            mode,
-            self.supervisor.internal_handle(),
-        );
+        begin_service_group_state(Arc::clone(&self.state), mode, self.supervisor.internal_handle());
     }
 }
 
@@ -513,9 +507,7 @@ impl Drop for ServiceRequest {
         if !self.released {
             let (lock, changed) = &*self.state;
             let (waiters, _) = {
-                let mut state = lock
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.requests.remove(&self.id);
                 self.released = true;
                 (std::mem::take(&mut state.shutdown_waiters), ())
@@ -523,10 +515,7 @@ impl Drop for ServiceRequest {
             changed.notify_all();
             wake_shutdown(waiters);
             notify_shutdown(&self.supervisor);
-            start_service_resource_cleanup(
-                Arc::clone(&self.state),
-                self.supervisor.internal_handle(),
-            );
+            start_service_resource_cleanup(Arc::clone(&self.state), self.supervisor.internal_handle());
         }
     }
 }
@@ -596,11 +585,7 @@ fn retry_service_cleanups_after_capacity_change(inner: &Arc<Inner>) {
     retry_closed_service_group_cleanups(&supervisor);
 }
 
-fn begin_service_group_state(
-    state: SharedServiceGroupState,
-    mode: ShutdownMode,
-    supervisor: OperationSupervisor,
-) {
+fn begin_service_group_state(state: SharedServiceGroupState, mode: ShutdownMode, supervisor: OperationSupervisor) {
     let (contexts, waiters) = {
         let mut guard = lock(&state.0);
         guard.closed = true;
@@ -642,10 +627,7 @@ fn retry_closed_service_group_cleanups(supervisor: &OperationSupervisor) {
     }
 }
 
-fn remove_completed_service_group(
-    supervisor: &OperationSupervisor,
-    group: &SharedServiceGroupState,
-) {
+fn remove_completed_service_group(supervisor: &OperationSupervisor, group: &SharedServiceGroupState) {
     let complete = {
         let state = lock(&group.0);
         state.closed && state.requests.is_empty() && state.resource_scopes.is_empty()
@@ -656,7 +638,8 @@ fn remove_completed_service_group(
 }
 
 impl ShutdownObserver {
-    /// Wait again for active work to settle, or return a fresh pending snapshot at deadline.
+    /// Wait again for active work to settle, or return a fresh pending snapshot
+    /// at deadline.
     pub async fn wait_async(
         &self,
         deadline: Deadline,
@@ -666,9 +649,7 @@ impl ShutdownObserver {
             ShutdownSource::Service(state, supervisor) => {
                 start_service_resource_cleanup(Arc::clone(state), supervisor.internal_handle())
             }
-            ShutdownSource::Supervisor(supervisor) => {
-                retry_closed_service_group_cleanups(supervisor)
-            }
+            ShutdownSource::Supervisor(supervisor) => retry_closed_service_group_cleanups(supervisor),
         }
         let context = OperationContext::new(crate::context::ContextOptions {
             clock: Some(clock),
@@ -711,9 +692,7 @@ impl ShutdownObserver {
             ShutdownSource::Service(state, supervisor) => {
                 start_service_resource_cleanup(Arc::clone(state), supervisor.internal_handle())
             }
-            ShutdownSource::Supervisor(supervisor) => {
-                retry_closed_service_group_cleanups(supervisor)
-            }
+            ShutdownSource::Supervisor(supervisor) => retry_closed_service_group_cleanups(supervisor),
         }
         let report = match &self.0 {
             ShutdownSource::Supervisor(supervisor) => {
@@ -729,18 +708,14 @@ impl ShutdownObserver {
                     })
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 ShutdownReport {
-                    pending_requests: state.active
-                        + state.queued.len()
-                        + supervisor.service_totals().0,
+                    pending_requests: state.active + state.queued.len() + supervisor.service_totals().0,
                     pending_recovery: supervisor.pending_recovery(),
                     pending_resources: supervisor.service_totals().1,
                 }
             }
             ShutdownSource::Service(state, supervisor) => {
                 let (mutex, changed) = &**state;
-                let guard = mutex
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let guard = mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (guard, _) = changed
                     .wait_timeout_while(guard, timeout, |s| {
                         !s.requests.is_empty() || !s.resource_scopes.is_empty()
@@ -764,9 +739,7 @@ impl ShutdownObserver {
             ShutdownSource::Supervisor(supervisor) => {
                 let state = lock(&supervisor.inner.state);
                 ShutdownReport {
-                    pending_requests: state.active
-                        + state.queued.len()
-                        + supervisor.service_totals().0,
+                    pending_requests: state.active + state.queued.len() + supervisor.service_totals().0,
                     pending_recovery: supervisor.pending_recovery(),
                     pending_resources: supervisor.service_totals().1,
                 }
@@ -843,21 +816,19 @@ impl OperationSupervisor {
 
     fn service_totals(&self) -> (usize, usize) {
         let groups = { lock(&self.inner.service_groups).clone() };
-        groups
-            .into_iter()
-            .fold((0, 0), |(requests, resources), group| {
-                let state = lock(&group.0);
-                (
-                    requests.saturating_add(
-                        state
-                            .requests
-                            .values()
-                            .filter(|entry| matches!(entry, ServiceRequestEntry::Standalone))
-                            .count(),
-                    ),
-                    resources.saturating_add(state.resource_scopes.len()),
-                )
-            })
+        groups.into_iter().fold((0, 0), |(requests, resources), group| {
+            let state = lock(&group.0);
+            (
+                requests.saturating_add(
+                    state
+                        .requests
+                        .values()
+                        .filter(|entry| matches!(entry, ServiceRequestEntry::Standalone))
+                        .count(),
+                ),
+                resources.saturating_add(state.resource_scopes.len()),
+            )
+        })
     }
 
     /// Number of cleanup permits retained by this shared supervisor.
@@ -865,8 +836,9 @@ impl OperationSupervisor {
         self.inner.cleanup_responsibility.active()
     }
 
-    /// Submit a managed future to the supervisor's shared bounded portable driver.
-    /// This is crate-private so public operation APIs remain the only submission path.
+    /// Submit a managed future to the supervisor's shared bounded portable
+    /// driver. This is crate-private so public operation APIs remain the
+    /// only submission path.
     pub(crate) fn spawn_managed<F>(&self, future: F) -> Result<TaskHandle, PortableDriverError>
     where
         F: core::future::Future<Output = ()> + Send + 'static,
@@ -933,25 +905,21 @@ impl OperationSupervisor {
         })
     }
 
-    /// Validate inherited cancellation, deadline, and budget before reserving root capacity.
+    /// Validate inherited cancellation, deadline, and budget before reserving
+    /// root capacity.
     pub fn try_admit_with_context<F>(
         &self,
         body: F,
         context: &OperationContext,
     ) -> Result<RootAdmission<F>, StartError<F>> {
         if let Err(error) = context.admission_check() {
-            return Err(StartError::new(
-                context_admission_error(context, error),
-                body,
-            ));
+            return Err(StartError::new(context_admission_error(context, error), body));
         }
         let admission = self.try_admit_body(body)?;
         let cancel = {
             let mut state = lock(&self.inner.state);
             state.contexts.retain(|(lease, _)| lease.strong_count() > 0);
-            state
-                .contexts
-                .push((Arc::downgrade(&admission.lease), context.clone()));
+            state.contexts.push((Arc::downgrade(&admission.lease), context.clone()));
             state.cancel
         };
         if cancel {
@@ -965,7 +933,8 @@ impl OperationSupervisor {
         self.start_wait_body_with_context(body, None)
     }
 
-    /// Create a bounded asynchronous admission waiter that also observes its context deadline.
+    /// Create a bounded asynchronous admission waiter that also observes its
+    /// context deadline.
     pub fn start_wait_body_with_context<F>(
         &self,
         body: F,
@@ -974,10 +943,7 @@ impl OperationSupervisor {
         if let Some(context) = &context
             && let Err(error) = context.admission_check()
         {
-            return Err(StartError::new(
-                context_admission_error(context, error),
-                body,
-            ));
+            return Err(StartError::new(context_admission_error(context, error), body));
         }
         let mut state = lock(&self.inner.state);
         let error = if state.closed {
@@ -1021,13 +987,10 @@ impl OperationSupervisor {
         self.inner.changed.notify_all();
     }
 
-    /// Stop root admission and wait up to the caller-owned timeout for accepted work.
-    /// Drain can only be upgraded to Cancel; every call observes the shared lifecycle.
-    pub fn shutdown_blocking(
-        &self,
-        mode: ShutdownMode,
-        timeout: std::time::Duration,
-    ) -> ShutdownReport {
+    /// Stop root admission and wait up to the caller-owned timeout for accepted
+    /// work. Drain can only be upgraded to Cancel; every call observes the
+    /// shared lifecycle.
+    pub fn shutdown_blocking(&self, mode: ShutdownMode, timeout: std::time::Duration) -> ShutdownReport {
         self.begin_shutdown(mode);
         let state = lock(&self.inner.state);
         let (state, _) = self
@@ -1047,7 +1010,8 @@ impl OperationSupervisor {
         }
     }
 
-    /// Begin shutdown and return a reusable observer after `timeout` expires or work settles.
+    /// Begin shutdown and return a reusable observer after `timeout` expires or
+    /// work settles.
     pub async fn shutdown_async(
         &self,
         mode: ShutdownMode,
@@ -1074,11 +1038,7 @@ impl OperationSupervisor {
             }
             state.contexts.retain(|(lease, _)| lease.strong_count() > 0);
             let contexts = if state.cancel {
-                state
-                    .contexts
-                    .iter()
-                    .map(|(_, context)| context.clone())
-                    .collect()
+                state.contexts.iter().map(|(_, context)| context.clone()).collect()
             } else {
                 Vec::new()
             };
@@ -1116,7 +1076,8 @@ impl OperationSupervisor {
         lock(&self.inner.state).results
     }
 
-    /// Reserve a cleanup slot that does not consume business admission capacity.
+    /// Reserve a cleanup slot that does not consume business admission
+    /// capacity.
     pub fn try_reserve_cleanup(&self) -> Result<CleanupPermit, AdmissionError> {
         let mut state = lock(&self.inner.state);
         if state.cleanup_active >= self.inner.limits.cleanup_concurrency {
@@ -1165,11 +1126,12 @@ impl<F> RootAdmission<F> {
         lock(&self.lease).queued
     }
 
-    /// Transfer an accepted body and its independent execution/result leases to the coordinator.
+    /// Transfer an accepted body and its independent execution/result leases to
+    /// the coordinator.
     ///
-    /// This is crate-private until the operation handle layer can bind both leases to
-    /// the actual task and result registry. Dropping this reservation after transfer
-    /// cannot release either lease.
+    /// This is crate-private until the operation handle layer can bind both
+    /// leases to the actual task and result registry. Dropping this
+    /// reservation after transfer cannot release either lease.
     pub(crate) fn transfer(&mut self) -> Option<AdmittedTask<F>> {
         if self.transferred {
             return None;
@@ -1244,11 +1206,7 @@ impl TaskLease {
         if lease.execution_released {
             return Poll::Ready(false);
         }
-        if !lease
-            .active_waiters
-            .iter()
-            .any(|waker| waker.will_wake(cx.waker()))
-        {
+        if !lease.active_waiters.iter().any(|waker| waker.will_wake(cx.waker())) {
             lease.active_waiters.push(cx.waker().clone());
         }
         Poll::Pending
@@ -1294,11 +1252,9 @@ fn release_execution(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
         }
         if lease_state.queued {
             lease_state.queued = false;
-            state.queued.retain(|entry| {
-                entry
-                    .upgrade()
-                    .is_some_and(|candidate| !Arc::ptr_eq(&candidate, lease))
-            });
+            state
+                .queued
+                .retain(|entry| entry.upgrade().is_some_and(|candidate| !Arc::ptr_eq(&candidate, lease)));
         }
         promoted.extend(take_waiter_wakers(&mut state));
         (promoted, std::mem::take(&mut state.shutdown_waiters))
@@ -1337,11 +1293,9 @@ fn release_all(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
             }
             if lease_state.queued {
                 lease_state.queued = false;
-                state.queued.retain(|entry| {
-                    entry
-                        .upgrade()
-                        .is_some_and(|candidate| !Arc::ptr_eq(&candidate, lease))
-                });
+                state
+                    .queued
+                    .retain(|entry| entry.upgrade().is_some_and(|candidate| !Arc::ptr_eq(&candidate, lease)));
             }
         }
         if lease_state.result_reserved {
@@ -1358,7 +1312,8 @@ fn release_all(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
 }
 
 /// A bounded waiter for root admission. Dropping it removes its registration;
-/// after admission, dropping the returned reservation follows the ordinary root path.
+/// after admission, dropping the returned reservation follows the ordinary root
+/// path.
 pub struct AdmissionWait<F> {
     supervisor: OperationSupervisor,
     waiter_id: u64,
@@ -1400,19 +1355,13 @@ impl<F> Future for AdmissionWait<F> {
                     return Poll::Ready(Err(error));
                 }
                 Poll::Ready(Err(ContextError::WaiterCapacityExceeded)) => {
-                    let error = StartError::new(
-                        AdmissionError::Busy,
-                        this.body.take().expect("body retained"),
-                    );
+                    let error = StartError::new(AdmissionError::Busy, this.body.take().expect("body retained"));
                     this.unregister();
                     return Poll::Ready(Err(error));
                 }
                 Poll::Ready(Err(error)) => {
                     let error = StartError::new(
-                        context_admission_error(
-                            this.context.as_ref().expect("signal has context"),
-                            error,
-                        ),
+                        context_admission_error(this.context.as_ref().expect("signal has context"), error),
                         this.body.take().expect("body retained"),
                     );
                     this.unregister();
@@ -1425,24 +1374,17 @@ impl<F> Future for AdmissionWait<F> {
             if let Some(signal) = &mut this.deadline_signal
                 && Pin::new(signal).poll(cx).is_ready()
             {
-                let error =
-                    StartError::new(AdmissionError::DeadlineExpired, this.body.take().unwrap());
+                let error = StartError::new(AdmissionError::DeadlineExpired, this.body.take().unwrap());
                 this.unregister();
                 return Poll::Ready(Err(error));
             }
             if let Err(error) = context.admission_check() {
-                let error = StartError::new(
-                    context_admission_error(context, error),
-                    this.body.take().unwrap(),
-                );
+                let error = StartError::new(context_admission_error(context, error), this.body.take().unwrap());
                 this.unregister();
                 return Poll::Ready(Err(error));
             }
         }
-        match this
-            .supervisor
-            .try_admit_body(this.body.take().expect("body retained"))
-        {
+        match this.supervisor.try_admit_body(this.body.take().expect("body retained")) {
             Ok(admission) => {
                 this.unregister();
                 Poll::Ready(Ok(admission))
@@ -1450,10 +1392,7 @@ impl<F> Future for AdmissionWait<F> {
             Err(error) if error.reason() == AdmissionError::Busy => {
                 this.body = Some(error.into_body());
                 this.register_waker(cx.waker());
-                match this
-                    .supervisor
-                    .try_admit_body(this.body.take().expect("body retained"))
-                {
+                match this.supervisor.try_admit_body(this.body.take().expect("body retained")) {
                     Ok(admission) => {
                         this.unregister();
                         Poll::Ready(Ok(admission))
@@ -1486,9 +1425,10 @@ impl<F> AdmissionWait<F> {
                 .iter_mut()
                 .find(|(id, _)| *id == self.waiter_id)
                 .and_then(|(_, registered)| {
-                    if registered.as_ref().is_some_and(|old| {
-                        old.will_wake(replacement.as_ref().expect("waker cloned"))
-                    }) {
+                    if registered
+                        .as_ref()
+                        .is_some_and(|old| old.will_wake(replacement.as_ref().expect("waker cloned")))
+                    {
                         None
                     } else {
                         registered.replace(replacement.take().expect("waker cloned"))
@@ -1527,26 +1467,18 @@ impl<F> Drop for AdmissionWait<F> {
 fn context_admission_error(context: &OperationContext, error: ContextError) -> AdmissionError {
     match error {
         ContextError::DeadlineExpired => AdmissionError::DeadlineExpired,
-        ContextError::Stopped
-            if context.stop_reason() == Some(crate::report::StopReason::Timeout) =>
-        {
+        ContextError::Stopped if context.stop_reason() == Some(crate::report::StopReason::Timeout) => {
             AdmissionError::DeadlineExpired
         }
         ContextError::Stopped => AdmissionError::Stopped,
         ContextError::BudgetUnavailable => AdmissionError::ReservationLimit,
         ContextError::WaiterCapacityExceeded => AdmissionError::Busy,
-        ContextError::ClockUnavailable | ContextError::ClockDomainMismatch => {
-            AdmissionError::DriverUnavailable
-        }
+        ContextError::ClockUnavailable | ContextError::ClockDomainMismatch => AdmissionError::DriverUnavailable,
     }
 }
 
 fn take_waiter_wakers(state: &mut State) -> Vec<Waker> {
-    state
-        .waiters
-        .iter_mut()
-        .filter_map(|(_, waker)| waker.take())
-        .collect()
+    state.waiters.iter_mut().filter_map(|(_, waker)| waker.take()).collect()
 }
 
 fn wake(waiters: Vec<Waker>) {
@@ -1582,21 +1514,17 @@ fn promote_one(state: &mut State, active_limit: usize) -> Vec<Waker> {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
-    fn limits(
-        active_roots: usize,
-        queued_roots: usize,
-        unobserved_results: usize,
-    ) -> SupervisorLimits {
+    use super::*;
+
+    fn limits(active_roots: usize, queued_roots: usize, unobserved_results: usize) -> SupervisorLimits {
         SupervisorLimits {
             active_roots,
             queued_roots,
@@ -1646,7 +1574,8 @@ mod tests {
 
     #[test]
     fn waiters_are_bounded_cancel_safely_and_recover_rejected_input() {
-        use std::task::{Wake, Waker};
+        use std::task::Wake;
+        use std::task::Waker;
         struct Noop;
         impl Wake for Noop {
             fn wake(self: Arc<Self>) {}
@@ -1658,9 +1587,7 @@ mod tests {
         let waker = Waker::from(Arc::new(Noop));
         let mut context = Context::from_waker(&waker);
         assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
-        let rejected = supervisor
-            .start_wait_body(String::from("rejected"))
-            .unwrap_err();
+        let rejected = supervisor.start_wait_body(String::from("rejected")).unwrap_err();
         assert_eq!(rejected.reason(), AdmissionError::Busy);
         assert_eq!(rejected.into_body(), "rejected");
         drop(waiting);
@@ -1670,7 +1597,8 @@ mod tests {
 
     #[test]
     fn close_wakes_waiters_and_they_recover_their_input() {
-        use std::task::{Wake, Waker};
+        use std::task::Wake;
+        use std::task::Waker;
         struct Noop;
         impl Wake for Noop {
             fn wake(self: Arc<Self>) {}
@@ -1724,10 +1652,14 @@ mod tests {
 
     #[test]
     fn expired_context_rejects_and_returns_the_original_body() {
-        use crate::context::{ContextOptions, Deadline};
-        use crate::protocol::{ClockSource, TimerRegistration};
-        use crate::report::{ClockDomainId, MonotonicTime};
         use std::task::Waker;
+
+        use crate::context::ContextOptions;
+        use crate::context::Deadline;
+        use crate::protocol::ClockSource;
+        use crate::protocol::TimerRegistration;
+        use crate::report::ClockDomainId;
+        use crate::report::MonotonicTime;
 
         struct FixedClock;
         struct NoTimer;
@@ -1768,9 +1700,11 @@ mod tests {
 
 #[cfg(test)]
 mod review_regressions {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
     use super::*;
     use crate::report::SupervisorLimits;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn dropping_admission_handle_does_not_release_transferred_running_body_quota() {
@@ -1806,11 +1740,16 @@ mod review_regressions {
 
 #[cfg(test)]
 mod reentrant_waker_regression {
-    use super::*;
-    use core::task::{Context, RawWaker, RawWakerVTable, Waker};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use core::task::Context;
+    use core::task::RawWaker;
+    use core::task::RawWakerVTable;
+    use core::task::Waker;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    use super::*;
 
     struct Probe {
         supervisor: OperationSupervisor,
@@ -1852,13 +1791,9 @@ mod reentrant_waker_regression {
         drop(probe);
     }
 
-    static VTABLE: RawWakerVTable =
-        RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref, drop_waker);
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref, drop_waker);
 
-    fn reentrant_waker(
-        supervisor: &OperationSupervisor,
-        lock_timeouts: &Arc<AtomicUsize>,
-    ) -> Waker {
+    fn reentrant_waker(supervisor: &OperationSupervisor, lock_timeouts: &Arc<AtomicUsize>) -> Waker {
         let probe = Arc::new(Probe {
             supervisor: supervisor.clone(),
             lock_timeouts: Arc::clone(lock_timeouts),
@@ -1882,11 +1817,9 @@ mod reentrant_waker_regression {
         let mut second_cx = Context::from_waker(&second_waker);
         let mut waiter = Box::pin(supervisor.start_wait_body(()).unwrap());
         assert!(matches!(waiter.as_mut().poll(&mut first_cx), Poll::Pending));
-        // Different RawWaker data forces a replacement and destruction of the old waker.
-        assert!(matches!(
-            waiter.as_mut().poll(&mut second_cx),
-            Poll::Pending
-        ));
+        // Different RawWaker data forces a replacement and destruction of the old
+        // waker.
+        assert!(matches!(waiter.as_mut().poll(&mut second_cx), Poll::Pending));
         drop(waiter);
         assert_eq!(lock_timeouts.load(Ordering::SeqCst), 0);
     }

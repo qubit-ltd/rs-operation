@@ -1,7 +1,10 @@
-use qubit_operation::report::{OperationOutcome, SupervisorLimits};
-use qubit_operation::scope::ScopeOptions;
-use qubit_operation::supervisor::{OperationSupervisor, ShutdownMode};
 use std::time::Duration;
+
+use qubit_operation::report::OperationOutcome;
+use qubit_operation::report::SupervisorLimits;
+use qubit_operation::scope::ScopeOptions;
+use qubit_operation::supervisor::OperationSupervisor;
+use qubit_operation::supervisor::ShutdownMode;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let supervisor = OperationSupervisor::new(SupervisorLimits::default());

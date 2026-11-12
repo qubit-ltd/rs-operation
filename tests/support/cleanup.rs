@@ -41,7 +41,8 @@ impl FakeCleanup {
         }
     }
 
-    /// Create a cleanup future that returns the supplied failure and recovery owner.
+    /// Create a cleanup future that returns the supplied failure and recovery
+    /// owner.
     #[allow(dead_code)] // Later lifecycle tests pass in a real registry-issued owner.
     pub fn recovery(failure: CleanupFailure, owner: RecoveryOwner) -> Self {
         Self {
@@ -101,15 +102,9 @@ impl Future for FakeCleanupFuture {
             }
             self.gate = None;
         }
-        match self
-            .plan
-            .take()
-            .expect("cleanup future polled after completion")
-        {
+        match self.plan.take().expect("cleanup future polled after completion") {
             CleanupPlan::Succeed | CleanupPlan::Pending(_) => Poll::Ready(CleanupOutcome::Cleaned),
-            CleanupPlan::Recover(failure, owner) => {
-                Poll::Ready(CleanupOutcome::FailedWithRecovery(failure, owner))
-            }
+            CleanupPlan::Recover(failure, owner) => Poll::Ready(CleanupOutcome::FailedWithRecovery(failure, owner)),
             CleanupPlan::Panic => panic!("scripted cleanup panic"),
         }
     }

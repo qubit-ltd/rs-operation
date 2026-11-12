@@ -39,8 +39,8 @@ impl PortableDriver {
     /// Start a fixed worker set with bounded task storage.
     ///
     /// Returns [`PortableDriverError::InvalidConfiguration`] if any configured
-    /// limit is zero, or [`PortableDriverError::WorkerSpawn`] if a thread cannot
-    /// be created.
+    /// limit is zero, or [`PortableDriverError::WorkerSpawn`] if a thread
+    /// cannot be created.
     pub fn new(config: PortableDriverConfig) -> Result<Self, PortableDriverError> {
         if config.worker_count == 0 || config.task_capacity == 0 || config.polls_per_turn == 0 {
             return Err(PortableDriverError::InvalidConfiguration);
@@ -73,14 +73,15 @@ impl PortableDriver {
         Ok(Self { shared, workers })
     }
 
-    /// Accept a Send future, or reject it without polling it if capacity is full.
+    /// Accept a Send future, or reject it without polling it if capacity is
+    /// full.
     ///
-    /// Returns [`PortableDriverError::Capacity`] when the task limit is full and
-    /// [`PortableDriverError::Closed`] after shutdown begins.
+    /// Returns [`PortableDriverError::Capacity`] when the task limit is full
+    /// and [`PortableDriverError::Closed`] after shutdown begins.
     ///
-    /// The driver does not inspect or replace runtime-bound futures. Only submit
-    /// futures that can progress on its worker threads; use an adapter attached
-    /// to the owning runtime for reactor-bound futures.
+    /// The driver does not inspect or replace runtime-bound futures. Only
+    /// submit futures that can progress on its worker threads; use an
+    /// adapter attached to the owning runtime for reactor-bound futures.
     pub fn spawn<F>(&self, future: F) -> Result<TaskHandle, PortableDriverError>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -152,11 +153,17 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PortableDriver, PortableDriverConfig};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use super::PortableDriver;
+    use super::PortableDriverConfig;
 
     struct DropNotice {
         sender: mpsc::SyncSender<bool>,
@@ -193,11 +200,7 @@ mod tests {
                     sender,
                     completed: Arc::clone(&task_completed),
                 };
-                let last_owner = task_owner
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .expect("last driver owner");
+                let last_owner = task_owner.lock().unwrap().take().expect("last driver owner");
                 drop(last_owner);
                 task_completed.store(true, Ordering::SeqCst);
             })
@@ -211,10 +214,7 @@ mod tests {
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         while shared.active_workers.load(Ordering::Acquire) != 0 {
-            assert!(
-                Instant::now() < deadline,
-                "closing workers exit within watchdog"
-            );
+            assert!(Instant::now() < deadline, "closing workers exit within watchdog");
             thread::yield_now();
         }
     }

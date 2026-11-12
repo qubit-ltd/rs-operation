@@ -1,16 +1,27 @@
-use qubit_operation::context::{
-    BudgetLease, BudgetLeaseError, ClockDomainMismatch, ContextError, ContextOptions, Deadline,
-    OperationContext,
-};
-use qubit_operation::protocol::{ClockSource, TimerRegistration};
-use qubit_operation::report::{ClockDomainId, MonotonicTime, StopReason};
 use std::cmp::Ordering;
 use std::future::Future;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
-};
-use std::task::{Context, Poll, Wake, Waker};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
+
+use qubit_operation::context::BudgetLease;
+use qubit_operation::context::BudgetLeaseError;
+use qubit_operation::context::ClockDomainMismatch;
+use qubit_operation::context::ContextError;
+use qubit_operation::context::ContextOptions;
+use qubit_operation::context::Deadline;
+use qubit_operation::context::OperationContext;
+use qubit_operation::protocol::ClockSource;
+use qubit_operation::protocol::TimerRegistration;
+use qubit_operation::report::ClockDomainId;
+use qubit_operation::report::MonotonicTime;
+use qubit_operation::report::StopReason;
 
 struct TestBudget(AtomicBool);
 
@@ -162,10 +173,7 @@ fn deadline_compares_only_within_its_clock_domain_and_child_takes_earliest() {
     let clock = Arc::new(ManualClock::new(7));
     let first = Deadline::at(MonotonicTime::new(ClockDomainId(7), 10));
     let earlier = Deadline::at(MonotonicTime::new(ClockDomainId(7), 8));
-    assert_eq!(
-        first.compare(earlier).expect("same clock domain"),
-        Ordering::Greater
-    );
+    assert_eq!(first.compare(earlier).expect("same clock domain"), Ordering::Greater);
     assert_eq!(
         first.compare(Deadline::at(MonotonicTime::new(ClockDomainId(8), 8))),
         Err(ClockDomainMismatch {
@@ -225,10 +233,7 @@ fn child_budget_must_satisfy_both_parent_and_child_leases() {
             ..ContextOptions::default()
         })
         .expect("child context");
-    assert_eq!(
-        child.admission_check(),
-        Err(ContextError::BudgetUnavailable)
-    );
+    assert_eq!(child.admission_check(), Err(ContextError::BudgetUnavailable));
 
     let permissive_parent = Arc::new(TestBudget(AtomicBool::new(true)));
     let denied_child = Arc::new(TestBudget(AtomicBool::new(false)));
@@ -242,10 +247,7 @@ fn child_budget_must_satisfy_both_parent_and_child_leases() {
             ..ContextOptions::default()
         })
         .expect("child context");
-    assert_eq!(
-        child.admission_check(),
-        Err(ContextError::BudgetUnavailable)
-    );
+    assert_eq!(child.admission_check(), Err(ContextError::BudgetUnavailable));
 }
 
 #[test]
@@ -261,10 +263,7 @@ fn deadline_signal_requests_timeout_and_cancels_its_timer_registration() {
     let first_wake_count = Arc::new(AtomicUsize::new(0));
     let first_waker = Waker::from(Arc::new(CountingWake(first_wake_count.clone())));
     let mut first_task_context = Context::from_waker(&first_waker);
-    assert!(matches!(
-        signal.as_mut().poll(&mut first_task_context),
-        Poll::Pending
-    ));
+    assert!(matches!(signal.as_mut().poll(&mut first_task_context), Poll::Pending));
     let current_wake_count = Arc::new(AtomicUsize::new(0));
     let current_wake = Arc::new(CountingWake(current_wake_count.clone()));
     let current_wake_weak = Arc::downgrade(&current_wake);
@@ -272,10 +271,7 @@ fn deadline_signal_requests_timeout_and_cancels_its_timer_registration() {
     drop(current_wake);
     {
         let mut current_task_context = Context::from_waker(&current_waker);
-        assert!(matches!(
-            signal.as_mut().poll(&mut current_task_context),
-            Poll::Pending
-        ));
+        assert!(matches!(signal.as_mut().poll(&mut current_task_context), Poll::Pending));
     }
     assert_eq!(clock.cancellations.load(AtomicOrdering::SeqCst), 1);
     clock.advance(3);
@@ -314,14 +310,9 @@ fn stop_signal_waiters_are_bounded_and_reclaimed_on_drop() {
     let operation = OperationContext::new(ContextOptions::default());
     let waker = Waker::from(Arc::new(CountingWake(Arc::new(AtomicUsize::new(0)))));
     let mut task_context = Context::from_waker(&waker);
-    let mut signals = (0..64)
-        .map(|_| Box::pin(operation.stop_signal()))
-        .collect::<Vec<_>>();
+    let mut signals = (0..64).map(|_| Box::pin(operation.stop_signal())).collect::<Vec<_>>();
     for signal in &mut signals {
-        assert!(matches!(
-            signal.as_mut().poll(&mut task_context),
-            Poll::Pending
-        ));
+        assert!(matches!(signal.as_mut().poll(&mut task_context), Poll::Pending));
     }
 
     let mut excess = Box::pin(operation.stop_signal());
@@ -332,10 +323,7 @@ fn stop_signal_waiters_are_bounded_and_reclaimed_on_drop() {
 
     drop(signals.pop());
     let mut replacement = Box::pin(operation.stop_signal());
-    assert!(matches!(
-        replacement.as_mut().poll(&mut task_context),
-        Poll::Pending
-    ));
+    assert!(matches!(replacement.as_mut().poll(&mut task_context), Poll::Pending));
     operation.request_stop(StopReason::UserCancelled);
     assert!(matches!(
         replacement.as_mut().poll(&mut task_context),

@@ -6,9 +6,9 @@
 //    Licensed under the Apache License, Version 2.0 (the "License").
 // =============================================================================
 
-use super::Entry;
-
 use std::sync::Arc;
+
+use super::Entry;
 
 pub(in crate::resource) struct Slot {
     pub(in crate::resource) generation: u32,

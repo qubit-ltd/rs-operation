@@ -119,7 +119,8 @@ impl ManualDriver {
         poll
     }
 
-    /// Invoke the task waker as a real scheduling event without polling the task.
+    /// Invoke the task waker as a real scheduling event without polling the
+    /// task.
     pub fn wake(&self, task_id: TaskId) {
         let task = self
             .inner
@@ -147,14 +148,10 @@ impl ManualDriver {
         drop(removed.expect("task must be registered before finishing"));
     }
 
-    /// Return the actual event sequence emitted by polls, wakes, and task drops.
+    /// Return the actual event sequence emitted by polls, wakes, and task
+    /// drops.
     pub fn trace(&self) -> Vec<String> {
-        self.inner
-            .state
-            .lock()
-            .expect("driver mutex poisoned")
-            .trace
-            .clone()
+        self.inner.state.lock().expect("driver mutex poisoned").trace.clone()
     }
 
     /// Return the number of actual calls through task wakers.
@@ -244,7 +241,8 @@ impl Future for RecordingStep {
     }
 }
 
-/// Build a future whose completion is controlled only by successive manual polls.
+/// Build a future whose completion is controlled only by successive manual
+/// polls.
 pub fn recording_step() -> impl Future<Output = ()> + Send + 'static {
     RecordingStep { pending_once: true }
 }

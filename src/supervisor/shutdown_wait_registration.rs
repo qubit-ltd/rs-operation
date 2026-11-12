@@ -6,8 +6,13 @@
 //    Licensed under the Apache License, Version 2.0 (the "License").
 // =============================================================================
 
-use super::{ContextError, OperationSupervisor, SharedServiceGroupState, ShutdownSource, lock};
 use std::task::Waker;
+
+use super::ContextError;
+use super::OperationSupervisor;
+use super::SharedServiceGroupState;
+use super::ShutdownSource;
+use super::lock;
 
 /// A bounded shutdown waiter that unregisters when its observation ends.
 pub(super) struct ShutdownWaitRegistration {
@@ -26,9 +31,7 @@ impl ShutdownWaitRegistration {
     pub(super) fn register(&mut self, waker: &Waker) -> Result<(), ContextError> {
         let replacement = waker.clone();
         match self.source.clone() {
-            ShutdownSource::Supervisor(supervisor) => {
-                self.register_supervisor(&supervisor, waker, replacement)
-            }
+            ShutdownSource::Supervisor(supervisor) => self.register_supervisor(&supervisor, waker, replacement),
             ShutdownSource::Service(state, _) => {
                 let guard = lock(&state.0);
                 let capacity = guard.limit;
@@ -48,29 +51,19 @@ impl ShutdownWaitRegistration {
         let capacity = supervisor.inner.limits.admission_waiters;
         let id = self.waiter_id.unwrap_or_else(|| {
             let mut state = lock(&supervisor.inner.state);
-            let used = state
-                .shutdown_waiters
-                .iter()
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>();
+            let used = state.shutdown_waiters.iter().map(|(id, _)| *id).collect::<Vec<_>>();
             allocate_waiter_id(&mut state.next_shutdown_waiter, &used)
         });
         let (old, result) = {
             let mut state = lock(&supervisor.inner.state);
-            let position = state
-                .shutdown_waiters
-                .iter()
-                .position(|(old_id, _)| *old_id == id);
+            let position = state.shutdown_waiters.iter().position(|(old_id, _)| *old_id == id);
             if position.is_none() && state.shutdown_waiters.len() >= capacity {
                 (None, Err(ContextError::WaiterCapacityExceeded))
             } else if let Some(position) = position {
                 let old = if state.shutdown_waiters[position].1.will_wake(waker) {
                     None
                 } else {
-                    Some(std::mem::replace(
-                        &mut state.shutdown_waiters[position].1,
-                        replacement,
-                    ))
+                    Some(std::mem::replace(&mut state.shutdown_waiters[position].1, replacement))
                 };
                 (old, Ok(()))
             } else {
@@ -94,29 +87,19 @@ impl ShutdownWaitRegistration {
     ) -> Result<(), ContextError> {
         let id = self.waiter_id.unwrap_or_else(|| {
             let mut guard = lock(&state.0);
-            let used = guard
-                .shutdown_waiters
-                .iter()
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>();
+            let used = guard.shutdown_waiters.iter().map(|(id, _)| *id).collect::<Vec<_>>();
             allocate_waiter_id(&mut guard.next_shutdown_waiter, &used)
         });
         let (old, result) = {
             let mut guard = lock(&state.0);
-            let position = guard
-                .shutdown_waiters
-                .iter()
-                .position(|(old_id, _)| *old_id == id);
+            let position = guard.shutdown_waiters.iter().position(|(old_id, _)| *old_id == id);
             if position.is_none() && guard.shutdown_waiters.len() >= capacity {
                 (None, Err(ContextError::WaiterCapacityExceeded))
             } else if let Some(position) = position {
                 let old = if guard.shutdown_waiters[position].1.will_wake(waker) {
                     None
                 } else {
-                    Some(std::mem::replace(
-                        &mut guard.shutdown_waiters[position].1,
-                        replacement,
-                    ))
+                    Some(std::mem::replace(&mut guard.shutdown_waiters[position].1, replacement))
                 };
                 (old, Ok(()))
             } else {

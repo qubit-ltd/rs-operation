@@ -6,11 +6,10 @@
 //    Licensed under the Apache License, Version 2.0 (the "License").
 // =============================================================================
 
-use super::RegisterErrorKind;
-
-use crate::protocol::OwnedCleanup;
-
 use std::fmt;
+
+use super::RegisterErrorKind;
+use crate::protocol::OwnedCleanup;
 
 /// Registration failure; `into_owner` returns the unaccepted cleanup owner.
 pub struct RegisterError {
@@ -32,8 +31,6 @@ impl RegisterError {
 
 impl fmt::Debug for RegisterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RegisterError")
-            .field("kind", &self.kind)
-            .finish()
+        f.debug_struct("RegisterError").field("kind", &self.kind).finish()
     }
 }

@@ -1,10 +1,16 @@
-use crate::protocol::{ClockSource, TimerRegistration};
-use crate::report::{ClockDomainId, MonotonicTime, StopReason};
 use core::cmp::Ordering;
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll};
-use std::sync::{Arc, Weak};
+use core::task::Context;
+use core::task::Poll;
+use std::sync::Arc;
+use std::sync::Weak;
+
+use crate::protocol::ClockSource;
+use crate::protocol::TimerRegistration;
+use crate::report::ClockDomainId;
+use crate::report::MonotonicTime;
+use crate::report::StopReason;
 
 /// Two monotonic instants cannot be ordered because they use different clocks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,11 +70,7 @@ pub struct DeadlineSignal {
 }
 
 impl DeadlineSignal {
-    pub(super) fn new(
-        deadline: Deadline,
-        clock: Arc<dyn ClockSource>,
-        node: Weak<super::Node>,
-    ) -> Self {
+    pub(super) fn new(deadline: Deadline, clock: Arc<dyn ClockSource>, node: Weak<super::Node>) -> Self {
         Self {
             deadline,
             clock,
@@ -108,10 +110,7 @@ impl Future for DeadlineSignal {
                 registration.cancel();
             }
             self.registered_waker = Some(cx.waker().clone());
-            self.registration = Some(
-                self.clock
-                    .register_deadline(self.deadline.at, cx.waker().clone()),
-            );
+            self.registration = Some(self.clock.register_deadline(self.deadline.at, cx.waker().clone()));
         }
         Poll::Pending
     }

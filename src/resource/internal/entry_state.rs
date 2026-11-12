@@ -7,7 +7,6 @@
 // =============================================================================
 
 use super::EntryPhase;
-
 use crate::report::ResourceId;
 
 pub(in crate::resource) struct EntryState {

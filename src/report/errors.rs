@@ -82,7 +82,8 @@ impl<F> std::error::Error for StartError<F> {}
 pub enum ObservationError {
     /// The one-shot typed result was already consumed.
     AlreadyTaken,
-    /// The service discarded the typed result while retaining settlement responsibility.
+    /// The service discarded the typed result while retaining settlement
+    /// responsibility.
     ResultDiscarded,
     /// A blocking observation from a framework-managed worker would deadlock.
     WouldDeadlock,
@@ -92,7 +93,8 @@ pub enum ObservationError {
     ClockUnavailable,
     /// The observer deadline belongs to a different clock domain.
     ClockDomainMismatch,
-    /// The operation already has the maximum number of asynchronous result waiters.
+    /// The operation already has the maximum number of asynchronous result
+    /// waiters.
     WaiterCapacityExceeded,
 }
 
@@ -105,9 +107,7 @@ impl fmt::Display for ObservationError {
             Self::InvalidObserver => "operation observer is invalid",
             Self::ClockUnavailable => "operation observer has no clock source",
             Self::ClockDomainMismatch => "operation observer deadline uses another clock domain",
-            Self::WaiterCapacityExceeded => {
-                "operation has reached its asynchronous waiter capacity"
-            }
+            Self::WaiterCapacityExceeded => "operation has reached its asynchronous waiter capacity",
         })
     }
 }

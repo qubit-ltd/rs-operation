@@ -1,4 +1,5 @@
-use std::{fmt, sync::Arc};
+use std::fmt;
+use std::sync::Arc;
 
 /// UTF-8 diagnostic text truncated to a fixed byte limit.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

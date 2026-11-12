@@ -6,12 +6,11 @@
 //    Licensed under the Apache License, Version 2.0 (the "License").
 // =============================================================================
 
-use super::Slot;
-
-use crate::report::ResourceId;
-
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+
+use super::Slot;
+use crate::report::ResourceId;
 
 pub(in crate::resource) struct RegistryState {
     pub(in crate::resource) slots: Vec<Slot>,

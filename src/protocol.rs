@@ -4,7 +4,10 @@ mod cleanup;
 mod control;
 mod time;
 
-pub use crate::report::StopReason;
-pub use cleanup::{CleanupContext, OwnedCleanup};
+pub use cleanup::CleanupContext;
+pub use cleanup::OwnedCleanup;
 pub use control::ManagedOperationControl;
-pub use time::{ClockSource, TimerRegistration};
+pub use time::ClockSource;
+pub use time::TimerRegistration;
+
+pub use crate::report::StopReason;

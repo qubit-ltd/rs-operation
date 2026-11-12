@@ -12,27 +12,35 @@ mod gate;
 use gate::Gate;
 #[path = "support/control.rs"]
 mod control;
-use control::{BusinessResult, FakeControl};
-use qubit_operation::protocol::{CleanupContext, OwnedCleanup};
-use qubit_operation::report::{
-    CleanupOutcome, DiagnosticSummary, EffectFact, EffectRecord, OperationOutcome, StopReason,
-    SupervisorLimits,
-};
-use qubit_operation::scope::{ChildRequirement, ScopeOptions};
-use qubit_operation::supervisor::OperationSupervisor;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
+
+use control::BusinessResult;
+use control::FakeControl;
+use qubit_operation::protocol::CleanupContext;
+use qubit_operation::protocol::OwnedCleanup;
+use qubit_operation::report::CleanupOutcome;
+use qubit_operation::report::DiagnosticSummary;
+use qubit_operation::report::EffectFact;
+use qubit_operation::report::EffectRecord;
+use qubit_operation::report::OperationOutcome;
+use qubit_operation::report::StopReason;
+use qubit_operation::report::SupervisorLimits;
+use qubit_operation::scope::ChildRequirement;
+use qubit_operation::scope::ScopeOptions;
+use qubit_operation::supervisor::OperationSupervisor;
 
 struct FakeInputCleanup(Arc<AtomicUsize>);
 
 impl OwnedCleanup for FakeInputCleanup {
-    fn begin(
-        self: Box<Self>,
-        _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+    fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { CleanupOutcome::Cleaned })
     }
@@ -41,10 +49,7 @@ impl OwnedCleanup for FakeInputCleanup {
 struct PanicCleanup;
 
 impl OwnedCleanup for PanicCleanup {
-    fn begin(
-        self: Box<Self>,
-        _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+    fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
         Box::pin(PanicCleanupFuture)
     }
 }
@@ -65,10 +70,7 @@ struct GateCleanup {
 }
 
 impl OwnedCleanup for GateCleanup {
-    fn begin(
-        self: Box<Self>,
-        _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+    fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             self.gate.wait().await;
@@ -134,9 +136,7 @@ fn cancelled_pipeline_keeps_input_owned_until_the_helper_exits_then_cleans_once(
         operation.result_blocking().expect("cancelled result is observable"),
         OperationOutcome::Stopped(ref stop) if stop.reason == StopReason::UserCancelled
     ));
-    let settlement = operation
-        .released_blocking()
-        .expect("helper and cleanup settle");
+    let settlement = operation.released_blocking().expect("helper and cleanup settle");
     assert_eq!(
         settlement.resource_phase,
         qubit_operation::report::ResourcePhase::Released
@@ -157,9 +157,7 @@ fn upload_error_remains_primary_when_cleanup_panic_leaves_release_unconfirmed() 
         .expect("pipeline root is accepted");
 
     assert!(matches!(
-        operation
-            .result_blocking()
-            .expect("business result remains observable"),
+        operation.result_blocking().expect("business result remains observable"),
         OperationOutcome::Failed("upload rejected")
     ));
     let shutdown = supervisor.shutdown_blocking(
@@ -195,9 +193,7 @@ fn pipeline_records_ordered_stages_and_cancel_at_each_boundary() {
                 let input = scope
                     .register_resource(FakeInputCleanup(body_cleanup_calls))
                     .expect("file owner registered before download");
-                let input_use = scope
-                    .acquire_use(input)
-                    .expect("pipeline helper leases input");
+                let input_use = scope.acquire_use(input).expect("pipeline helper leases input");
                 let stages = ["download", "stage", "convert", "upload"];
                 for (index, (stage, gate)) in stages.into_iter().zip(body_gates).enumerate() {
                     let mut reservation = scope
@@ -232,10 +228,7 @@ fn pipeline_records_ordered_stages_and_cancel_at_each_boundary() {
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("next committed domain stage starts");
             assert_eq!(actual_index, index);
-            assert_eq!(
-                stage_name,
-                ["download", "stage", "convert", "upload"][index]
-            );
+            assert_eq!(stage_name, ["download", "stage", "convert", "upload"][index]);
             assert_ne!(control.operation_id().0, 0);
             gate.wait_started();
             observed.push(index);
@@ -243,10 +236,7 @@ fn pipeline_records_ordered_stages_and_cancel_at_each_boundary() {
                 operation.request_cancel(StopReason::UserCancelled);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 while control.stop_requests() == 0 {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "child stop was not delivered"
-                    );
+                    assert!(std::time::Instant::now() < deadline, "child stop was not delivered");
                     std::thread::yield_now();
                 }
                 assert_eq!(control.first_stop_reason(), Some(StopReason::UserCancelled));
@@ -259,9 +249,7 @@ fn pipeline_records_ordered_stages_and_cancel_at_each_boundary() {
             gate.release();
         }
         assert_eq!(observed, (0..=expected_last_stage).collect::<Vec<_>>());
-        let outcome = operation
-            .result_blocking()
-            .expect("pipeline result available");
+        let outcome = operation.result_blocking().expect("pipeline result available");
         match cancel_at {
             Some(_) => assert!(matches!(
                 outcome,
@@ -276,12 +264,7 @@ fn pipeline_records_ordered_stages_and_cancel_at_each_boundary() {
                 "no later stage commits after cancellation"
             );
         }
-        assert!(
-            operation
-                .released_blocking()
-                .expect("pipeline settles")
-                .all_released
-        );
+        assert!(operation.released_blocking().expect("pipeline settles").all_released);
         assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
     }
 }
@@ -306,9 +289,7 @@ fn required_upload_child_failure_is_published_as_child_failed() {
         .expect("pipeline root accepted");
 
     assert!(matches!(
-        operation
-            .result_blocking()
-            .expect("child failure is observable"),
+        operation.result_blocking().expect("child failure is observable"),
         OperationOutcome::ChildFailed(_)
     ));
     assert!(
@@ -322,9 +303,7 @@ fn required_upload_child_failure_is_published_as_child_failed() {
 #[test]
 fn deadline_snapshot_keeps_observation_live_until_cleanup_is_confirmed() {
     let supervisor = OperationSupervisor::new(SupervisorLimits::default());
-    let manual_clock = Arc::new(clock::ManualClock::new(
-        qubit_operation::report::ClockDomainId(78),
-    ));
+    let manual_clock = Arc::new(clock::ManualClock::new(qubit_operation::report::ClockDomainId(78)));
     let operation_clock = Arc::clone(&manual_clock);
     let cleanup_gate = Gate::new();
     let cleanup_started = cleanup_gate.clone();
@@ -351,9 +330,7 @@ fn deadline_snapshot_keeps_observation_live_until_cleanup_is_confirmed() {
         )
         .expect("root accepted");
     assert_eq!(
-        operation
-            .result_blocking()
-            .expect("business result is ready"),
+        operation.result_blocking().expect("business result is ready"),
         OperationOutcome::Succeeded("business result")
     );
     cleanup_started.wait_started();
@@ -370,14 +347,9 @@ fn deadline_snapshot_keeps_observation_live_until_cleanup_is_confirmed() {
         }
         timer_clock.advance_by(1);
     });
-    let snapshot = block_on(
-        observer.observe_until(qubit_operation::context::Deadline::at(
-            qubit_operation::report::MonotonicTime::new(
-                qubit_operation::report::ClockDomainId(78),
-                1,
-            ),
-        )),
-    )
+    let snapshot = block_on(observer.observe_until(qubit_operation::context::Deadline::at(
+        qubit_operation::report::MonotonicTime::new(qubit_operation::report::ClockDomainId(78), 1),
+    )))
     .expect("deadline observation succeeds")
     .snapshot;
     timer.join().expect("manual clock timer completed");
@@ -429,14 +401,9 @@ fn upload_effect_record_survives_cancellation_in_settlement() {
         operation.result_blocking().expect("result available"),
         OperationOutcome::Stopped(ref stop) if stop.reason == StopReason::UserCancelled
     ));
-    let settlement = operation
-        .released_blocking()
-        .expect("recorded upload settles");
+    let settlement = operation.released_blocking().expect("recorded upload settles");
     assert_eq!(settlement.effects.len(), 2);
-    assert_eq!(
-        settlement.effects[0].description.as_str(),
-        "fake upload committed"
-    );
+    assert_eq!(settlement.effects[0].description.as_str(), "fake upload committed");
     assert_eq!(settlement.effects[0].fact, EffectFact::Known);
     assert_eq!(settlement.effects[0].operation_id, settlement.operation_id);
     assert_eq!(

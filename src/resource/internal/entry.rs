@@ -6,13 +6,12 @@
 //    Licensed under the Apache License, Version 2.0 (the "License").
 // =============================================================================
 
-use super::EntryState;
-use super::RegistryInner;
-
-use crate::protocol::OwnedCleanup;
-
 use std::sync::Mutex;
 use std::sync::Weak;
+
+use super::EntryState;
+use super::RegistryInner;
+use crate::protocol::OwnedCleanup;
 
 pub(in crate::resource) struct Entry {
     pub(in crate::resource) registry: Mutex<Weak<RegistryInner>>,

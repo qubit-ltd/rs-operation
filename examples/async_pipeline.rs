@@ -1,11 +1,16 @@
-use qubit_operation::report::{OperationOutcome, SupervisorLimits};
-use qubit_operation::scope::ScopeOptions;
-use qubit_operation::supervisor::{OperationSupervisor, ShutdownMode};
 use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
-use std::task::{Context, Wake, Waker};
+use std::task::Context;
+use std::task::Wake;
+use std::task::Waker;
 use std::time::Duration;
+
+use qubit_operation::report::OperationOutcome;
+use qubit_operation::report::SupervisorLimits;
+use qubit_operation::scope::ScopeOptions;
+use qubit_operation::supervisor::OperationSupervisor;
+use qubit_operation::supervisor::ShutdownMode;
 
 struct ThreadWaker(std::thread::Thread);
 impl Wake for ThreadWaker {
@@ -31,11 +36,9 @@ fn block_on<F: Future>(future: F) -> F::Output {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let supervisor = OperationSupervisor::new(SupervisorLimits::default());
-    let (outcome, settlement) = block_on(
-        supervisor.run_to_completion(ScopeOptions::default(), |_scope| async {
-            Ok::<_, &'static str>("receipt-17")
-        }),
-    )?;
+    let (outcome, settlement) = block_on(supervisor.run_to_completion(ScopeOptions::default(), |_scope| async {
+        Ok::<_, &'static str>("receipt-17")
+    }))?;
     match outcome {
         OperationOutcome::Succeeded(receipt) => println!("stored receipt {receipt}"),
         other => return Err(format!("pipeline did not succeed: {other:?}").into()),

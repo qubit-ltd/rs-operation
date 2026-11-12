@@ -1,18 +1,29 @@
-use core::{
-    future::Future,
-    task::{Context, Poll},
-};
-use qubit_operation::{
-    protocol::{
-        CleanupContext, ClockSource, ManagedOperationControl, OwnedCleanup, TimerRegistration,
-    },
-    report::{
-        AdmissionError, ChildBusinessSummary, ChildSettlement, ChildSnapshot, CleanupOutcome,
-        ClockDomainId, DiagnosticSummary, MonotonicTime, OperationId, OperationOutcome,
-        OperationPhase, ResourcePhase, ScopeLimits, SettlementReport, StartError, StopReason,
-        SupervisorLimits,
-    },
-};
+use core::future::Future;
+use core::task::Context;
+use core::task::Poll;
+
+use qubit_operation::protocol::CleanupContext;
+use qubit_operation::protocol::ClockSource;
+use qubit_operation::protocol::ManagedOperationControl;
+use qubit_operation::protocol::OwnedCleanup;
+use qubit_operation::protocol::TimerRegistration;
+use qubit_operation::report::AdmissionError;
+use qubit_operation::report::ChildBusinessSummary;
+use qubit_operation::report::ChildSettlement;
+use qubit_operation::report::ChildSnapshot;
+use qubit_operation::report::CleanupOutcome;
+use qubit_operation::report::ClockDomainId;
+use qubit_operation::report::DiagnosticSummary;
+use qubit_operation::report::MonotonicTime;
+use qubit_operation::report::OperationId;
+use qubit_operation::report::OperationOutcome;
+use qubit_operation::report::OperationPhase;
+use qubit_operation::report::ResourcePhase;
+use qubit_operation::report::ScopeLimits;
+use qubit_operation::report::SettlementReport;
+use qubit_operation::report::StartError;
+use qubit_operation::report::StopReason;
+use qubit_operation::report::SupervisorLimits;
 
 struct Control;
 impl ManagedOperationControl for Control {
@@ -43,11 +54,7 @@ impl ClockSource for Clock {
     fn now(&self) -> MonotonicTime {
         MonotonicTime::new(ClockDomainId(1), 0)
     }
-    fn register_deadline(
-        &self,
-        _: MonotonicTime,
-        _: std::task::Waker,
-    ) -> Box<dyn TimerRegistration> {
+    fn register_deadline(&self, _: MonotonicTime, _: std::task::Waker) -> Box<dyn TimerRegistration> {
         Box::new(Timer)
     }
 }
@@ -80,7 +87,5 @@ fn lifecycle_ports_are_object_safe_and_reports_do_not_require_clone_errors() {
     let _recovered_body: NonCloneBody = rejected.into_body();
     assert_eq!(ScopeLimits::default().child_operations, 64);
     assert_eq!(SupervisorLimits::default().unobserved_results, 64);
-    assert!(
-        DiagnosticSummary::new("诊断".repeat(200)).as_str().len() <= DiagnosticSummary::MAX_BYTES
-    );
+    assert!(DiagnosticSummary::new("诊断".repeat(200)).as_str().len() <= DiagnosticSummary::MAX_BYTES);
 }

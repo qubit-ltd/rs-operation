@@ -1,4 +1,5 @@
-use super::{ClockDomainId, OperationId};
+use super::ClockDomainId;
+use super::OperationId;
 
 /// Monotonic tick value; values from different domains are incomparable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,7 +52,8 @@ pub enum ResourcePhase {
 
 /// Bounded observation snapshot for a child operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Bounded child-operation snapshot; it does not consume results or prove more than the fields state.
+/// Bounded child-operation snapshot; it does not consume results or prove more
+/// than the fields state.
 pub struct ChildSnapshot {
     /// Child operation identity.
     pub operation_id: OperationId,

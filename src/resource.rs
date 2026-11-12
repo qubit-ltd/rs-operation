@@ -22,15 +22,17 @@ mod resource_error;
 mod resource_use;
 mod transfer_error;
 
-pub use crate::report::ReleaseReceipt;
-pub use cleanup_scheduler::{
-    CleanupObservation, CleanupPanic, CleanupPermit, CleanupResponsibility, CleanupScheduler,
-    CleanupTask,
-};
+pub use cleanup_scheduler::CleanupObservation;
+pub use cleanup_scheduler::CleanupPanic;
+pub use cleanup_scheduler::CleanupPermit;
+pub use cleanup_scheduler::CleanupResponsibility;
+pub use cleanup_scheduler::CleanupScheduler;
+pub use cleanup_scheduler::CleanupTask;
 pub use dependency_error::DependencyError;
 pub use handle::ResourceHandle;
 pub use ready_cleanup::ReadyCleanup;
-pub use recovery_registry::{RecoveryError, RecoveryRegistry};
+pub use recovery_registry::RecoveryError;
+pub use recovery_registry::RecoveryRegistry;
 pub use register_error::RegisterError;
 pub use register_error_kind::RegisterErrorKind;
 pub use registry::ResourceRegistry;
@@ -38,3 +40,5 @@ pub use registry_error::RegistryError;
 pub use resource_error::ResourceError;
 pub use resource_use::ResourceUse;
 pub use transfer_error::TransferError;
+
+pub use crate::report::ReleaseReceipt;

@@ -150,17 +150,11 @@ fn test_transfer_moves_dependency_group_after_reserving_all_target_slots() {
     assert_eq!(resource_a.id().operation, OperationId::new(9));
     resource_a.close_for_use().unwrap();
     resource_b.close_for_use().unwrap();
-    assert_eq!(
-        destination.take_ready_cleanup().unwrap().resource_id(),
-        resource_b.id()
-    );
+    assert_eq!(destination.take_ready_cleanup().unwrap().resource_id(), resource_b.id());
     destination.confirm_released(resource_b.id()).unwrap();
     assert!(destination.take_ready_cleanup().is_none());
     drop(use_a);
-    assert_eq!(
-        destination.take_ready_cleanup().unwrap().resource_id(),
-        resource_a.id()
-    );
+    assert_eq!(destination.take_ready_cleanup().unwrap().resource_id(), resource_a.id());
 }
 
 #[test]
@@ -186,14 +180,9 @@ fn test_cleanup_owner_transfer_needs_receiver_receipt_before_source_releases_it(
     assert_eq!(received.resource_id(), received_id);
     let (received_id, receiver_owner) = received.into_parts();
     drop(receiver_owner);
-    let release = receiver
-        .confirm_released_with_receipt(received_id)
-        .unwrap()
-        .unwrap();
+    let release = receiver.confirm_released_with_receipt(received_id).unwrap().unwrap();
     assert!(source.confirm_released(source_id).is_err());
-    source
-        .confirm_transferred_released(source_id, release)
-        .unwrap();
+    source.confirm_transferred_released(source_id, release).unwrap();
     assert!(!source.contains(source_id));
     assert_eq!(drop_count.load(Ordering::SeqCst), 1);
 }
@@ -218,9 +207,7 @@ fn test_transferred_prerequisite_stays_blocked_until_external_release_confirmati
         .accept_cleanup_transfer(prerequisite_id, transferred_owner)
         .unwrap();
     assert!(receiver.contains(received_id));
-    source
-        .confirm_transferred(prerequisite_id, receipt)
-        .unwrap();
+    source.confirm_transferred(prerequisite_id, receipt).unwrap();
     assert!(source.take_ready_cleanup().is_none());
     assert!(source.contains(dependent_id));
     assert!(source.contains(prerequisite_id));
@@ -228,10 +215,7 @@ fn test_transferred_prerequisite_stays_blocked_until_external_release_confirmati
     let received = receiver.take_ready_cleanup().unwrap();
     let (received_id, receiver_owner) = received.into_parts();
     drop(receiver_owner);
-    let release = receiver
-        .confirm_released_with_receipt(received_id)
-        .unwrap()
-        .unwrap();
+    let release = receiver.confirm_released_with_receipt(received_id).unwrap().unwrap();
     assert!(source.confirm_released(prerequisite_id).is_err());
 
     let decoy = ResourceRegistry::new(OperationId::new(16), 2);
@@ -242,10 +226,7 @@ fn test_transferred_prerequisite_stays_blocked_until_external_release_confirmati
     let decoy_ready = decoy.take_ready_cleanup().unwrap();
     let (_, decoy_owner) = decoy_ready.into_parts();
     drop(decoy_owner);
-    let wrong_receiver_proof = decoy
-        .confirm_released_with_receipt(decoy_id)
-        .unwrap()
-        .unwrap();
+    let wrong_receiver_proof = decoy.confirm_released_with_receipt(decoy_id).unwrap().unwrap();
     assert!(
         source
             .confirm_transferred_released(prerequisite_id, wrong_receiver_proof)
@@ -265,10 +246,7 @@ fn test_transferred_prerequisite_stays_blocked_until_external_release_confirmati
     let old_ready = decoy.take_ready_cleanup().unwrap();
     let (_, old_owner) = old_ready.into_parts();
     drop(old_owner);
-    let old_generation_proof = decoy
-        .confirm_released_with_receipt(old_generation_id)
-        .unwrap()
-        .unwrap();
+    let old_generation_proof = decoy.confirm_released_with_receipt(old_generation_id).unwrap().unwrap();
     assert!(
         source
             .confirm_transferred_released(prerequisite_id, old_generation_proof)
@@ -276,9 +254,7 @@ fn test_transferred_prerequisite_stays_blocked_until_external_release_confirmati
     );
     assert!(source.contains(prerequisite_id));
     assert!(source.take_ready_cleanup().is_none());
-    source
-        .confirm_transferred_released(prerequisite_id, release)
-        .unwrap();
+    source.confirm_transferred_released(prerequisite_id, release).unwrap();
     let ready_dependent = source.take_ready_cleanup().unwrap();
     assert_eq!(ready_dependent.resource_id(), dependent_id);
     let (_, owner) = ready_dependent.into_parts();
@@ -298,9 +274,7 @@ fn test_rejected_cleanup_owner_transfer_can_be_restored_at_source() {
     let ready = source.take_ready_cleanup().unwrap();
     let (_, owner) = ready.into_parts();
 
-    let error = receiver
-        .accept_cleanup_transfer(resource_id, owner)
-        .unwrap_err();
+    let error = receiver.accept_cleanup_transfer(resource_id, owner).unwrap_err();
     assert!(source.contains(resource_id));
     match source.restore_cleanup_owner(resource_id, error.into_owner()) {
         Ok(()) => {}

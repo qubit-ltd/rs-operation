@@ -22,7 +22,8 @@ use crate::report::ObservationError;
 
 /// Maximum number of asynchronous waiters retained by one notification source.
 ///
-/// Additional registrations fail with [`ObservationError::WaiterCapacityExceeded`].
+/// Additional registrations fail with
+/// [`ObservationError::WaiterCapacityExceeded`].
 pub(crate) const ASYNC_WAITER_CAPACITY: usize = 64;
 
 /// Mutable waiter list guarded with the notification generation.
@@ -94,7 +95,8 @@ impl Notify {
         }
     }
 
-    /// Block until a generation change, checking the predicate around Condvar wait.
+    /// Block until a generation change, checking the predicate around Condvar
+    /// wait.
     pub(crate) fn wait_blocking_since(&self, generation: u64) {
         let mut state = lock(&self.inner.state);
         while state.generation == generation {
@@ -119,7 +121,8 @@ pub(crate) struct Notified {
 impl Future for Notified {
     type Output = Result<(), ObservationError>;
 
-    /// Register this future or complete when its notification generation advances.
+    /// Register this future or complete when its notification generation
+    /// advances.
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let Some(inner) = self.inner.upgrade() else {
             self.waiter_id = None;
@@ -132,19 +135,11 @@ impl Future for Notified {
         let registration = {
             let mut state = lock(&inner.state);
             if state.generation != self.generation {
-                if let Some(index) = state
-                    .waiters
-                    .iter()
-                    .position(|(waiter_id, _)| *waiter_id == id)
-                {
+                if let Some(index) = state.waiters.iter().position(|(waiter_id, _)| *waiter_id == id) {
                     replaced_waker = Some(state.waiters.swap_remove(index).1);
                 }
                 Ok(true)
-            } else if let Some((_, existing)) = state
-                .waiters
-                .iter_mut()
-                .find(|(waiter_id, _)| *waiter_id == id)
-            {
+            } else if let Some((_, existing)) = state.waiters.iter_mut().find(|(waiter_id, _)| *waiter_id == id) {
                 if !existing.will_wake(context.waker()) {
                     replaced_waker = Some(std::mem::replace(existing, context.waker().clone()));
                 }
@@ -192,16 +187,11 @@ impl Drop for Notified {
 
 /// Recover a poisoned internal synchronization lock without exposing poison.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ASYNC_WAITER_CAPACITY;
-    use super::Notify;
-    use crate::report::ObservationError;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -210,6 +200,10 @@ mod tests {
     use std::task::Poll;
     use std::task::Wake;
     use std::task::Waker;
+
+    use super::ASYNC_WAITER_CAPACITY;
+    use super::Notify;
+    use crate::report::ObservationError;
 
     struct CountingWake(Arc<Mutex<usize>>);
 
@@ -225,10 +219,7 @@ mod tests {
 
     fn counting_waker() -> (Waker, Arc<Mutex<usize>>) {
         let count = Arc::new(Mutex::new(0));
-        (
-            Waker::from(Arc::new(CountingWake(Arc::clone(&count)))),
-            count,
-        )
+        (Waker::from(Arc::new(CountingWake(Arc::clone(&count)))), count)
     }
 
     #[test]
@@ -252,10 +243,7 @@ mod tests {
         let mut notified = Box::pin(notify.notified());
         let (waker, wake_count) = counting_waker();
         let mut context = Context::from_waker(&waker);
-        assert!(matches!(
-            Pin::as_mut(&mut notified).poll(&mut context),
-            Poll::Pending
-        ));
+        assert!(matches!(Pin::as_mut(&mut notified).poll(&mut context), Poll::Pending));
 
         notify.notify_waiters();
 
@@ -342,9 +330,6 @@ mod tests {
 
         drop(waiters.pop());
         let mut replacement = Box::pin(notify.notified());
-        assert!(matches!(
-            replacement.as_mut().poll(&mut context),
-            Poll::Pending
-        ));
+        assert!(matches!(replacement.as_mut().poll(&mut context), Poll::Pending));
     }
 }

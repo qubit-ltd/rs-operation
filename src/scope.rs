@@ -1,19 +1,38 @@
 //! Child registration and structured scope composition.
 
-use crate::context::{ContextError, ContextOptions, DeadlineSignal, OperationContext};
-use crate::protocol::{ManagedOperationControl, OwnedCleanup};
-use crate::report::{
-    ChildBusinessOutcome, ChildBusinessSummary, ChildSettlement, EffectRecord, OperationId,
-    RecoveryKey, RecoveryOwner, ReleaseReceipt, ResourceId, ScopeLimits, StopReason,
-};
-use crate::resource::{
-    CleanupScheduler, RecoveryRegistry, RegisterError, RegistryError, ResourceError,
-    ResourceHandle, ResourceRegistry, ResourceUse, TransferError,
-};
 use std::collections::BTreeMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::task::Context;
+use std::task::Poll;
+
+use crate::context::ContextError;
+use crate::context::ContextOptions;
+use crate::context::DeadlineSignal;
+use crate::context::OperationContext;
+use crate::protocol::ManagedOperationControl;
+use crate::protocol::OwnedCleanup;
+use crate::report::ChildBusinessOutcome;
+use crate::report::ChildBusinessSummary;
+use crate::report::ChildSettlement;
+use crate::report::EffectRecord;
+use crate::report::OperationId;
+use crate::report::RecoveryKey;
+use crate::report::RecoveryOwner;
+use crate::report::ReleaseReceipt;
+use crate::report::ResourceId;
+use crate::report::ScopeLimits;
+use crate::report::StopReason;
+use crate::resource::CleanupScheduler;
+use crate::resource::RecoveryRegistry;
+use crate::resource::RegisterError;
+use crate::resource::RegistryError;
+use crate::resource::ResourceError;
+use crate::resource::ResourceHandle;
+use crate::resource::ResourceRegistry;
+use crate::resource::ResourceUse;
+use crate::resource::TransferError;
 
 static NEXT_SCOPE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000_000);
 
@@ -51,7 +70,8 @@ pub enum ScopeError {
     InvalidContext,
 }
 
-/// Aggregate of all committed child operations after business and release observation.
+/// Aggregate of all committed child operations after business and release
+/// observation.
 #[derive(Clone, Debug, Default)]
 pub struct ScopeJoinReport {
     pub settlements: Vec<ChildSettlement>,
@@ -73,7 +93,8 @@ struct State {
     reserved_children: usize,
 }
 
-/// A scope that owns child registration authority and waits for registered work.
+/// A scope that owns child registration authority and waits for registered
+/// work.
 #[derive(Clone)]
 pub struct OperationScope {
     operation_id: OperationId,
@@ -131,7 +152,8 @@ impl OperationScope {
         }
     }
 
-    /// Create an owned child scope whose accepted work and resources join this scope.
+    /// Create an owned child scope whose accepted work and resources join this
+    /// scope.
     pub fn child_scope(&self, options: ScopeOptions) -> Result<OperationScope, ScopeError> {
         let context = self
             .context
@@ -150,16 +172,8 @@ impl OperationScope {
         {
             return Err(ScopeError::LimitReached);
         }
-        let child_id = OperationId::new(
-            NEXT_SCOPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128,
-        );
-        let mut child = OperationScope::new(
-            child_id,
-            options.limits,
-            options.policy,
-            self.cleanup.clone(),
-            context,
-        );
+        let child_id = OperationId::new(NEXT_SCOPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128);
+        let mut child = OperationScope::new(child_id, options.limits, options.policy, self.cleanup.clone(), context);
         child.effects = Arc::clone(&self.effects);
         if let Some(reason) = state.stop {
             child.request_cancel(reason);
@@ -173,7 +187,8 @@ impl OperationScope {
         self.operation_id
     }
 
-    /// Retain a caller-declared side-effect fact for the final settlement report.
+    /// Retain a caller-declared side-effect fact for the final settlement
+    /// report.
     pub fn record_effect(&self, effect: EffectRecord) -> Result<(), ScopeError> {
         let mut state = self.effects.lock().unwrap_or_else(|e| e.into_inner());
         if state.records.len() >= state.limit {
@@ -190,10 +205,7 @@ impl OperationScope {
     }
 
     /// Register a cleanup owner before creating or exposing its resource.
-    pub fn register_resource<C: OwnedCleanup>(
-        &self,
-        owner: C,
-    ) -> Result<ResourceId, RegisterError> {
+    pub fn register_resource<C: OwnedCleanup>(&self, owner: C) -> Result<ResourceId, RegisterError> {
         let handle = self.resources.register(Box::new(owner))?;
         let id = handle.id();
         self.handles
@@ -213,7 +225,8 @@ impl OperationScope {
             .acquire_use()
     }
 
-    /// Close future use and make the resource eligible for cleanup after its leases return.
+    /// Close future use and make the resource eligible for cleanup after its
+    /// leases return.
     pub fn close_for_use(&self, id: ResourceId) -> Result<(), ResourceError> {
         self.handles
             .lock()
@@ -240,7 +253,8 @@ impl OperationScope {
             )
     }
 
-    /// Transfer a resource and its connected dependency group to another scope atomically.
+    /// Transfer a resource and its connected dependency group to another scope
+    /// atomically.
     pub fn transfer_resource_to(
         &self,
         id: ResourceId,
@@ -252,16 +266,10 @@ impl OperationScope {
         let self_first = Arc::as_ptr(&self.handles) < Arc::as_ptr(&destination.handles);
         if self_first {
             let mut source = self.handles.lock().unwrap_or_else(|e| e.into_inner());
-            let mut target = destination
-                .handles
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut target = destination.handles.lock().unwrap_or_else(|e| e.into_inner());
             self.transfer_with_locked_handles(id, destination, &mut source, &mut target)
         } else {
-            let mut target = destination
-                .handles
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut target = destination.handles.lock().unwrap_or_else(|e| e.into_inner());
             let mut source = self.handles.lock().unwrap_or_else(|e| e.into_inner());
             self.transfer_with_locked_handles(id, destination, &mut source, &mut target)
         }
@@ -284,31 +292,19 @@ impl OperationScope {
 
     /// Take a one-use typed recovery key produced by cleanup settlement.
     pub fn take_recovery_key(&self) -> Option<RecoveryKey<RecoveryOwner>> {
-        self.recovery_keys
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop()
+        self.recovery_keys.lock().unwrap_or_else(|e| e.into_inner()).pop()
     }
 
     /// Recover an owner only with its original registry-issued key.
-    pub fn take_recovery<R: Send + 'static>(
-        &self,
-        key: RecoveryKey<R>,
-    ) -> Result<R, RecoveryKey<R>> {
+    pub fn take_recovery<R: Send + 'static>(&self, key: RecoveryKey<R>) -> Result<R, RecoveryKey<R>> {
         self.recovery.take_recovery(key)
     }
 
-    /// Confirm release of a transferred owner using the receiver's release proof.
-    pub fn confirm_transferred_release(
-        &self,
-        id: ResourceId,
-        receipt: ReleaseReceipt,
-    ) -> Result<(), RegistryError> {
+    /// Confirm release of a transferred owner using the receiver's release
+    /// proof.
+    pub fn confirm_transferred_release(&self, id: ResourceId, receipt: ReleaseReceipt) -> Result<(), RegistryError> {
         self.resources.confirm_transferred_released(id, receipt)?;
-        self.handles
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id);
+        self.handles.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         self.resources.notify_change();
         Ok(())
     }
@@ -327,19 +323,12 @@ impl OperationScope {
     }
 
     pub(crate) fn poll_deadlines(&self, cx: &mut Context<'_>) {
-        let mut signal = self
-            .deadline_signal
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let mut signal = self.deadline_signal.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(mut signal) = signal.take() {
             if Pin::new(&mut signal).poll(cx).is_ready() {
                 self.request_cancel(StopReason::Timeout);
             } else {
-                *self
-                    .deadline_signal
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(signal);
+                *self.deadline_signal.lock().unwrap_or_else(|e| e.into_inner()) = Some(signal);
             }
         }
         for child in self.child_scopes() {
@@ -357,10 +346,7 @@ impl OperationScope {
         self.recovery.clone()
     }
     pub(crate) fn save_recovery_key(&self, key: RecoveryKey<RecoveryOwner>) {
-        self.recovery_keys
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(key);
+        self.recovery_keys.lock().unwrap_or_else(|e| e.into_inner()).push(key);
     }
     pub(crate) fn resource_epoch(&self) -> u64 {
         self.resources.change_epoch()
@@ -388,11 +374,9 @@ impl OperationScope {
         .await
     }
 
-    /// Reserve a child registration slot before handing work to a domain executor.
-    pub fn reserve_child(
-        &self,
-        requirement: ChildRequirement,
-    ) -> Result<ChildReservation, ScopeError> {
+    /// Reserve a child registration slot before handing work to a domain
+    /// executor.
+    pub fn reserve_child(&self, requirement: ChildRequirement) -> Result<ChildReservation, ScopeError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.accepting {
             return Err(ScopeError::Closed);
@@ -460,7 +444,8 @@ impl OperationScope {
         self.policy
     }
 
-    /// Close this scope's body submissions and wait for every committed child to settle.
+    /// Close this scope's body submissions and wait for every committed child
+    /// to settle.
     pub async fn join(&self) -> ScopeJoinReport {
         self.close_body();
         self.close_body_resources();
@@ -475,7 +460,8 @@ impl OperationScope {
     }
 }
 
-/// A two-phase registration reservation. Dropping before commit has no child side effect.
+/// A two-phase registration reservation. Dropping before commit has no child
+/// side effect.
 pub struct ChildReservation {
     scope: Arc<Mutex<State>>,
     requirement: ChildRequirement,
@@ -543,24 +529,34 @@ impl Drop for ChildReservation {
 
 #[cfg(test)]
 mod tests {
-    use super::{OperationScope, ScopePolicy};
-    use crate::context::{ContextOptions, OperationContext};
-    use crate::protocol::{CleanupContext, OwnedCleanup};
-    use crate::report::{CleanupOutcome, OperationId, ScopeLimits};
-    use crate::resource::{CleanupScheduler, ResourceRegistry};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::RawWaker;
+    use std::task::RawWakerVTable;
+    use std::task::Wake;
+    use std::task::Waker;
+
+    use super::OperationScope;
+    use super::ScopePolicy;
+    use crate::context::ContextOptions;
+    use crate::context::OperationContext;
+    use crate::protocol::CleanupContext;
+    use crate::protocol::OwnedCleanup;
+    use crate::report::CleanupOutcome;
+    use crate::report::OperationId;
+    use crate::report::ScopeLimits;
+    use crate::resource::CleanupScheduler;
+    use crate::resource::ResourceRegistry;
 
     struct ReadyCleanup;
 
     impl OwnedCleanup for ReadyCleanup {
-        fn begin(
-            self: Box<Self>,
-            _: CleanupContext,
-        ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+        fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
             Box::pin(std::future::ready(CleanupOutcome::Cleaned))
         }
     }
@@ -589,10 +585,7 @@ mod tests {
             registry.register_change_waker(Waker::noop());
             let _ = tx.send(());
         });
-        if rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err()
-        {
+        if rx.recv_timeout(std::time::Duration::from_millis(100)).is_err() {
             probe.lock_timeouts.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -693,14 +686,8 @@ mod tests {
         barrier.wait();
         let first_result = rx.recv_timeout(std::time::Duration::from_secs(1));
         let second_result = rx.recv_timeout(std::time::Duration::from_secs(1));
-        assert!(
-            first_result.is_ok(),
-            "first opposing transfer must complete"
-        );
-        assert!(
-            second_result.is_ok(),
-            "second opposing transfer must complete"
-        );
+        assert!(first_result.is_ok(), "first opposing transfer must complete");
+        assert!(second_result.is_ok(), "second opposing transfer must complete");
         assert!(first_result.unwrap().is_ok());
         assert!(second_result.unwrap().is_ok());
     }
@@ -742,11 +729,7 @@ pub(crate) struct JoinFacts {
     pub settlements: Vec<ChildSettlement>,
 }
 
-pub(crate) fn poll_child_business(
-    scope: &OperationScope,
-    cx: &mut Context<'_>,
-    facts: &mut JoinFacts,
-) -> Poll<()> {
+pub(crate) fn poll_child_business(scope: &OperationScope, cx: &mut Context<'_>, facts: &mut JoinFacts) -> Poll<()> {
     let children = {
         let state = scope.state.lock().unwrap_or_else(|e| e.into_inner());
         state
@@ -759,11 +742,7 @@ pub(crate) fn poll_child_business(
     let mut pending = false;
     for (control, requirement) in children {
         let id = control.snapshot().operation_id;
-        if facts
-            .business
-            .iter()
-            .any(|summary| summary.operation_id == id)
-        {
+        if facts.business.iter().any(|summary| summary.operation_id == id) {
             continue;
         }
         if let Poll::Ready(summary) = control.poll_business(cx) {
@@ -781,18 +760,10 @@ pub(crate) fn poll_child_business(
             pending = true;
         }
     }
-    if pending {
-        Poll::Pending
-    } else {
-        Poll::Ready(())
-    }
+    if pending { Poll::Pending } else { Poll::Ready(()) }
 }
 
-pub(crate) fn poll_child_releases(
-    scope: &OperationScope,
-    cx: &mut Context<'_>,
-    facts: &mut JoinFacts,
-) -> Poll<()> {
+pub(crate) fn poll_child_releases(scope: &OperationScope, cx: &mut Context<'_>, facts: &mut JoinFacts) -> Poll<()> {
     let children = {
         let state = scope.state.lock().unwrap_or_else(|e| e.into_inner());
         state
@@ -804,11 +775,7 @@ pub(crate) fn poll_child_releases(
     };
     let mut pending = false;
     for (id, control) in children {
-        if facts
-            .settlements
-            .iter()
-            .any(|settlement| settlement.operation_id == id)
-        {
+        if facts.settlements.iter().any(|settlement| settlement.operation_id == id) {
             continue;
         }
         match control.poll_released(cx) {
@@ -827,18 +794,10 @@ pub(crate) fn poll_child_releases(
             Poll::Pending => pending = true,
         }
     }
-    if pending {
-        Poll::Pending
-    } else {
-        Poll::Ready(())
-    }
+    if pending { Poll::Pending } else { Poll::Ready(()) }
 }
 
-pub(crate) fn poll_scope_business(
-    scope: &OperationScope,
-    cx: &mut Context<'_>,
-    facts: &mut JoinFacts,
-) -> Poll<()> {
+pub(crate) fn poll_scope_business(scope: &OperationScope, cx: &mut Context<'_>, facts: &mut JoinFacts) -> Poll<()> {
     if poll_child_business(scope, cx, facts).is_pending() {
         return Poll::Pending;
     }
@@ -850,11 +809,7 @@ pub(crate) fn poll_scope_business(
     Poll::Ready(())
 }
 
-pub(crate) fn poll_scope_releases(
-    scope: &OperationScope,
-    cx: &mut Context<'_>,
-    facts: &mut JoinFacts,
-) -> Poll<()> {
+pub(crate) fn poll_scope_releases(scope: &OperationScope, cx: &mut Context<'_>, facts: &mut JoinFacts) -> Poll<()> {
     if poll_child_releases(scope, cx, facts).is_pending() {
         return Poll::Pending;
     }

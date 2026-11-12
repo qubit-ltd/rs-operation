@@ -1,24 +1,51 @@
-use qubit_operation::context::{ContextOptions, Deadline};
-use qubit_operation::driver::{BlockingExecutor, ThreadExecutor, is_thread_executor_worker};
-use qubit_operation::operation::OperationObserver;
-use qubit_operation::protocol::ManagedOperationControl;
-use qubit_operation::protocol::{CleanupContext, OwnedCleanup};
-use qubit_operation::report::{
-    ChildBusinessOutcome, ChildBusinessSummary, ChildSettlement, ChildSnapshot, CleanupFailure,
-    CleanupOutcome, CleanupStage, DiagnosticSummary, EffectFact, EffectRecord, OperationId,
-    OperationOutcome, OperationPhase, RecoveryKey, RecoveryOwner, ResourceId, ResourcePhase,
-    ScopeLimits, StopReason, SupervisorLimits,
-};
-use qubit_operation::report::{ClockDomainId, MonotonicTime};
-use qubit_operation::resource::RecoveryRegistry;
-use qubit_operation::scope::{ChildRequirement, ScopeOptions, ScopePolicy};
-use qubit_operation::supervisor::OperationSupervisor;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 use std::thread;
+
+use qubit_operation::context::ContextOptions;
+use qubit_operation::context::Deadline;
+use qubit_operation::driver::BlockingExecutor;
+use qubit_operation::driver::ThreadExecutor;
+use qubit_operation::driver::is_thread_executor_worker;
+use qubit_operation::operation::OperationObserver;
+use qubit_operation::protocol::CleanupContext;
+use qubit_operation::protocol::ManagedOperationControl;
+use qubit_operation::protocol::OwnedCleanup;
+use qubit_operation::report::ChildBusinessOutcome;
+use qubit_operation::report::ChildBusinessSummary;
+use qubit_operation::report::ChildSettlement;
+use qubit_operation::report::ChildSnapshot;
+use qubit_operation::report::CleanupFailure;
+use qubit_operation::report::CleanupOutcome;
+use qubit_operation::report::CleanupStage;
+use qubit_operation::report::ClockDomainId;
+use qubit_operation::report::DiagnosticSummary;
+use qubit_operation::report::EffectFact;
+use qubit_operation::report::EffectRecord;
+use qubit_operation::report::MonotonicTime;
+use qubit_operation::report::OperationId;
+use qubit_operation::report::OperationOutcome;
+use qubit_operation::report::OperationPhase;
+use qubit_operation::report::RecoveryKey;
+use qubit_operation::report::RecoveryOwner;
+use qubit_operation::report::ResourceId;
+use qubit_operation::report::ResourcePhase;
+use qubit_operation::report::ScopeLimits;
+use qubit_operation::report::StopReason;
+use qubit_operation::report::SupervisorLimits;
+use qubit_operation::resource::RecoveryRegistry;
+use qubit_operation::scope::ChildRequirement;
+use qubit_operation::scope::ScopeOptions;
+use qubit_operation::scope::ScopePolicy;
+use qubit_operation::supervisor::OperationSupervisor;
 
 #[path = "support/gate.rs"]
 mod gate;
@@ -96,9 +123,7 @@ impl ProbeControl {
         let (lock, changed) = &*self.state;
         let state = lock.lock().unwrap();
         let (state, timeout) = changed
-            .wait_timeout_while(state, std::time::Duration::from_secs(5), |s| {
-                s.stop_requests == 0
-            })
+            .wait_timeout_while(state, std::time::Duration::from_secs(5), |s| s.stop_requests == 0)
             .unwrap();
         assert!(
             !timeout.timed_out() || state.stop_requests != 0,
@@ -112,9 +137,7 @@ impl ProbeControl {
         let (lock, changed) = &*self.state;
         let state = lock.lock().unwrap();
         let (state, timeout) = changed
-            .wait_timeout_while(state, std::time::Duration::from_secs(2), |s| {
-                s.stop_requests == 0
-            })
+            .wait_timeout_while(state, std::time::Duration::from_secs(2), |s| s.stop_requests == 0)
             .unwrap();
         !timeout.timed_out() || state.stop_requests != 0
     }
@@ -173,10 +196,7 @@ struct GateCleanup {
 struct PanicCleanup(Arc<std::sync::atomic::AtomicBool>);
 
 impl OwnedCleanup for PanicCleanup {
-    fn begin(
-        self: Box<Self>,
-        _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+    fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
         self.0.store(true, Ordering::SeqCst);
         Box::pin(async { panic!("contract cleanup panic") })
     }
@@ -185,8 +205,7 @@ impl OwnedCleanup for GateCleanup {
     fn begin(
         self: Box<Self>,
         _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = qubit_operation::report::CleanupOutcome> + Send + 'static>>
-    {
+    ) -> Pin<Box<dyn Future<Output = qubit_operation::report::CleanupOutcome> + Send + 'static>> {
         Box::pin(async move {
             self.started.store(true, Ordering::SeqCst);
             self.gate.wait().await;
@@ -204,13 +223,8 @@ impl OwnedCleanup for RecoveryCleanup {
     fn begin(
         self: Box<Self>,
         _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = qubit_operation::report::CleanupOutcome> + Send + 'static>>
-    {
-        let id = self
-            .id
-            .lock()
-            .unwrap()
-            .expect("registration id set before cleanup");
+    ) -> Pin<Box<dyn Future<Output = qubit_operation::report::CleanupOutcome> + Send + 'static>> {
+        let id = self.id.lock().unwrap().expect("registration id set before cleanup");
         let (key, failure_owner) = self
             .registry
             .register_with_capsule(id, String::from("capsule"), String::from("failure owner"))
@@ -233,11 +247,8 @@ impl OwnedCleanup for ImmediateCleanup {
     fn begin(
         self: Box<Self>,
         _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = qubit_operation::report::CleanupOutcome> + Send + 'static>>
-    {
-        Box::pin(std::future::ready(
-            qubit_operation::report::CleanupOutcome::Cleaned,
-        ))
+    ) -> Pin<Box<dyn Future<Output = qubit_operation::report::CleanupOutcome> + Send + 'static>> {
+        Box::pin(std::future::ready(qubit_operation::report::CleanupOutcome::Cleaned))
     }
 }
 struct CountCleanup(Arc<std::sync::atomic::AtomicUsize>);
@@ -245,12 +256,9 @@ impl OwnedCleanup for CountCleanup {
     fn begin(
         self: Box<Self>,
         _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = qubit_operation::report::CleanupOutcome> + Send + 'static>>
-    {
+    ) -> Pin<Box<dyn Future<Output = qubit_operation::report::CleanupOutcome> + Send + 'static>> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Box::pin(std::future::ready(
-            qubit_operation::report::CleanupOutcome::Cleaned,
-        ))
+        Box::pin(std::future::ready(qubit_operation::report::CleanupOutcome::Cleaned))
     }
 }
 struct TransferCleanup {
@@ -262,13 +270,8 @@ impl OwnedCleanup for TransferCleanup {
     fn begin(
         self: Box<Self>,
         _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = qubit_operation::report::CleanupOutcome> + Send + 'static>>
-    {
-        let id = self
-            .id
-            .lock()
-            .unwrap()
-            .expect("source identity set before cleanup");
+    ) -> Pin<Box<dyn Future<Output = qubit_operation::report::CleanupOutcome> + Send + 'static>> {
+        let id = self.id.lock().unwrap().expect("source identity set before cleanup");
         let (_, receipt) = self
             .receiver
             .accept_cleanup_transfer(id, Box::new(ImmediateCleanup))
@@ -286,9 +289,7 @@ fn handle_is_unique_observer_is_clone_and_body_can_start() {
     fn assert_clone<T: Clone>() {}
     assert_clone::<OperationObserver<usize, std::io::Error>>();
     let mut handle = supervisor
-        .start(ScopeOptions::default(), |_| async {
-            Ok::<_, std::io::Error>(7)
-        })
+        .start(ScopeOptions::default(), |_| async { Ok::<_, std::io::Error>(7) })
         .unwrap();
     let observer = handle.observer();
     let observer_copy = observer.clone();
@@ -434,9 +435,7 @@ fn resource_use_and_cleanup_gate_keep_released_pending_until_confirmation() {
                 .unwrap();
             let use_lease = scope.acquire_use(resource).unwrap();
             let mut reservation = scope.reserve_child(ChildRequirement::Required).unwrap();
-            reservation
-                .attach_with_uses(Arc::new(child), vec![use_lease])
-                .unwrap();
+            reservation.attach_with_uses(Arc::new(child), vec![use_lease]).unwrap();
             reservation.commit().unwrap();
             tx.send(resource).unwrap();
             Ok::<_, std::io::Error>(71_u32)
@@ -496,12 +495,8 @@ fn child_scope_transfer_keeps_owner_supervised_until_parent_join_confirms_cleanu
             let child_scope = scope.child_scope(ScopeOptions::default()).unwrap();
             let moved = scope.transfer_resource_to(resource, &child_scope).unwrap();
             let use_lease = child_scope.acquire_use(moved).unwrap();
-            let mut reservation = child_scope
-                .reserve_child(ChildRequirement::Required)
-                .unwrap();
-            reservation
-                .attach_with_uses(Arc::new(child), vec![use_lease])
-                .unwrap();
+            let mut reservation = child_scope.reserve_child(ChildRequirement::Required).unwrap();
+            reservation.attach_with_uses(Arc::new(child), vec![use_lease]).unwrap();
             reservation.commit().unwrap();
             tx.send((resource, moved)).unwrap();
             let joined = scope.join().await;
@@ -513,29 +508,18 @@ fn child_scope_transfer_keeps_owner_supervised_until_parent_join_confirms_cleanu
     assert_ne!(source.operation, receiver.operation);
     assert!(!started.load(Ordering::SeqCst));
     assert!(
-        matches!(
-            joined_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ),
+        matches!(joined_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
         "join must remain pending until destination cleanup is confirmed"
     );
     child_control.release();
     cleanup_gate.wait_started();
     assert!(started.load(Ordering::SeqCst));
     assert!(
-        matches!(
-            joined_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ),
+        matches!(joined_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
         "join must remain pending while cleanup has not confirmed"
     );
     cleanup_gate.release();
-    assert_eq!(
-        joined_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap(),
-        1
-    );
+    assert_eq!(joined_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), 1);
     assert!(matches!(
         handle.result_blocking().unwrap(),
         OperationOutcome::Succeeded(())
@@ -639,9 +623,7 @@ fn managed_worker_blocking_wait_returns_would_deadlock() {
     let mut outer = supervisor
         .start(ScopeOptions::default(), move |_| async move {
             let mut inner = nested_supervisor
-                .start(ScopeOptions::default(), |_| async {
-                    Ok::<_, std::io::Error>(1_u8)
-                })
+                .start(ScopeOptions::default(), |_| async { Ok::<_, std::io::Error>(1_u8) })
                 .unwrap();
             let result_wait = inner.result_blocking();
             let release_wait = inner.observer().released_blocking();
@@ -678,10 +660,7 @@ fn run_async_is_lazy_until_first_poll_and_run_to_completion_returns_settlement()
         0,
         "constructing run_async must not submit the body"
     );
-    assert!(matches!(
-        block_on(future).unwrap(),
-        OperationOutcome::Succeeded(31)
-    ));
+    assert!(matches!(block_on(future).unwrap(), OperationOutcome::Succeeded(31)));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
     let cleanup_gate = Gate::new();
@@ -717,21 +696,14 @@ fn result_is_taken_once_and_observation_releases_reserved_result_slot() {
         ..SupervisorLimits::default()
     });
     let mut first = supervisor
-        .start(ScopeOptions::default(), |_| async {
-            Ok::<_, std::io::Error>(1_u8)
-        })
+        .start(ScopeOptions::default(), |_| async { Ok::<_, std::io::Error>(1_u8) })
         .unwrap();
     assert_eq!(supervisor.reserved_results(), 1);
-    let rejected = match supervisor.start(ScopeOptions::default(), |_| async {
-        Ok::<_, std::io::Error>(2_u8)
-    }) {
+    let rejected = match supervisor.start(ScopeOptions::default(), |_| async { Ok::<_, std::io::Error>(2_u8) }) {
         Err(error) => error,
         Ok(_) => panic!("reserved result slot must reject another root"),
     };
-    assert_eq!(
-        rejected.reason(),
-        qubit_operation::report::AdmissionError::Busy
-    );
+    assert_eq!(rejected.reason(), qubit_operation::report::AdmissionError::Busy);
     let _ = rejected.into_body();
     assert!(matches!(
         first.result_blocking().unwrap(),
@@ -743,9 +715,7 @@ fn result_is_taken_once_and_observation_releases_reserved_result_slot() {
         Err(qubit_operation::report::ObservationError::AlreadyTaken)
     ));
     let mut second = supervisor
-        .start(ScopeOptions::default(), |_| async {
-            Ok::<_, std::io::Error>(3_u8)
-        })
+        .start(ScopeOptions::default(), |_| async { Ok::<_, std::io::Error>(3_u8) })
         .unwrap();
     assert!(matches!(
         second.result_blocking().unwrap(),
@@ -905,9 +875,7 @@ fn cleanup_recovery_is_transferred_and_report_remains_a_stable_history() {
             Ok::<_, std::io::Error>(53_u32)
         })
         .unwrap();
-    let scope = scope_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
+    let scope = scope_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
     assert!(matches!(
         handle.result_blocking().unwrap(),
         OperationOutcome::Succeeded(53)
@@ -922,10 +890,7 @@ fn cleanup_recovery_is_transferred_and_report_remains_a_stable_history() {
     assert_eq!(report.cleanup_failures.len(), 1);
     assert_eq!(report, observer.released_blocking().unwrap());
 
-    let resource_id = id_slot
-        .lock()
-        .unwrap()
-        .expect("registered resource identity");
+    let resource_id = id_slot.lock().unwrap().expect("registered resource identity");
     let other_registry = RecoveryRegistry::new(1);
     let (_, foreign_owner) = other_registry
         .register_with_capsule(
@@ -943,9 +908,7 @@ fn cleanup_recovery_is_transferred_and_report_remains_a_stable_history() {
         "a foreign registry key is returned unchanged"
     );
 
-    let outer_key = scope
-        .take_recovery_key()
-        .expect("failed cleanup issued a one-use key");
+    let outer_key = scope.take_recovery_key().expect("failed cleanup issued a one-use key");
     let recovery_owner: RecoveryOwner = scope
         .take_recovery(outer_key)
         .expect("scope recovery registry accepts its own key");
@@ -999,18 +962,13 @@ fn transferred_cleanup_requires_receiver_release_receipt_to_clear_source_tombsto
         })
         .unwrap();
     let (source_scope, _dependent_id) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-    let source_id = id_slot
-        .lock()
-        .unwrap()
-        .expect("source registration was created");
+    let source_id = id_slot.lock().unwrap().expect("source registration was created");
     assert!(matches!(
         handle.result_blocking().unwrap(),
         OperationOutcome::Succeeded(())
     ));
     let observer = handle.observer();
-    let transfer = accepted_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
+    let transfer = accepted_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
     assert_eq!(transfer.resource(), source_id);
     let waker = Waker::from(Arc::new(Noop));
     let mut cx = Context::from_waker(&waker);
@@ -1029,13 +987,9 @@ fn transferred_cleanup_requires_receiver_release_receipt_to_clear_source_tombsto
         "accepted transfer leaves a source tombstone until receiver release proof"
     );
 
-    let wrong_registry =
-        qubit_operation::resource::ResourceRegistry::new(OperationId::new(9001), 1);
-    let wrong_source_registry =
-        qubit_operation::resource::ResourceRegistry::new(OperationId::new(9002), 1);
-    let wrong_handle = wrong_source_registry
-        .register(Box::new(ImmediateCleanup))
-        .unwrap();
+    let wrong_registry = qubit_operation::resource::ResourceRegistry::new(OperationId::new(9001), 1);
+    let wrong_source_registry = qubit_operation::resource::ResourceRegistry::new(OperationId::new(9002), 1);
+    let wrong_handle = wrong_source_registry.register(Box::new(ImmediateCleanup)).unwrap();
     let wrong_source = wrong_handle.id();
     wrong_handle.close_for_use().unwrap();
     let wrong_ready = wrong_source_registry.take_ready_cleanup().unwrap();
@@ -1067,13 +1021,8 @@ fn transferred_cleanup_requires_receiver_release_receipt_to_clear_source_tombsto
         block_on(owner.begin(CleanupContext { deadline: None })),
         qubit_operation::report::CleanupOutcome::Cleaned
     ));
-    let release = receiver
-        .confirm_released_with_receipt(receiver_id)
-        .unwrap()
-        .unwrap();
-    source_scope
-        .confirm_transferred_release(source_id, release)
-        .unwrap();
+    let release = receiver.confirm_released_with_receipt(receiver_id).unwrap().unwrap();
+    source_scope.confirm_transferred_release(source_id, release).unwrap();
     let report = observer.released_blocking().unwrap();
     assert_eq!(
         a_cleanup_calls.load(Ordering::SeqCst),
@@ -1122,10 +1071,7 @@ fn active_body_deadline_requests_timeout_and_publishes_stopped() {
     clock.advance_by(1);
     gate.release();
     let outcome = handle.result_blocking().unwrap();
-    assert!(
-        started.is_ok(),
-        "body should start before deadline: {outcome:?}"
-    );
+    assert!(started.is_ok(), "body should start before deadline: {outcome:?}");
     assert!(
         matches!(outcome, OperationOutcome::Stopped(ref stop) if stop.reason == StopReason::Timeout),
         "deadline should stop active body, got {outcome:?}"
@@ -1163,18 +1109,13 @@ fn child_scope_deadline_stops_its_active_children() {
             Ok::<_, std::io::Error>(())
         })
         .unwrap();
-    entered_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
+    entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
     gate.wait_started();
     clock.advance_by(1);
     let stopped = control.stopped_before_watchdog();
     control.release();
     gate.release();
-    assert!(
-        stopped,
-        "child deadline must stop its already committed child"
-    );
+    assert!(stopped, "child deadline must stop its already committed child");
     assert!(matches!(
         handle.result_blocking().unwrap(),
         OperationOutcome::Succeeded(())
@@ -1209,10 +1150,7 @@ fn pending_child_reservations_consume_quota_and_uncommitted_drop_returns_it() {
     let outcome = handle.result_blocking().unwrap();
     match outcome {
         OperationOutcome::Succeeded((second_is_limited, dropped_reservation_returns_quota)) => {
-            assert!(
-                second_is_limited,
-                "pending reservations must consume child quota"
-            );
+            assert!(second_is_limited, "pending reservations must consume child quota");
             assert!(
                 dropped_reservation_returns_quota,
                 "dropping an uncommitted reservation returns quota"
@@ -1231,9 +1169,7 @@ fn async_body_error_under_fail_fast_stops_committed_child() {
     let mut handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let mut reservation = scope.reserve_child(ChildRequirement::Required).unwrap();
-            reservation
-                .attach(Arc::new(control_for_body.clone()))
-                .unwrap();
+            reservation.attach(Arc::new(control_for_body.clone())).unwrap();
             reservation.commit().unwrap();
             tx.send(()).unwrap();
             Err::<(), _>("async body failed")
@@ -1243,14 +1179,8 @@ fn async_body_error_under_fail_fast_stops_committed_child() {
     let stopped = control.stopped_before_watchdog();
     control.release();
     let outcome = handle.result_blocking().unwrap();
-    assert!(
-        stopped,
-        "FailFast must stop active committed children on body error"
-    );
-    assert!(matches!(
-        outcome,
-        OperationOutcome::Failed("async body failed")
-    ));
+    assert!(stopped, "FailFast must stop active committed children on body error");
+    assert!(matches!(outcome, OperationOutcome::Failed("async body failed")));
 }
 
 #[test]
@@ -1263,9 +1193,7 @@ fn blocking_body_error_under_fail_fast_stops_committed_child() {
     let mut handle = supervisor
         .start_blocking(&executor, ScopeOptions::default(), move |scope| {
             let mut reservation = scope.reserve_child(ChildRequirement::Required).unwrap();
-            reservation
-                .attach(Arc::new(control_for_body.clone()))
-                .unwrap();
+            reservation.attach(Arc::new(control_for_body.clone())).unwrap();
             reservation.commit().unwrap();
             tx.send(()).unwrap();
             Err::<(), _>("blocking body failed")
@@ -1275,14 +1203,8 @@ fn blocking_body_error_under_fail_fast_stops_committed_child() {
     let stopped = control.stopped_before_watchdog();
     control.release();
     let outcome = handle.result_blocking().unwrap();
-    assert!(
-        stopped,
-        "FailFast must stop active committed children on body error"
-    );
-    assert!(matches!(
-        outcome,
-        OperationOutcome::Failed("blocking body failed")
-    ));
+    assert!(stopped, "FailFast must stop active committed children on body error");
+    assert!(matches!(outcome, OperationOutcome::Failed("blocking body failed")));
 }
 
 #[test]
@@ -1319,9 +1241,7 @@ fn cleanup_panic_publishes_unconfirmed_settlement_instead_of_stalling() {
     let body_cleanup_started = Arc::clone(&cleanup_started);
     let mut handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
-            scope
-                .register_resource(PanicCleanup(body_cleanup_started))
-                .unwrap();
+            scope.register_resource(PanicCleanup(body_cleanup_started)).unwrap();
             Ok::<_, std::io::Error>(())
         })
         .unwrap();
@@ -1344,10 +1264,7 @@ fn cleanup_panic_publishes_unconfirmed_settlement_instead_of_stalling() {
         thread::yield_now();
     };
     assert!(cleanup_started.load(Ordering::SeqCst));
-    assert!(
-        report.is_some(),
-        "cleanup panic must publish a terminal report"
-    );
+    assert!(report.is_some(), "cleanup panic must publish a terminal report");
     assert_eq!(report.unwrap().resource_phase, ResourcePhase::Unconfirmed);
 }
 
@@ -1372,9 +1289,7 @@ fn committed_effect_record_survives_later_cancellation() {
             Ok::<_, std::io::Error>(())
         })
         .unwrap();
-    recorded_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
+    recorded_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
     gate.wait_started();
     handle.request_cancel(StopReason::UserCancelled);
     gate.release();
@@ -1401,9 +1316,7 @@ fn dropping_last_resource_use_wakes_scope_cleanup_drain() {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let mut handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
-            let id = scope
-                .register_resource(CountCleanup(body_cleanup_calls))
-                .unwrap();
+            let id = scope.register_resource(CountCleanup(body_cleanup_calls)).unwrap();
             let resource_use = scope.acquire_use(id).unwrap();
             tx.send(resource_use).unwrap();
             Ok::<_, std::io::Error>(())
@@ -1464,9 +1377,7 @@ fn cleanup_pool_saturation_keeps_owner_until_capacity_returns() {
                 ..ScopeOptions::default()
             },
             move |scope| async move {
-                scope
-                    .register_resource(CountCleanup(body_cleanup_calls))
-                    .unwrap();
+                scope.register_resource(CountCleanup(body_cleanup_calls)).unwrap();
                 Ok::<_, std::io::Error>(())
             },
         )
@@ -1482,9 +1393,7 @@ fn cleanup_pool_saturation_keeps_owner_until_capacity_returns() {
         thread::sleep(std::time::Duration::from_millis(20));
         clock.advance_by(1);
     });
-    let observed =
-        block_on(observer.observe_until(Deadline::at(MonotonicTime::new(ClockDomainId(211), 1))))
-            .unwrap();
+    let observed = block_on(observer.observe_until(Deadline::at(MonotonicTime::new(ClockDomainId(211), 1)))).unwrap();
     advance.join().unwrap();
     assert!(observed.snapshot.settlement.is_some());
     assert_eq!(second_cleanup_calls.load(Ordering::SeqCst), 1);
@@ -1554,10 +1463,7 @@ fn observer_deadline_without_context_clock_returns_explicit_error() {
         Ok(_) => panic!("observer deadline requires a configured clock"),
         Err(error) => error,
     };
-    assert_eq!(
-        error,
-        qubit_operation::report::ObservationError::ClockUnavailable
-    );
+    assert_eq!(error, qubit_operation::report::ObservationError::ClockUnavailable);
     assert!(matches!(
         block_on(handle.result()).unwrap(),
         OperationOutcome::Succeeded(5)
@@ -1588,15 +1494,10 @@ fn start_wait_returns_unstarted_body_on_expired_context() {
         Ok(_) => panic!("expired context must reject admission"),
         Err(error) => error,
     };
-    assert_eq!(
-        error.reason(),
-        qubit_operation::report::AdmissionError::DeadlineExpired
-    );
+    assert_eq!(error.reason(), qubit_operation::report::AdmissionError::DeadlineExpired);
     assert_eq!(starts.load(Ordering::SeqCst), 0);
     let recovered = error.into_body();
-    let mut handle = supervisor
-        .start(ScopeOptions::default(), recovered)
-        .unwrap();
+    let mut handle = supervisor.start(ScopeOptions::default(), recovered).unwrap();
     assert!(matches!(
         block_on(handle.result()).unwrap(),
         OperationOutcome::Succeeded(17)
@@ -1649,16 +1550,11 @@ fn start_wait_blocking_deadline_returns_original_body_while_capacity_is_held() {
         Err(error) => error,
     };
     advancer.join().unwrap();
-    assert_eq!(
-        error.reason(),
-        qubit_operation::report::AdmissionError::DeadlineExpired
-    );
+    assert_eq!(error.reason(), qubit_operation::report::AdmissionError::DeadlineExpired);
     assert_eq!(starts.load(Ordering::SeqCst), 0);
     gate.release();
     let _ = block_on(active.released());
-    let mut retry = supervisor
-        .start(ScopeOptions::default(), error.into_body())
-        .unwrap();
+    let mut retry = supervisor.start(ScopeOptions::default(), error.into_body()).unwrap();
     assert!(matches!(
         block_on(retry.result()).unwrap(),
         OperationOutcome::Succeeded(3)
@@ -1725,13 +1621,10 @@ fn dropping_pending_start_wait_removes_waiter_without_starting_body() {
     gate.wait_started();
     let starts = Arc::new(AtomicU64::new(0));
     let body_starts = Arc::clone(&starts);
-    let mut waiter = Box::pin(supervisor.start_wait(
-        ScopeOptions::default(),
-        move |_| async move {
-            body_starts.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, std::io::Error>(2usize)
-        },
-    ));
+    let mut waiter = Box::pin(supervisor.start_wait(ScopeOptions::default(), move |_| async move {
+        body_starts.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, std::io::Error>(2usize)
+    }));
     let waker = std::task::Waker::from(Arc::new(ThreadWaker(thread::current())));
     let mut cx = Context::from_waker(&waker);
     assert!(waiter.as_mut().poll(&mut cx).is_pending());
@@ -1792,18 +1685,14 @@ fn start_wait_blocking_rejects_managed_worker() {
     let nested_supervisor = supervisor.clone();
     let mut handle = supervisor
         .start(ScopeOptions::default(), move |_| async move {
-            let nested = nested_supervisor
-                .start_wait_blocking(ScopeOptions::default(), move |_| async move {
-                    Ok::<_, std::io::Error>(())
-                });
+            let nested = nested_supervisor.start_wait_blocking(ScopeOptions::default(), move |_| async move {
+                Ok::<_, std::io::Error>(())
+            });
             let error = match nested {
                 Ok(_) => panic!("managed worker must not block waiting for admission"),
                 Err(error) => error,
             };
-            assert_eq!(
-                error.reason(),
-                qubit_operation::report::AdmissionError::WouldDeadlock
-            );
+            assert_eq!(error.reason(), qubit_operation::report::AdmissionError::WouldDeadlock);
             Ok::<_, std::io::Error>(())
         })
         .unwrap();
@@ -1823,22 +1712,15 @@ fn start_blocking_rejects_managed_worker_without_running_body() {
     let body_started = Arc::clone(&nested_started);
     let mut handle = supervisor
         .start(ScopeOptions::default(), move |_| async move {
-            let nested = nested_supervisor.start_blocking(
-                &*nested_executor,
-                ScopeOptions::default(),
-                move |_| {
-                    body_started.store(true, Ordering::SeqCst);
-                    Ok::<_, std::io::Error>(())
-                },
-            );
+            let nested = nested_supervisor.start_blocking(&*nested_executor, ScopeOptions::default(), move |_| {
+                body_started.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(())
+            });
             let error = match nested {
                 Ok(_) => panic!("managed worker must not submit blocking work synchronously"),
                 Err(error) => error,
             };
-            assert_eq!(
-                error.reason(),
-                qubit_operation::report::AdmissionError::WouldDeadlock
-            );
+            assert_eq!(error.reason(), qubit_operation::report::AdmissionError::WouldDeadlock);
             Ok::<_, std::io::Error>(())
         })
         .unwrap();
@@ -1908,10 +1790,7 @@ fn blocking_body_panic_publishes_panicked_and_releases_resources() {
         );
         thread::park_timeout(std::time::Duration::from_millis(10));
     };
-    assert!(matches!(
-        outcome,
-        Poll::Ready(Ok(OperationOutcome::Panicked(_)))
-    ));
+    assert!(matches!(outcome, Poll::Ready(Ok(OperationOutcome::Panicked(_)))));
     drop(result);
     assert!(handle.released_blocking().unwrap().all_released);
 }
@@ -1930,9 +1809,7 @@ fn start_blocking_queue_rejection_returns_original_unstarted_body() {
             })
             .is_ok()
     );
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
+    started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
     assert!(executor.execute(|| {}).is_ok());
     let starts = Arc::new(AtomicU64::new(0));
     let body_starts = Arc::clone(&starts);
@@ -1943,16 +1820,11 @@ fn start_blocking_queue_rejection_returns_original_unstarted_body() {
         Ok(_) => panic!("full executor queue rejects before body start"),
         Err(error) => error,
     };
-    assert_eq!(
-        error.reason(),
-        qubit_operation::report::AdmissionError::Busy
-    );
+    assert_eq!(error.reason(), qubit_operation::report::AdmissionError::Busy);
     assert_eq!(starts.load(Ordering::SeqCst), 0);
     let recovered = error.into_body();
     let mut handle = supervisor
-        .start(ScopeOptions::default(), move |scope| async move {
-            recovered(scope)
-        })
+        .start(ScopeOptions::default(), move |scope| async move { recovered(scope) })
         .unwrap();
     assert!(matches!(
         block_on(handle.result()).unwrap(),
@@ -2011,10 +1883,7 @@ fn start_blocking_rolls_back_queued_root_and_original_body_can_retry() {
         Ok(_) => panic!("synchronous start returns instead of waiting on a queued root"),
         Err(error) => error,
     };
-    assert_eq!(
-        rejected.reason(),
-        qubit_operation::report::AdmissionError::Busy
-    );
+    assert_eq!(rejected.reason(), qubit_operation::report::AdmissionError::Busy);
     assert_eq!(starts.load(Ordering::SeqCst), 0);
     let recovered = rejected.into_body();
     releaser.join().unwrap();

@@ -1,5 +1,12 @@
-use super::{DiagnosticSummary, OperationId, RecoveryKey, ResourceId, TransferReceipt};
-use std::{error::Error, fmt, sync::Arc};
+use std::error::Error;
+use std::fmt;
+use std::sync::Arc;
+
+use super::DiagnosticSummary;
+use super::OperationId;
+use super::RecoveryKey;
+use super::ResourceId;
+use super::TransferReceipt;
 
 /// Phase in which cleanup failed or transferred responsibility.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,7 +27,8 @@ pub struct CleanupFailure {
     pub stage: CleanupStage,
     /// Sanitized bounded diagnostic text.
     pub summary: DiagnosticSummary,
-    /// Typed source shared by `Arc`; arbitrary errors need not implement `Clone`.
+    /// Typed source shared by `Arc`; arbitrary errors need not implement
+    /// `Clone`.
     pub source: Option<Arc<dyn Error + Send + Sync>>,
 }
 
@@ -82,10 +90,7 @@ impl RecoveryOwner {
     /// On a type, resource-generation, or key mismatch, returns this owner
     /// unchanged. The erased value is never exposed for arbitrary downcasting.
     pub fn take<R: Send + 'static>(self, key: RecoveryKey<R>) -> Result<R, Self> {
-        if key.registry_id != self.registry_id
-            || key.resource_id() != self.resource_id
-            || key.nonce != self.nonce
-        {
+        if key.registry_id != self.registry_id || key.resource_id() != self.resource_id || key.nonce != self.nonce {
             return Err(self);
         }
         match self.value.downcast::<R>() {
@@ -126,7 +131,8 @@ pub struct SettlementReport {
     pub operation_id: OperationId,
     /// Aggregate resource lifecycle phase.
     pub resource_phase: super::ResourcePhase,
-    /// True only when all required release/cleanup responsibilities are settled.
+    /// True only when all required release/cleanup responsibilities are
+    /// settled.
     pub all_released: bool,
     /// Bounded child settlement facts.
     pub children: Arc<[ChildSettlement]>,
@@ -136,13 +142,16 @@ pub struct SettlementReport {
     pub transfers: Arc<[TransferReceipt]>,
     /// Number of resources whose final release is still unconfirmed.
     pub unconfirmed_count: usize,
-    /// Caller-declared side effects retained even when business work was stopped.
+    /// Caller-declared side effects retained even when business work was
+    /// stopped.
     pub effects: Arc<[super::EffectRecord]>,
-    /// Number of side-effect records omitted after the configured limit was reached.
+    /// Number of side-effect records omitted after the configured limit was
+    /// reached.
     pub effect_overflow: usize,
 }
 
-/// Copyable cleanup failure fact that excludes typed sources and owner payloads.
+/// Copyable cleanup failure fact that excludes typed sources and owner
+/// payloads.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CleanupFailureSummary {
     /// Resource whose cleanup failed.
@@ -155,16 +164,15 @@ pub struct CleanupFailureSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::{RecoveryOwner, ResourceId};
-    use crate::report::{OperationId, RecoveryKey};
+    use super::RecoveryOwner;
+    use super::ResourceId;
+    use crate::report::OperationId;
+    use crate::report::RecoveryKey;
 
     #[test]
     fn recovery_key_must_match_resource_generation_and_nonce() {
         let id = ResourceId::new(OperationId::new(1), 4, 8);
-        let owner = RecoveryOwner::new(
-            &RecoveryKey::<String>::new(1, id, 13),
-            String::from("owned"),
-        );
+        let owner = RecoveryOwner::new(&RecoveryKey::<String>::new(1, id, 13), String::from("owned"));
         let wrong = RecoveryKey::<String>::new(1, ResourceId::new(OperationId::new(1), 4, 7), 13);
         let owner = owner.take(wrong).unwrap_err();
         let wrong = RecoveryKey::<String>::new(1, id, 12);
@@ -176,17 +184,11 @@ mod tests {
     #[test]
     fn recovery_key_must_match_the_erased_owner_type() {
         let id = ResourceId::new(OperationId::new(2), 1, 3);
-        let owner = RecoveryOwner::new(
-            &RecoveryKey::<String>::new(1, id, 21),
-            String::from("owned"),
-        );
+        let owner = RecoveryOwner::new(&RecoveryKey::<String>::new(1, id, 21), String::from("owned"));
         let wrong_type = RecoveryKey::<u64>::new(1, id, 21);
 
         let owner = owner.take(wrong_type).unwrap_err();
-        assert_eq!(
-            owner.take(RecoveryKey::<String>::new(1, id, 21)).unwrap(),
-            "owned"
-        );
+        assert_eq!(owner.take(RecoveryKey::<String>::new(1, id, 21)).unwrap(), "owned");
     }
 
     #[test]

@@ -10,15 +10,6 @@
 #[path = "support/mod.rs"]
 mod support;
 
-use qubit_operation::driver::BlockingExecutor;
-use qubit_operation::driver::DriverStatus;
-use qubit_operation::driver::ExecutorError;
-use qubit_operation::driver::ExternalDriver;
-use qubit_operation::driver::ExternalDriverGuard;
-use qubit_operation::driver::PortableDriver;
-use qubit_operation::driver::PortableDriverConfig;
-use qubit_operation::driver::ThreadExecutor;
-use qubit_operation::driver::is_thread_executor_worker;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -30,15 +21,22 @@ use std::task::Waker;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+
+use qubit_operation::driver::BlockingExecutor;
+use qubit_operation::driver::DriverStatus;
+use qubit_operation::driver::ExecutorError;
+use qubit_operation::driver::ExternalDriver;
+use qubit_operation::driver::ExternalDriverGuard;
+use qubit_operation::driver::PortableDriver;
+use qubit_operation::driver::PortableDriverConfig;
+use qubit_operation::driver::ThreadExecutor;
+use qubit_operation::driver::is_thread_executor_worker;
 use support::Gate;
 
 fn wait_for_task_count(driver: &PortableDriver, expected: usize) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while driver.task_count() != expected {
-        assert!(
-            Instant::now() < deadline,
-            "driver task count did not settle"
-        );
+        assert!(Instant::now() < deadline, "driver task count did not settle");
         thread::yield_now();
     }
 }

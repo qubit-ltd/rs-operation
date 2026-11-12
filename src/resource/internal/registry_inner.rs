@@ -6,13 +6,13 @@
 //    Licensed under the Apache License, Version 2.0 (the "License").
 // =============================================================================
 
-use super::RegistryState;
-
-use crate::report::OperationId;
-
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::task::Waker;
+
+use super::RegistryState;
+use crate::report::OperationId;
 
 pub(in crate::resource) struct RegistryInner {
     pub(in crate::resource) id: u64,

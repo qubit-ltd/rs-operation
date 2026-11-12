@@ -7,7 +7,8 @@
 // =============================================================================
 
 use std::cell::Cell;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Context;
@@ -37,24 +38,21 @@ struct ActiveWorkerMarker(Arc<PortableShared>);
 #[cfg(test)]
 impl ActiveWorkerMarker {
     fn enter(shared: Arc<PortableShared>) -> Self {
-        shared
-            .active_workers
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        shared.active_workers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Self(shared)
     }
 }
 #[cfg(test)]
 impl Drop for ActiveWorkerMarker {
     fn drop(&mut self) {
-        self.0
-            .active_workers
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.active_workers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
 use super::PortableShared;
 
-/// Poll portable tasks in bounded FIFO turns without holding the scheduler lock.
+/// Poll portable tasks in bounded FIFO turns without holding the scheduler
+/// lock.
 pub fn portable_worker_loop(shared: Arc<PortableShared>) {
     let _worker_marker = WorkerMarker::enter();
     #[cfg(test)]
@@ -70,16 +68,12 @@ pub fn portable_worker_loop(shared: Arc<PortableShared>) {
                     }
                     if let Some(id) = state.ready.pop_front() {
                         if let Some(task) = state.tasks.get(&id).cloned() {
-                            task.queued
-                                .store(false, std::sync::atomic::Ordering::Release);
+                            task.queued.store(false, std::sync::atomic::Ordering::Release);
                             break (id, task);
                         }
                         continue;
                     }
-                    state = shared
-                        .ready
-                        .wait(state)
-                        .unwrap_or_else(|error| error.into_inner());
+                    state = shared.ready.wait(state).unwrap_or_else(|error| error.into_inner());
                 }
             };
             let Some(mut future) = lock(&task.future).take() else {

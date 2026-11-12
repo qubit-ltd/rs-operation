@@ -6,6 +6,13 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::task::Context;
+use std::task::Poll;
+
 use super::notify::Notified;
 use super::notify::Notify;
 use crate::report::ObservationError;
@@ -13,12 +20,6 @@ use crate::report::OperationOutcome;
 use crate::report::SettlementReport;
 use crate::report::StopReason;
 use crate::report::StopReport;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::task::Context;
-use std::task::Poll;
 
 /// Ownership state of the single typed business result.
 enum ResultSlot<T, E> {
@@ -67,10 +68,7 @@ impl<T, E> StateCell<T, E> {
     }
 
     /// Publish the first business outcome. A previously accepted stop wins.
-    pub(crate) fn publish(
-        &self,
-        outcome: OperationOutcome<T, E>,
-    ) -> Result<(), OperationOutcome<T, E>> {
+    pub(crate) fn publish(&self, outcome: OperationOutcome<T, E>) -> Result<(), OperationOutcome<T, E>> {
         let mut state = lock(&self.state);
         if !matches!(state.result, ResultSlot::Pending) || state.stop.is_some() {
             drop(state);
@@ -89,11 +87,7 @@ impl<T, E> StateCell<T, E> {
     }
 
     /// Accept the first stop reason if no business outcome has been published.
-    pub(crate) fn request_stop(
-        &self,
-        reason: StopReason,
-        accepted_at: Option<crate::report::MonotonicTime>,
-    ) -> bool {
+    pub(crate) fn request_stop(&self, reason: StopReason, accepted_at: Option<crate::report::MonotonicTime>) -> bool {
         let accepted = {
             let mut state = lock(&self.state);
             if state.success_published {
@@ -101,10 +95,7 @@ impl<T, E> StateCell<T, E> {
             } else if state.stop.is_some() {
                 false
             } else {
-                let report = StopReport {
-                    reason,
-                    accepted_at,
-                };
+                let report = StopReport { reason, accepted_at };
                 state.stop = Some(report.clone());
                 if matches!(state.result, ResultSlot::Pending) {
                     state.result = ResultSlot::Ready(OperationOutcome::Stopped(report));
@@ -137,7 +128,8 @@ impl<T, E> StateCell<T, E> {
         }
     }
 
-    /// Discard an available result without dropping its user value under the state lock.
+    /// Discard an available result without dropping its user value under the
+    /// state lock.
     pub(crate) fn discard_result(&self) -> bool {
         let discarded = {
             let mut state = lock(&self.state);
@@ -185,7 +177,8 @@ impl<T, E> StateCell<T, E> {
         lock(&self.state).settlement.as_ref().map(Arc::clone)
     }
 
-    /// Return the first accepted stop fact without consuming the business result.
+    /// Return the first accepted stop fact without consuming the business
+    /// result.
     pub(crate) fn stop_report(&self) -> Option<StopReport> {
         lock(&self.state).stop.clone()
     }
@@ -214,7 +207,8 @@ impl<T, E> StateCell<T, E> {
 pub(crate) struct ResultFuture<'a, T, E> {
     /// Shared cell whose result this future may consume once.
     cell: &'a StateCell<T, E>,
-    /// Current generation waiter, dropped automatically if observation is cancelled.
+    /// Current generation waiter, dropped automatically if observation is
+    /// cancelled.
     notification: Option<Notified>,
 }
 
@@ -246,21 +240,11 @@ impl<T, E> Future for ResultFuture<'_, T, E> {
 
 /// Recover a poisoned internal synchronization lock without exposing poison.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::StateCell;
-    use crate::report::ObservationError;
-    use crate::report::OperationId;
-    use crate::report::OperationOutcome;
-    use crate::report::ResourcePhase;
-    use crate::report::SettlementReport;
-    use crate::report::StopReason;
-    use crate::report::StopReport;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -273,6 +257,15 @@ mod tests {
     use std::task::Waker;
     use std::thread;
     use std::time::Duration;
+
+    use super::StateCell;
+    use crate::report::ObservationError;
+    use crate::report::OperationId;
+    use crate::report::OperationOutcome;
+    use crate::report::ResourcePhase;
+    use crate::report::SettlementReport;
+    use crate::report::StopReason;
+    use crate::report::StopReport;
 
     #[derive(Debug, Eq, PartialEq)]
     struct NonCloneError(&'static str);
@@ -291,10 +284,7 @@ mod tests {
 
     fn counting_waker() -> (Waker, Arc<Mutex<usize>>) {
         let count = Arc::new(Mutex::new(0));
-        (
-            Waker::from(Arc::new(CountingWake(Arc::clone(&count)))),
-            count,
-        )
+        (Waker::from(Arc::new(CountingWake(Arc::clone(&count)))), count)
     }
 
     #[test]
@@ -307,10 +297,7 @@ mod tests {
             cell.take_result_blocking().unwrap(),
             OperationOutcome::Failed(NonCloneError("original"))
         );
-        assert_eq!(
-            cell.take_result_blocking(),
-            Err(ObservationError::AlreadyTaken)
-        );
+        assert_eq!(cell.take_result_blocking(), Err(ObservationError::AlreadyTaken));
     }
 
     #[test]
@@ -327,10 +314,7 @@ mod tests {
             })
         );
         assert!(cell.publish(OperationOutcome::Succeeded(7)).is_err());
-        assert_eq!(
-            cell.take_result_blocking(),
-            Err(ObservationError::AlreadyTaken)
-        );
+        assert_eq!(cell.take_result_blocking(), Err(ObservationError::AlreadyTaken));
     }
 
     #[test]
@@ -339,17 +323,13 @@ mod tests {
         cell.publish(OperationOutcome::Succeeded(11)).unwrap();
 
         assert!(!cell.request_stop(StopReason::UserCancelled, None));
-        assert_eq!(
-            cell.take_result_blocking().unwrap(),
-            OperationOutcome::Succeeded(11)
-        );
+        assert_eq!(cell.take_result_blocking().unwrap(), OperationOutcome::Succeeded(11));
     }
 
     #[test]
     fn test_later_stop_is_recorded_without_overwriting_a_failure() {
         let cell = StateCell::<usize, NonCloneError>::new();
-        cell.publish(OperationOutcome::Failed(NonCloneError("failed")))
-            .unwrap();
+        cell.publish(OperationOutcome::Failed(NonCloneError("failed"))).unwrap();
 
         assert!(cell.request_stop(StopReason::UserCancelled, None));
         assert_eq!(
@@ -371,10 +351,7 @@ mod tests {
         let (first_waker, _) = counting_waker();
         let mut first_context = Context::from_waker(&first_waker);
         let mut first = Box::pin(cell.result());
-        assert!(matches!(
-            first.as_mut().poll(&mut first_context),
-            Poll::Pending
-        ));
+        assert!(matches!(first.as_mut().poll(&mut first_context), Poll::Pending));
         drop(first);
 
         cell.publish(OperationOutcome::Succeeded(23)).unwrap();
@@ -444,9 +421,7 @@ mod tests {
         let (lock, condition) = &*rendezvous;
         let mut registered = lock.lock().unwrap();
         while !*registered {
-            let (next, timeout) = condition
-                .wait_timeout(registered, Duration::from_secs(2))
-                .unwrap();
+            let (next, timeout) = condition.wait_timeout(registered, Duration::from_secs(2)).unwrap();
             registered = next;
             assert!(!timeout.timed_out(), "waiter did not reach its gate");
         }
@@ -474,10 +449,7 @@ mod tests {
             Pin::as_mut(&mut result).poll(&mut context),
             Poll::Ready(Ok(OperationOutcome::Succeeded(41)))
         ));
-        assert_eq!(
-            cell.take_result_blocking(),
-            Err(ObservationError::AlreadyTaken)
-        );
+        assert_eq!(cell.take_result_blocking(), Err(ObservationError::AlreadyTaken));
     }
 
     #[test]
@@ -510,13 +482,7 @@ mod tests {
 
         assert!(cell.discard_result());
         assert!(!cell.discard_result());
-        assert_eq!(
-            cell.take_result_blocking(),
-            Err(ObservationError::ResultDiscarded)
-        );
-        assert_eq!(
-            cell.take_result_blocking(),
-            Err(ObservationError::ResultDiscarded)
-        );
+        assert_eq!(cell.take_result_blocking(), Err(ObservationError::ResultDiscarded));
+        assert_eq!(cell.take_result_blocking(), Err(ObservationError::ResultDiscarded));
     }
 }

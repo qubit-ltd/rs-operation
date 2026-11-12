@@ -1,23 +1,48 @@
 //! Public managed operation handles and supervisor submission.
 
-use crate::context::{ContextError, Deadline, OperationContext};
-use crate::driver::{BlockingExecutor, ExecutorError, PortableDriverError};
-use crate::protocol::CleanupContext;
-use crate::report::{
-    AdmissionError, ChildFailureSummary, CleanupFailureSummary, CleanupOutcome, ClockDomainId,
-    DiagnosticSummary, MonotonicTime, ObservationError, OperationId, OperationOutcome,
-    PanicSummary, ResourcePhase, SettlementReport, StartError, StopReason, StopReport,
-};
-use crate::resource::{CleanupObservation, CleanupScheduler};
-use crate::scope::{
-    JoinFacts, OperationScope, ScopeOptions, poll_scope_business, poll_scope_releases,
-};
-use crate::supervisor::{OperationSupervisor, ResultLease};
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll, Waker};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use core::task::Context;
+use core::task::Poll;
+use core::task::Waker;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
+use crate::context::ContextError;
+use crate::context::Deadline;
+use crate::context::OperationContext;
+use crate::driver::BlockingExecutor;
+use crate::driver::ExecutorError;
+use crate::driver::PortableDriverError;
+use crate::protocol::CleanupContext;
+use crate::report::AdmissionError;
+use crate::report::ChildFailureSummary;
+use crate::report::CleanupFailureSummary;
+use crate::report::CleanupOutcome;
+use crate::report::ClockDomainId;
+use crate::report::DiagnosticSummary;
+use crate::report::MonotonicTime;
+use crate::report::ObservationError;
+use crate::report::OperationId;
+use crate::report::OperationOutcome;
+use crate::report::PanicSummary;
+use crate::report::ResourcePhase;
+use crate::report::SettlementReport;
+use crate::report::StartError;
+use crate::report::StopReason;
+use crate::report::StopReport;
+use crate::resource::CleanupObservation;
+use crate::resource::CleanupScheduler;
+use crate::scope::JoinFacts;
+use crate::scope::OperationScope;
+use crate::scope::ScopeOptions;
+use crate::scope::poll_scope_business;
+use crate::scope::poll_scope_releases;
+use crate::supervisor::OperationSupervisor;
+use crate::supervisor::ResultLease;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -83,8 +108,7 @@ impl<T, E> OperationHandle<T, E> {
 
     /// Consume the typed outcome using a blocking wait.
     pub fn result_blocking(&mut self) -> Result<OperationOutcome<T, E>, ObservationError> {
-        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker()
-        {
+        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker() {
             return Err(ObservationError::WouldDeadlock);
         }
         let mut state = lock(&self.shared.state);
@@ -105,11 +129,7 @@ impl<T, E> OperationHandle<T, E> {
                 }
                 return Ok(result);
             }
-            state = self
-                .shared
-                .changed
-                .wait(state)
-                .unwrap_or_else(|e| e.into_inner());
+            state = self.shared.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -120,8 +140,7 @@ impl<T, E> OperationHandle<T, E> {
 
     /// Wait for settlement using a blocking wait.
     pub fn released_blocking(&self) -> Result<SettlementReport, ObservationError> {
-        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker()
-        {
+        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker() {
             return Err(ObservationError::WouldDeadlock);
         }
         let mut state = lock(&self.shared.state);
@@ -129,11 +148,7 @@ impl<T, E> OperationHandle<T, E> {
             if let Some(report) = &state.released {
                 return Ok(report.clone());
             }
-            state = self
-                .shared
-                .changed
-                .wait(state)
-                .unwrap_or_else(|e| e.into_inner());
+            state = self.shared.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -183,8 +198,7 @@ impl<T, E> OperationObserver<T, E> {
     }
     /// Wait for a stable settlement snapshot using a blocking wait.
     pub fn released_blocking(&self) -> Result<SettlementReport, ObservationError> {
-        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker()
-        {
+        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker() {
             return Err(ObservationError::WouldDeadlock);
         }
         let mut state = lock(&self.shared.state);
@@ -192,11 +206,7 @@ impl<T, E> OperationObserver<T, E> {
             if let Some(report) = &state.released {
                 return Ok(report.clone());
             }
-            state = self
-                .shared
-                .changed
-                .wait(state)
-                .unwrap_or_else(|e| e.into_inner());
+            state = self.shared.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
     /// Return the latest resource state without waiting.
@@ -207,20 +217,14 @@ impl<T, E> OperationObserver<T, E> {
             .map_or(ResourcePhase::Active, |r| r.resource_phase)
     }
 
-    /// Observe the current state until a caller-owned deadline without stopping the operation.
-    pub async fn observe_until(
-        &self,
-        deadline: Deadline,
-    ) -> Result<ObserveUntil<T, E>, ObservationError> {
-        let mut timer = self
-            .shared
-            .context
-            .signal_at(deadline)
-            .map_err(|error| match error {
-                ContextError::ClockUnavailable => ObservationError::ClockUnavailable,
-                ContextError::ClockDomainMismatch => ObservationError::ClockDomainMismatch,
-                _ => ObservationError::InvalidObserver,
-            })?;
+    /// Observe the current state until a caller-owned deadline without stopping
+    /// the operation.
+    pub async fn observe_until(&self, deadline: Deadline) -> Result<ObserveUntil<T, E>, ObservationError> {
+        let mut timer = self.shared.context.signal_at(deadline).map_err(|error| match error {
+            ContextError::ClockUnavailable => ObservationError::ClockUnavailable,
+            ContextError::ClockDomainMismatch => ObservationError::ClockDomainMismatch,
+            _ => ObservationError::InvalidObserver,
+        })?;
         let snapshot = std::future::poll_fn(|cx| {
             let timed_out = Pin::new(&mut timer).poll(cx).is_ready();
             let mut candidate = Some(cx.waker().clone());
@@ -229,19 +233,12 @@ impl<T, E> OperationObserver<T, E> {
                 if let Some(report) = &state.released {
                     (Some(observer_snapshot(&state, Some(report.clone()))), false)
                 } else {
-                    if !state
-                        .release_waiters
-                        .iter()
-                        .any(|w| w.will_wake(cx.waker()))
-                    {
+                    if !state.release_waiters.iter().any(|w| w.will_wake(cx.waker())) {
                         state
                             .release_waiters
                             .push(candidate.take().expect("candidate waker is present"));
                     }
-                    (
-                        timed_out.then(|| observer_snapshot(&state, None)),
-                        timed_out,
-                    )
+                    (timed_out.then(|| observer_snapshot(&state, None)), timed_out)
                 }
             };
             drop(candidate);
@@ -277,17 +274,12 @@ pub struct ObserverSnapshot {
     pub settlement: Option<SettlementReport>,
 }
 
-fn observer_snapshot<T, E>(
-    state: &State<T, E>,
-    settlement: Option<SettlementReport>,
-) -> ObserverSnapshot {
+fn observer_snapshot<T, E>(state: &State<T, E>, settlement: Option<SettlementReport>) -> ObserverSnapshot {
     ObserverSnapshot {
         resource_phase: settlement
             .as_ref()
             .map_or(ResourcePhase::Active, |report| report.resource_phase),
-        business_result_ready: state.result.is_some()
-            || state.result_taken
-            || state.result_discarded,
+        business_result_ready: state.result.is_some() || state.result_taken || state.result_discarded,
         result_taken: state.result_taken,
         result_discarded: state.result_discarded,
         settlement,
@@ -340,11 +332,7 @@ fn poll_released<T, E>(shared: &Arc<Shared<T, E>>, cx: &mut Context<'_>) -> Poll
         if let Some(report) = &state.released {
             Poll::Ready(report.clone())
         } else {
-            if !state
-                .release_waiters
-                .iter()
-                .any(|w| w.will_wake(cx.waker()))
-            {
+            if !state.release_waiters.iter().any(|w| w.will_wake(cx.waker())) {
                 state
                     .release_waiters
                     .push(candidate.take().expect("candidate waker is present"));
@@ -376,11 +364,7 @@ fn remove_release_waiter<T, E>(shared: &Arc<Shared<T, E>>, waker: &Waker) {
 
 impl OperationSupervisor {
     /// Admit and immediately submit an owned asynchronous body.
-    pub fn start<F, Fut, T, E>(
-        &self,
-        options: ScopeOptions,
-        body: F,
-    ) -> Result<OperationHandle<T, E>, StartError<F>>
+    pub fn start<F, Fut, T, E>(&self, options: ScopeOptions, body: F) -> Result<OperationHandle<T, E>, StartError<F>>
     where
         F: FnOnce(OperationScope) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, E>> + Send + 'static,
@@ -390,21 +374,17 @@ impl OperationSupervisor {
         let context = OperationContext::new(options.context.clone());
         let body_cell = Arc::new(Mutex::new(Some(body)));
         let retained = Arc::clone(&body_cell);
-        let mut admission = match self.try_admit_with_context(
-            move || lock(&retained).take().expect("body invoked once"),
-            &context,
-        ) {
-            Ok(admission) => admission,
-            Err(error) => {
-                return Err(StartError::new(
-                    error.reason(),
-                    lock(&body_cell).take().expect("unstarted body retained"),
-                ));
-            }
-        };
-        let admitted = admission
-            .transfer()
-            .expect("fresh admission transfers once");
+        let mut admission =
+            match self.try_admit_with_context(move || lock(&retained).take().expect("body invoked once"), &context) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return Err(StartError::new(
+                        error.reason(),
+                        lock(&body_cell).take().expect("unstarted body retained"),
+                    ));
+                }
+            };
+        let admitted = admission.transfer().expect("fresh admission transfers once");
         let (_, task_lease, result_lease) = admitted.into_parts();
         self.start_admitted(options, context, body_cell, task_lease, result_lease)
     }
@@ -435,9 +415,7 @@ impl OperationSupervisor {
             let reason = error.reason();
             StartError::new(reason, error.into_body()())
         })?;
-        let admitted = admission
-            .transfer()
-            .expect("fresh admission transfers once");
+        let admitted = admission.transfer().expect("fresh admission transfers once");
         let (_, task_lease, result_lease) = admitted.into_parts();
         self.start_admitted(options, context, body_cell, task_lease, result_lease)
     }
@@ -456,17 +434,18 @@ impl OperationSupervisor {
         T: Send + 'static,
         E: Send + 'static,
     {
-        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker()
-        {
+        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker() {
             return Err(StartError::new(AdmissionError::WouldDeadlock, body));
         }
         block_on_start_wait(self.start_wait(options, body))
     }
 
-    /// Immediately admit a synchronous body and run it on the caller-supplied bounded executor.
+    /// Immediately admit a synchronous body and run it on the caller-supplied
+    /// bounded executor.
     ///
-    /// If root admission would queue, this rolls the reservation back and returns `Busy` with
-    /// the original body. Use [`Self::start_wait`] or [`Self::start_wait_blocking`] to wait.
+    /// If root admission would queue, this rolls the reservation back and
+    /// returns `Busy` with the original body. Use [`Self::start_wait`] or
+    /// [`Self::start_wait_blocking`] to wait.
     pub fn start_blocking<X, F, T, E>(
         &self,
         executor: &X,
@@ -501,14 +480,10 @@ impl OperationSupervisor {
             drop(admission);
             return Err(StartError::new(
                 AdmissionError::Busy,
-                lock(&body_cell)
-                    .take()
-                    .expect("queued blocking body retained"),
+                lock(&body_cell).take().expect("queued blocking body retained"),
             ));
         }
-        let admitted = admission
-            .transfer()
-            .expect("fresh admission transfers once");
+        let admitted = admission.transfer().expect("fresh admission transfers once");
         let (_, task_lease, result_lease) = admitted.into_parts();
         let id = OperationId::new(NEXT_ID.fetch_add(1, Ordering::Relaxed) as u128);
         let shared = Arc::new(Shared {
@@ -622,8 +597,7 @@ impl OperationSupervisor {
                     operation_id: id,
                     resource_phase,
                     all_released: resource_phase == ResourcePhase::Released
-                        || (resource_phase == ResourcePhase::RecoveryRequired
-                            && unconfirmed_count == 0),
+                        || (resource_phase == ResourcePhase::RecoveryRequired && unconfirmed_count == 0),
                     children: facts.settlements.into(),
                     cleanup_failures: settlement.failures.into(),
                     transfers: settlement.transfers.into(),
@@ -652,12 +626,9 @@ impl OperationSupervisor {
         let job_completion = Arc::clone(&completion);
         let job_body = Arc::clone(&body_cell);
         if let Err(rejected) = executor.execute(move || {
-            let body = lock(&job_body)
-                .take()
-                .expect("accepted blocking body invoked once");
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(scope_for_job)))
-                    .map_or(BlockingBodyResult::Panicked, BlockingBodyResult::Returned);
+            let body = lock(&job_body).take().expect("accepted blocking body invoked once");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(scope_for_job)))
+                .map_or(BlockingBodyResult::Panicked, BlockingBodyResult::Returned);
             let waker = {
                 let mut state = lock(&job_completion);
                 state.result = Some(result);
@@ -683,9 +654,7 @@ impl OperationSupervisor {
             }
             return Err(StartError::new(
                 reason,
-                lock(&body_cell)
-                    .take()
-                    .expect("rejected blocking body retained"),
+                lock(&body_cell).take().expect("rejected blocking body retained"),
             ));
         }
         Ok(OperationHandle {
@@ -734,13 +703,7 @@ impl OperationSupervisor {
         let cleanup_scheduler = self.cleanup_scheduler();
         let manager_supervisor = self.internal_handle();
         let future = async move {
-            let scope = OperationScope::new(
-                id,
-                options.limits,
-                options.policy,
-                cleanup_scheduler,
-                scope_context,
-            );
+            let scope = OperationScope::new(id, options.limits, options.policy, cleanup_scheduler, scope_context);
             manager_supervisor.track_scope_recovery(&scope);
             let f = lock(&worker_body).take().expect("body invoked once");
             let body_scope = scope.clone();
@@ -759,8 +722,7 @@ impl OperationSupervisor {
             .await;
             if stopped.is_none()
                 && (result.is_err()
-                    || (matches!(&result, Ok(Err(_)))
-                        && scope.policy() == crate::scope::ScopePolicy::FailFast))
+                    || (matches!(&result, Ok(Err(_))) && scope.policy() == crate::scope::ScopePolicy::FailFast))
             {
                 scope.request_cancel(StopReason::ParentStopped);
             }
@@ -804,8 +766,7 @@ impl OperationSupervisor {
                 operation_id: id,
                 resource_phase,
                 all_released: resource_phase == ResourcePhase::Released
-                    || (resource_phase == ResourcePhase::RecoveryRequired
-                        && unconfirmed_count == 0),
+                    || (resource_phase == ResourcePhase::RecoveryRequired && unconfirmed_count == 0),
                 children: facts.settlements.into(),
                 cleanup_failures: failures.into(),
                 transfers: transfers.into(),
@@ -819,11 +780,7 @@ impl OperationSupervisor {
         let worker_lease = Arc::clone(&lease);
         match self.spawn_managed(async move {
             let ready = std::future::poll_fn(|cx| {
-                if let Poll::Ready(active) = lock(&worker_lease)
-                    .as_ref()
-                    .expect("task lease")
-                    .poll_active(cx)
-                {
+                if let Poll::Ready(active) = lock(&worker_lease).as_ref().expect("task lease").poll_active(cx) {
                     return Poll::Ready(active);
                 }
                 if let Poll::Ready(Ok(_reason)) = Pin::new(&mut admission_stop).poll(cx) {
@@ -835,9 +792,7 @@ impl OperationSupervisor {
             if ready && worker_context.admission_check().is_ok() {
                 future.await;
             } else {
-                let reason = worker_context
-                    .stop_reason()
-                    .unwrap_or(StopReason::UserCancelled);
+                let reason = worker_context.stop_reason().unwrap_or(StopReason::UserCancelled);
                 publish_result(
                     &gate_shared,
                     OperationOutcome::Stopped(StopReport {
@@ -900,9 +855,10 @@ impl OperationSupervisor {
             .expect("private run handle result is observed once"))
     }
 
-    /// Run a body and observe both its typed result and final resource settlement.
-    /// Resource-bearing outputs must be transferred or have their use leases returned
-    /// before the body completes, otherwise this future correctly remains pending.
+    /// Run a body and observe both its typed result and final resource
+    /// settlement. Resource-bearing outputs must be transferred or have
+    /// their use leases returned before the body completes, otherwise this
+    /// future correctly remains pending.
     pub async fn run_to_completion<F, Fut, T, E>(
         &self,
         options: ScopeOptions,
@@ -1157,9 +1113,7 @@ impl<F: Future> Future for CatchUnwind<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            this.future.as_mut().poll(cx)
-        })) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| this.future.as_mut().poll(cx))) {
             Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
             Ok(Poll::Pending) => Poll::Pending,
             Err(_) => Poll::Ready(Err(())),
@@ -1198,13 +1152,29 @@ impl<F: Future> Future for Cancellable<F> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Shared, State, poll_released, poll_result, publish_released, publish_result};
-    use crate::context::{ContextOptions, OperationContext};
-    use crate::report::{OperationId, OperationOutcome, ResourcePhase, SettlementReport};
-    use core::task::{Context, RawWaker, RawWakerVTable, Waker};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
+    use core::task::Context;
+    use core::task::RawWaker;
+    use core::task::RawWakerVTable;
+    use core::task::Waker;
+    use std::sync::Arc;
+    use std::sync::Condvar;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::task::Poll;
+
+    use super::Shared;
+    use super::State;
+    use super::poll_released;
+    use super::poll_result;
+    use super::publish_released;
+    use super::publish_result;
+    use crate::context::ContextOptions;
+    use crate::context::OperationContext;
+    use crate::report::OperationId;
+    use crate::report::OperationOutcome;
+    use crate::report::ResourcePhase;
+    use crate::report::SettlementReport;
 
     struct Probe {
         shared: Arc<Shared<(), ()>>,
@@ -1242,8 +1212,7 @@ mod tests {
         drop(probe);
     }
 
-    static VTABLE: RawWakerVTable =
-        RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref, drop_waker);
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref, drop_waker);
 
     fn reentrant_waker(shared: &Arc<Shared<(), ()>>, lock_reentries: &Arc<AtomicUsize>) -> Waker {
         let probe = Arc::new(Probe {

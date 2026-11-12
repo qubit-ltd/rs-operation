@@ -9,7 +9,8 @@
 use crate::protocol::OwnedCleanup;
 use crate::report::ResourceId;
 
-/// Cleanup owner removed from the registry and ready for an external cleanup driver.
+/// Cleanup owner removed from the registry and ready for an external cleanup
+/// driver.
 pub struct ReadyCleanup {
     pub(super) resource_id: ResourceId,
     pub(super) owner: Option<Box<dyn OwnedCleanup>>,

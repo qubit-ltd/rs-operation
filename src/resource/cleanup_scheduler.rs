@@ -1,14 +1,16 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll, Waker},
-};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 
-use crate::report::{CleanupOutcome, MonotonicTime};
+use crate::report::CleanupOutcome;
+use crate::report::MonotonicTime;
 
 /// Bounded cleanup concurrency, independent of business-operation admission.
 #[derive(Clone)]
@@ -40,7 +42,8 @@ pub struct CleanupPermit {
     capacity_waiters: Arc<Mutex<Vec<Waker>>>,
 }
 
-/// Panic fact for a cleanup future whose independent recovery capsule remains registered.
+/// Panic fact for a cleanup future whose independent recovery capsule remains
+/// registered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CleanupPanic {
     resource_id: crate::report::ResourceId,
@@ -77,15 +80,9 @@ struct CleanupTaskInner {
 #[derive(Debug)]
 pub enum CleanupObservation {
     Pending,
-    AlreadySettled {
-        resource_id: crate::report::ResourceId,
-    },
-    Unconfirmed {
-        resource_id: crate::report::ResourceId,
-    },
-    ClockDomainMismatch {
-        resource_id: crate::report::ResourceId,
-    },
+    AlreadySettled { resource_id: crate::report::ResourceId },
+    Unconfirmed { resource_id: crate::report::ResourceId },
+    ClockDomainMismatch { resource_id: crate::report::ResourceId },
     Settled(Result<CleanupOutcome, CleanupPanic>),
 }
 
@@ -109,12 +106,11 @@ impl CleanupScheduler {
             if active >= self.state.limit {
                 return None;
             }
-            match self.state.active.compare_exchange_weak(
-                active,
-                active + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .state
+                .active
+                .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => {
                     return Some(CleanupPermit {
                         active: Arc::clone(&self.state.active),
@@ -219,11 +215,7 @@ impl CleanupScheduler {
         permit: CleanupPermit,
         future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>>,
     ) -> Result<CleanupTask, Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>>> {
-        let mut tasks = self
-            .state
-            .tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut tasks = self.state.tasks.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if tasks.contains_key(&resource_id) {
             drop(permit);
             return Err(future);
@@ -319,17 +311,9 @@ impl CleanupTask {
     /// The first observation at/after the deadline returns `Unconfirmed` and
     /// retains both future and permit. A later call continues polling so the
     /// eventual real outcome can still be confirmed.
-    pub fn poll_at(
-        &mut self,
-        cx: &mut Context<'_>,
-        now: MonotonicTime,
-    ) -> Poll<CleanupObservation> {
+    pub fn poll_at(&mut self, cx: &mut Context<'_>, now: MonotonicTime) -> Poll<CleanupObservation> {
         let deadline = {
-            let task = self
-                .state
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let task = self.state.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if task.settled {
                 return Poll::Ready(CleanupObservation::AlreadySettled {
                     resource_id: self.resource_id,
@@ -346,11 +330,7 @@ impl CleanupTask {
                     resource_id: self.resource_id,
                 });
             }
-            let mut task = self
-                .state
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut task = self.state.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if !task.unconfirmed_reported && now.ticks >= deadline.ticks {
                 task.unconfirmed_reported = true;
                 return Poll::Ready(CleanupObservation::Unconfirmed {
@@ -359,33 +339,20 @@ impl CleanupTask {
             }
         }
         let mut future = {
-            let mut task = self
-                .state
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut task = self.state.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             task.polling = true;
-            task.future
-                .take()
-                .expect("cleanup future is retained by its task")
+            task.future.take().expect("cleanup future is retained by its task")
         };
-        let polled =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx)));
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx)));
         match polled {
             Ok(Poll::Pending) => {
-                let mut task = self
-                    .state
-                    .inner
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut task = self.state.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 task.future = Some(future);
                 task.polling = false;
                 Poll::Ready(CleanupObservation::Pending)
             }
             Ok(Poll::Ready(outcome)) => {
-                let drop_panicked =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(future)))
-                        .is_err();
+                let drop_panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(future))).is_err();
                 self.complete_task();
                 if drop_panicked {
                     Poll::Ready(CleanupObservation::Settled(Err(CleanupPanic {
@@ -407,11 +374,7 @@ impl CleanupTask {
 
     fn complete_task(&self) {
         {
-            let mut task = self
-                .state
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut task = self.state.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             task.polling = false;
             task.settled = true;
             task.permit = None;

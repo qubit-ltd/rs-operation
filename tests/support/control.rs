@@ -54,12 +54,11 @@ pub struct FakeControl {
 }
 
 impl FakeControl {
-    /// Create a fresh control with distinct operation identity and no completed facts.
+    /// Create a fresh control with distinct operation identity and no completed
+    /// facts.
     pub fn new() -> Self {
         Self {
-            operation_id: OperationId::new(
-                NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed) as u128
-            ),
+            operation_id: OperationId::new(NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed) as u128),
             state: Arc::default(),
         }
     }
@@ -69,23 +68,20 @@ impl FakeControl {
         self.operation_id
     }
 
-    /// Return the number of actual calls to [`ManagedOperationControl::request_stop`].
+    /// Return the number of actual calls to
+    /// [`ManagedOperationControl::request_stop`].
     pub fn stop_requests(&self) -> usize {
-        self.state
-            .lock()
-            .expect("control mutex poisoned")
-            .stop_requests
+        self.state.lock().expect("control mutex poisoned").stop_requests
     }
 
-    /// Return the first accepted stop reason without discarding later call counts.
+    /// Return the first accepted stop reason without discarding later call
+    /// counts.
     pub fn first_stop_reason(&self) -> Option<StopReason> {
-        self.state
-            .lock()
-            .expect("control mutex poisoned")
-            .first_stop
+        self.state.lock().expect("control mutex poisoned").first_stop
     }
 
-    /// Publish the business fact and wake observers that polled before it was available.
+    /// Publish the business fact and wake observers that polled before it was
+    /// available.
     pub fn complete_business(&self, result: BusinessResult) {
         let waiters = {
             let mut state = self.state.lock().expect("control mutex poisoned");
@@ -98,7 +94,8 @@ impl FakeControl {
         }
     }
 
-    /// Confirm release independently from the business outcome and wake its observers.
+    /// Confirm release independently from the business outcome and wake its
+    /// observers.
     pub fn confirm_release(&self) {
         let waiters = {
             let mut state = self.state.lock().expect("control mutex poisoned");

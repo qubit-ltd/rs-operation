@@ -6,7 +6,8 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
-//! Portable future driving, bounded blocking execution, and external driver leases.
+//! Portable future driving, bounded blocking execution, and external driver
+//! leases.
 
 #[path = "driver/external.rs"]
 mod external;

@@ -6,10 +6,10 @@
 //    Licensed under the Apache License, Version 2.0 (the "License").
 // =============================================================================
 
+use std::sync::Arc;
+
 use super::internal::Entry;
 use super::internal::RegistryInner;
-
-use std::sync::Arc;
 
 /// One outstanding authorization for a resource to be used.
 ///

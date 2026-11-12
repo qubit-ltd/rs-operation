@@ -1,4 +1,5 @@
-use qubit_operation::report::{AdmissionError, SupervisorLimits};
+use qubit_operation::report::AdmissionError;
+use qubit_operation::report::SupervisorLimits;
 use qubit_operation::supervisor::OperationSupervisor;
 
 fn limits(active_roots: usize, queued_roots: usize, unobserved_results: usize) -> SupervisorLimits {
@@ -74,7 +75,10 @@ fn admission_waiter_drop_unregisters_and_close_returns_its_body() {
     use core::future::Future;
     use core::pin::Pin;
     use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Wake;
+    use std::task::Waker;
     struct Noop;
     impl Wake for Noop {
         fn wake(self: Arc<Self>) {}
@@ -91,10 +95,7 @@ fn admission_waiter_drop_unregisters_and_close_returns_its_body() {
     let waker = Waker::from(Arc::new(Noop));
     let mut cx = Context::from_waker(&waker);
     let mut dropped = Box::pin(supervisor.start_wait_body(String::from("dropped")).unwrap());
-    assert!(matches!(
-        Pin::as_mut(&mut dropped).poll(&mut cx),
-        Poll::Pending
-    ));
+    assert!(matches!(Pin::as_mut(&mut dropped).poll(&mut cx), Poll::Pending));
     assert_eq!(
         supervisor
             .start_wait_body(String::from("over limit"))
@@ -107,10 +108,7 @@ fn admission_waiter_drop_unregisters_and_close_returns_its_body() {
 
     let blocker = supervisor.try_admit().unwrap();
     let mut waiting = Box::pin(supervisor.start_wait_body(String::from("kept")).unwrap());
-    assert!(matches!(
-        Pin::as_mut(&mut waiting).poll(&mut cx),
-        Poll::Pending
-    ));
+    assert!(matches!(Pin::as_mut(&mut waiting).poll(&mut cx), Poll::Pending));
     supervisor.close();
     match Pin::as_mut(&mut waiting).poll(&mut cx) {
         Poll::Ready(Err(error)) => {
@@ -142,8 +140,12 @@ fn released_capacity_wakes_waiter_and_admits_without_running_body() {
     use core::future::Future;
     use core::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Wake;
+    use std::task::Waker;
     struct CountWake(Arc<AtomicUsize>);
     impl Wake for CountWake {
         fn wake(self: Arc<Self>) {
@@ -167,10 +169,7 @@ fn released_capacity_wakes_waiter_and_admits_without_running_body() {
     let wakes = Arc::new(AtomicUsize::new(0));
     let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
     let mut cx = Context::from_waker(&waker);
-    assert!(matches!(
-        Pin::as_mut(&mut waiter).poll(&mut cx),
-        Poll::Pending
-    ));
+    assert!(matches!(Pin::as_mut(&mut waiter).poll(&mut cx), Poll::Pending));
     drop(blocker);
     assert_eq!(wakes.load(Ordering::SeqCst), 1);
     let admitted = match Pin::as_mut(&mut waiter).poll(&mut cx) {
@@ -185,12 +184,22 @@ fn released_capacity_wakes_waiter_and_admits_without_running_body() {
 fn admission_wait_deadline_returns_expired_error_and_unstarted_body() {
     use core::future::Future;
     use core::pin::Pin;
-    use qubit_operation::context::{ContextOptions, Deadline, OperationContext};
-    use qubit_operation::protocol::{ClockSource, TimerRegistration};
-    use qubit_operation::report::{ClockDomainId, MonotonicTime};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Wake;
+    use std::task::Waker;
+
+    use qubit_operation::context::ContextOptions;
+    use qubit_operation::context::Deadline;
+    use qubit_operation::context::OperationContext;
+    use qubit_operation::protocol::ClockSource;
+    use qubit_operation::protocol::TimerRegistration;
+    use qubit_operation::report::ClockDomainId;
+    use qubit_operation::report::MonotonicTime;
     struct TestClock {
         ticks: AtomicU64,
         waker: Mutex<Option<Waker>>,
@@ -235,10 +244,7 @@ fn admission_wait_deadline_returns_expired_error_and_unstarted_body() {
     );
     let waker = Waker::from(Arc::new(Noop));
     let mut cx = Context::from_waker(&waker);
-    assert!(matches!(
-        Pin::as_mut(&mut waiter).poll(&mut cx),
-        Poll::Pending
-    ));
+    assert!(matches!(Pin::as_mut(&mut waiter).poll(&mut cx), Poll::Pending));
     clock.ticks.store(2, Ordering::SeqCst);
     clock.waker.lock().unwrap().take().unwrap().wake();
     match Pin::as_mut(&mut waiter).poll(&mut cx) {
@@ -256,11 +262,17 @@ fn admission_wait_deadline_returns_expired_error_and_unstarted_body() {
 fn context_stop_wakes_pending_admission_waiter_and_returns_body() {
     use core::future::Future;
     use core::pin::Pin;
-    use qubit_operation::context::{ContextOptions, OperationContext};
-    use qubit_operation::report::StopReason;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Wake;
+    use std::task::Waker;
+
+    use qubit_operation::context::ContextOptions;
+    use qubit_operation::context::OperationContext;
+    use qubit_operation::report::StopReason;
     struct CountWake(Arc<AtomicUsize>);
     impl Wake for CountWake {
         fn wake(self: Arc<Self>) {
@@ -284,10 +296,7 @@ fn context_stop_wakes_pending_admission_waiter_and_returns_body() {
     let wakes = Arc::new(AtomicUsize::new(0));
     let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
     let mut cx = Context::from_waker(&waker);
-    assert!(matches!(
-        Pin::as_mut(&mut waiter).poll(&mut cx),
-        Poll::Pending
-    ));
+    assert!(matches!(Pin::as_mut(&mut waiter).poll(&mut cx), Poll::Pending));
     assert!(operation_context.request_stop(StopReason::UserCancelled));
     assert_eq!(wakes.load(Ordering::SeqCst), 1);
     match Pin::as_mut(&mut waiter).poll(&mut cx) {
