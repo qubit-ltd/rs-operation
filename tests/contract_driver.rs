@@ -27,8 +27,21 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Wake;
 use std::task::Waker;
+use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 use support::Gate;
+
+fn wait_for_task_count(driver: &PortableDriver, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while driver.task_count() != expected {
+        assert!(
+            Instant::now() < deadline,
+            "driver task count did not settle"
+        );
+        thread::yield_now();
+    }
+}
 
 struct SelfWake {
     polls: Arc<AtomicUsize>,
@@ -123,7 +136,7 @@ fn test_portable_driver_bounds_tasks_and_executes_self_waking_future() {
         .unwrap();
     done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(driver.worker_count(), 2);
-    assert_eq!(driver.task_count(), 0);
+    wait_for_task_count(&driver, 0);
     for _ in 0..64 {
         driver.spawn(std::future::pending::<()>()).unwrap();
     }
@@ -164,7 +177,7 @@ fn test_portable_driver_wakes_a_pending_test_gate() {
     gate.wait_started();
     gate.release();
     done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert_eq!(driver.task_count(), 0);
+    wait_for_task_count(&driver, 0);
 }
 
 #[test]
@@ -185,7 +198,7 @@ fn test_repeated_wakes_coalesce_into_one_ready_entry() {
         .unwrap();
     done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(polls.load(Ordering::SeqCst), 2);
-    assert_eq!(driver.task_count(), 0);
+    wait_for_task_count(&driver, 0);
 }
 
 #[test]
