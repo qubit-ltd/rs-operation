@@ -10,12 +10,13 @@
 //!
 //! Foundation for managed operation lifecycles and composition.
 //!
-//! The crate currently exposes lifecycle protocol and report types. Managed
-//! operation execution and composition are being built on these foundations.
+//! The crate exposes lifecycle contracts, portable drivers, and resource
+//! registry primitives used to compose managed operations.
 
 mod internal;
 
 pub mod context;
+pub mod driver;
 pub mod protocol;
 pub mod report;
 pub mod resource;
