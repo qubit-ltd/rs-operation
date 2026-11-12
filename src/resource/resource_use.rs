@@ -7,6 +7,7 @@
 // =============================================================================
 
 use super::internal::Entry;
+use super::internal::RegistryInner;
 
 use std::sync::Arc;
 
@@ -16,6 +17,7 @@ use std::sync::Arc;
 /// copied native handles or external users have stopped accessing the resource.
 pub struct ResourceUse {
     pub(super) entry: Arc<Entry>,
+    pub(super) registry: Arc<RegistryInner>,
 }
 
 impl Drop for ResourceUse {
@@ -23,5 +25,6 @@ impl Drop for ResourceUse {
         if let Ok(mut state) = self.entry.state.lock() {
             state.active_uses = state.active_uses.saturating_sub(1);
         }
+        self.registry.notify_change();
     }
 }

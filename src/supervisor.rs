@@ -335,9 +335,11 @@ impl ServiceGroup {
             ScopeLimits {
                 child_operations: 0,
                 resources: capacity,
+                effect_records: 0,
             },
             crate::scope::ScopePolicy::FailFast,
             self.supervisor.cleanup_scheduler(),
+            crate::context::OperationContext::new(crate::context::ContextOptions::default()),
         );
         self.supervisor.track_scope_recovery(&scope);
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));

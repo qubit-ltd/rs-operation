@@ -1,16 +1,17 @@
 //! Child registration and structured scope composition.
 
-use crate::context::ContextOptions;
+use crate::context::{ContextError, ContextOptions, DeadlineSignal, OperationContext};
 use crate::protocol::{ManagedOperationControl, OwnedCleanup};
 use crate::report::{
-    ChildBusinessOutcome, ChildBusinessSummary, ChildSettlement, OperationId, RecoveryKey,
-    RecoveryOwner, ReleaseReceipt, ResourceId, ScopeLimits, StopReason,
+    ChildBusinessOutcome, ChildBusinessSummary, ChildSettlement, EffectRecord, OperationId,
+    RecoveryKey, RecoveryOwner, ReleaseReceipt, ResourceId, ScopeLimits, StopReason,
 };
 use crate::resource::{
     CleanupScheduler, RecoveryRegistry, RegisterError, RegistryError, ResourceError,
     ResourceHandle, ResourceRegistry, ResourceUse, TransferError,
 };
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -43,9 +44,11 @@ pub struct ScopeOptions {
 pub enum ScopeError {
     Closed,
     LimitReached,
+    EffectLimitReached,
     AlreadyAttached,
     NotAttached,
     Cancelled,
+    InvalidContext,
 }
 
 /// Aggregate of all committed child operations after business and release observation.
@@ -67,11 +70,13 @@ struct State {
     stop: Option<StopReason>,
     children: Vec<Child>,
     child_scopes: Vec<OperationScope>,
+    reserved_children: usize,
 }
 
 /// A scope that owns child registration authority and waits for registered work.
 #[derive(Clone)]
 pub struct OperationScope {
+    operation_id: OperationId,
     state: Arc<Mutex<State>>,
     limits: ScopeLimits,
     policy: ScopePolicy,
@@ -80,8 +85,16 @@ pub struct OperationScope {
     cleanup: CleanupScheduler,
     recovery: RecoveryRegistry,
     recovery_keys: Arc<Mutex<Vec<RecoveryKey<RecoveryOwner>>>>,
-    resource_wakers: Arc<Mutex<Vec<std::task::Waker>>>,
-    resource_epoch: Arc<std::sync::atomic::AtomicU64>,
+    context: OperationContext,
+    deadline_signal: Arc<Mutex<Option<DeadlineSignal>>>,
+    effects: Arc<Mutex<EffectState>>,
+}
+
+#[derive(Default)]
+struct EffectState {
+    limit: usize,
+    records: Vec<EffectRecord>,
+    overflow: usize,
 }
 
 impl OperationScope {
@@ -90,13 +103,17 @@ impl OperationScope {
         limits: ScopeLimits,
         policy: ScopePolicy,
         cleanup: CleanupScheduler,
+        context: OperationContext,
     ) -> Self {
+        let deadline_signal = Arc::new(Mutex::new(context.deadline_signal()));
         Self {
+            operation_id: operation,
             state: Arc::new(Mutex::new(State {
                 accepting: true,
                 stop: None,
                 children: Vec::new(),
                 child_scopes: Vec::new(),
+                reserved_children: 0,
             })),
             limits,
             policy,
@@ -105,13 +122,21 @@ impl OperationScope {
             cleanup,
             recovery: RecoveryRegistry::new(limits.resources),
             recovery_keys: Arc::default(),
-            resource_wakers: Arc::default(),
-            resource_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            context,
+            deadline_signal,
+            effects: Arc::new(Mutex::new(EffectState {
+                limit: limits.effect_records,
+                ..EffectState::default()
+            })),
         }
     }
 
     /// Create an owned child scope whose accepted work and resources join this scope.
     pub fn child_scope(&self, options: ScopeOptions) -> Result<OperationScope, ScopeError> {
+        let context = self
+            .context
+            .child(options.context.clone())
+            .map_err(|_error: ContextError| ScopeError::InvalidContext)?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.accepting {
             return Err(ScopeError::Closed);
@@ -121,23 +146,47 @@ impl OperationScope {
         }
         if options.limits.child_operations > self.limits.child_operations
             || options.limits.resources > self.limits.resources
+            || options.limits.effect_records > self.limits.effect_records
         {
             return Err(ScopeError::LimitReached);
         }
         let child_id = OperationId::new(
             NEXT_SCOPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128,
         );
-        let child = OperationScope::new(
+        let mut child = OperationScope::new(
             child_id,
             options.limits,
             options.policy,
             self.cleanup.clone(),
+            context,
         );
+        child.effects = Arc::clone(&self.effects);
         if let Some(reason) = state.stop {
             child.request_cancel(reason);
         }
         state.child_scopes.push(child.clone());
         Ok(child)
+    }
+
+    /// Return the identity of this operation scope.
+    pub const fn operation_id(&self) -> OperationId {
+        self.operation_id
+    }
+
+    /// Retain a caller-declared side-effect fact for the final settlement report.
+    pub fn record_effect(&self, effect: EffectRecord) -> Result<(), ScopeError> {
+        let mut state = self.effects.lock().unwrap_or_else(|e| e.into_inner());
+        if state.records.len() >= state.limit {
+            state.overflow = state.overflow.saturating_add(1);
+            return Err(ScopeError::EffectLimitReached);
+        }
+        state.records.push(effect);
+        Ok(())
+    }
+
+    pub(crate) fn effect_snapshot(&self) -> (Arc<[EffectRecord]>, usize) {
+        let state = self.effects.lock().unwrap_or_else(|e| e.into_inner());
+        (Arc::from(state.records.clone()), state.overflow)
     }
 
     /// Register a cleanup owner before creating or exposing its resource.
@@ -197,16 +246,39 @@ impl OperationScope {
         id: ResourceId,
         destination: &OperationScope,
     ) -> Result<ResourceId, TransferError> {
-        let mut handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
-        let handle = handles.get(&id).ok_or(TransferError::NotRegistered)?;
+        if Arc::ptr_eq(&self.handles, &destination.handles) {
+            return Err(TransferError::SameRegistry);
+        }
+        let self_first = Arc::as_ptr(&self.handles) < Arc::as_ptr(&destination.handles);
+        if self_first {
+            let mut source = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+            let mut target = destination
+                .handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.transfer_with_locked_handles(id, destination, &mut source, &mut target)
+        } else {
+            let mut target = destination
+                .handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut source = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+            self.transfer_with_locked_handles(id, destination, &mut source, &mut target)
+        }
+    }
+
+    fn transfer_with_locked_handles(
+        &self,
+        id: ResourceId,
+        destination: &OperationScope,
+        source: &mut BTreeMap<ResourceId, ResourceHandle>,
+        target: &mut BTreeMap<ResourceId, ResourceHandle>,
+    ) -> Result<ResourceId, TransferError> {
+        let handle = source.get(&id).ok_or(TransferError::NotRegistered)?;
         self.resources.transfer_to(handle, &destination.resources)?;
         let new_id = handle.id();
-        let handle = handles.remove(&id).expect("handle checked");
-        destination
-            .handles
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(new_id, handle);
+        let handle = source.remove(&id).expect("source handle was checked");
+        target.insert(new_id, handle);
         Ok(new_id)
     }
 
@@ -237,17 +309,7 @@ impl OperationScope {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
-        self.resource_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let waiters = std::mem::take(
-            &mut *self
-                .resource_wakers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        );
-        for waker in waiters {
-            waker.wake();
-        }
+        self.resources.notify_change();
         Ok(())
     }
 
@@ -262,6 +324,27 @@ impl OperationScope {
             let _ = handle.close_for_use();
         }
         let _ = (&self.cleanup, &self.resources, &self.recovery);
+    }
+
+    pub(crate) fn poll_deadlines(&self, cx: &mut Context<'_>) {
+        let mut signal = self
+            .deadline_signal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(mut signal) = signal.take() {
+            if Pin::new(&mut signal).poll(cx).is_ready() {
+                self.request_cancel(StopReason::Timeout);
+            } else {
+                *self
+                    .deadline_signal
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(signal);
+            }
+        }
+        for child in self.child_scopes() {
+            child.poll_deadlines(cx);
+        }
     }
 
     pub(crate) fn resource_registry(&self) -> ResourceRegistry {
@@ -280,8 +363,7 @@ impl OperationScope {
             .push(key);
     }
     pub(crate) fn resource_epoch(&self) -> u64 {
-        self.resource_epoch
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.resources.change_epoch()
     }
 
     pub(crate) async fn wait_for_resource_change(&self, seen: u64) {
@@ -292,18 +374,12 @@ impl OperationScope {
             {
                 return Poll::Ready(());
             }
-            let mut waiters = self
-                .resource_wakers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
-                waiters.push(cx.waker().clone());
-            }
+            self.resources.register_change_waker(cx.waker());
             if self.resource_epoch() != seen
                 || self.resources.has_ready_cleanup()
                 || self.resources.pending_cleanup_count() == 0
             {
-                waiters.retain(|w| !w.will_wake(cx.waker()));
+                self.resources.remove_change_waker(cx.waker());
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -317,19 +393,21 @@ impl OperationScope {
         &self,
         requirement: ChildRequirement,
     ) -> Result<ChildReservation, ScopeError> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.accepting {
             return Err(ScopeError::Closed);
         }
-        if state.children.len() >= self.limits.child_operations {
+        if state.children.len() + state.reserved_children >= self.limits.child_operations {
             return Err(ScopeError::LimitReached);
         }
+        state.reserved_children += 1;
         Ok(ChildReservation {
             scope: Arc::clone(&self.state),
             requirement,
             control: None,
             uses: Vec::new(),
             committed: false,
+            reserved: true,
         })
     }
 
@@ -404,6 +482,7 @@ pub struct ChildReservation {
     control: Option<Arc<dyn ManagedOperationControl>>,
     uses: Vec<ResourceUse>,
     committed: bool,
+    reserved: bool,
 }
 
 impl ChildReservation {
@@ -445,13 +524,213 @@ impl ChildReservation {
             committed: true,
             uses: Some(std::mem::take(&mut self.uses)),
         });
+        state.reserved_children -= 1;
+        self.reserved = false;
         self.committed = true;
         Ok(())
     }
 }
 
 impl Drop for ChildReservation {
-    fn drop(&mut self) { /* uncommitted reservations own no external work */
+    fn drop(&mut self) {
+        if self.reserved {
+            let mut state = self.scope.lock().unwrap_or_else(|e| e.into_inner());
+            state.reserved_children -= 1;
+            self.reserved = false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OperationScope, ScopePolicy};
+    use crate::context::{ContextOptions, OperationContext};
+    use crate::protocol::{CleanupContext, OwnedCleanup};
+    use crate::report::{CleanupOutcome, OperationId, ScopeLimits};
+    use crate::resource::{CleanupScheduler, ResourceRegistry};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker};
+
+    struct ReadyCleanup;
+
+    impl OwnedCleanup for ReadyCleanup {
+        fn begin(
+            self: Box<Self>,
+            _: CleanupContext,
+        ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+            Box::pin(std::future::ready(CleanupOutcome::Cleaned))
+        }
+    }
+
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ReentrantProbe {
+        registry: ResourceRegistry,
+        lock_timeouts: Arc<AtomicUsize>,
+    }
+
+    fn check_registry_reentry(probe: &ReentrantProbe) {
+        let registry = probe.registry.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            registry.register_change_waker(Waker::noop());
+            let _ = tx.send(());
+        });
+        if rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err()
+        {
+            probe.lock_timeouts.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    unsafe fn clone_reentrant_waker(data: *const ()) -> RawWaker {
+        let probe = unsafe { Arc::<ReentrantProbe>::from_raw(data.cast()) };
+        check_registry_reentry(&probe);
+        let clone = Arc::clone(&probe);
+        std::mem::forget(probe);
+        RawWaker::new(Arc::into_raw(clone).cast(), &REENTRANT_VTABLE)
+    }
+
+    unsafe fn wake_reentrant_waker(data: *const ()) {
+        let probe = unsafe { Arc::<ReentrantProbe>::from_raw(data.cast()) };
+        check_registry_reentry(&probe);
+        drop(probe);
+    }
+
+    unsafe fn wake_reentrant_waker_by_ref(data: *const ()) {
+        let probe = unsafe { &*data.cast::<ReentrantProbe>() };
+        check_registry_reentry(probe);
+    }
+
+    unsafe fn drop_reentrant_waker(data: *const ()) {
+        let probe = unsafe { Arc::<ReentrantProbe>::from_raw(data.cast()) };
+        check_registry_reentry(&probe);
+        drop(probe);
+    }
+
+    static REENTRANT_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_reentrant_waker,
+        wake_reentrant_waker,
+        wake_reentrant_waker_by_ref,
+        drop_reentrant_waker,
+    );
+
+    #[test]
+    fn dropping_last_resource_use_wakes_registered_scope_waiter() {
+        let scope = OperationScope::new(
+            OperationId::new(1),
+            ScopeLimits::default(),
+            ScopePolicy::FailFast,
+            CleanupScheduler::new(1),
+            OperationContext::new(ContextOptions::default()),
+        );
+        let id = scope.register_resource(ReadyCleanup).unwrap();
+        let use_lease = scope.acquire_use(id).unwrap();
+        scope.close_for_use(id).unwrap();
+        let seen = scope.resource_epoch();
+        let mut wait = Box::pin(scope.wait_for_resource_change(seen));
+        let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut cx = Context::from_waker(&waker);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        drop(use_lease);
+        assert!(wake_count.0.load(Ordering::SeqCst) > 0);
+        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(())));
+    }
+
+    #[test]
+    fn opposing_scope_resource_transfers_do_not_invert_handle_locks() {
+        let make_scope = |id| {
+            OperationScope::new(
+                OperationId::new(id),
+                ScopeLimits::default(),
+                ScopePolicy::FailFast,
+                CleanupScheduler::new(1),
+                OperationContext::new(ContextOptions::default()),
+            )
+        };
+        let first = make_scope(10);
+        let second = make_scope(11);
+        let first_resource = first.register_resource(ReadyCleanup).unwrap();
+        let second_resource = second.register_resource(ReadyCleanup).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let first_scope = first.clone();
+        let first_destination = second.clone();
+        let first_barrier = Arc::clone(&barrier);
+        let first_tx = tx.clone();
+        std::thread::spawn(move || {
+            first_barrier.wait();
+            first_tx
+                .send(first_scope.transfer_resource_to(first_resource, &first_destination))
+                .unwrap();
+        });
+
+        let second_scope = second.clone();
+        let second_destination = first.clone();
+        let second_barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            second_barrier.wait();
+            tx.send(second_scope.transfer_resource_to(second_resource, &second_destination))
+                .unwrap();
+        });
+
+        barrier.wait();
+        let first_result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        let second_result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        assert!(
+            first_result.is_ok(),
+            "first opposing transfer must complete"
+        );
+        assert!(
+            second_result.is_ok(),
+            "second opposing transfer must complete"
+        );
+        assert!(first_result.unwrap().is_ok());
+        assert!(second_result.unwrap().is_ok());
+    }
+
+    #[test]
+    fn resource_waiter_waker_callbacks_can_reenter_registry_without_lock() {
+        let scope = OperationScope::new(
+            OperationId::new(12),
+            ScopeLimits::default(),
+            ScopePolicy::FailFast,
+            CleanupScheduler::new(1),
+            OperationContext::new(ContextOptions::default()),
+        );
+        let id = scope.register_resource(ReadyCleanup).unwrap();
+        let use_lease = scope.acquire_use(id).unwrap();
+        scope.close_for_use(id).unwrap();
+        let seen = scope.resource_epoch();
+        let mut wait = Box::pin(scope.wait_for_resource_change(seen));
+        let lock_timeouts = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::new(ReentrantProbe {
+            registry: scope.resources.clone(),
+            lock_timeouts: Arc::clone(&lock_timeouts),
+        });
+        let raw = RawWaker::new(Arc::into_raw(probe).cast(), &REENTRANT_VTABLE);
+        let waker = unsafe { Waker::from_raw(raw) };
+        let mut cx = Context::from_waker(&waker);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        drop(use_lease);
+        assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(())));
+        assert_eq!(lock_timeouts.load(Ordering::SeqCst), 0);
     }
 }
 

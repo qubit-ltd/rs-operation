@@ -370,6 +370,8 @@ fn settlement_report_remains_a_stable_historical_snapshot_after_recovery() {
         cleanup_failures: Arc::from([]),
         transfers: Arc::from([]),
         unconfirmed_count: 0,
+        effects: Arc::from([]),
+        effect_overflow: 0,
     };
     let historical = report.clone();
     assert_eq!(recovery.take_recovery(key).unwrap(), "capsule");

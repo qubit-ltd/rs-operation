@@ -136,6 +136,10 @@ pub struct SettlementReport {
     pub transfers: Arc<[TransferReceipt]>,
     /// Number of resources whose final release is still unconfirmed.
     pub unconfirmed_count: usize,
+    /// Caller-declared side effects retained even when business work was stopped.
+    pub effects: Arc<[super::EffectRecord]>,
+    /// Number of side-effect records omitted after the configured limit was reached.
+    pub effect_overflow: usize,
 }
 
 /// Copyable cleanup failure fact that excludes typed sources and owner payloads.

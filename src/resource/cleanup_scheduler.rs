@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     future::Future,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use crate::report::{CleanupOutcome, MonotonicTime};
@@ -30,12 +30,14 @@ pub struct CleanupResponsibility {
 struct SchedulerState {
     limit: usize,
     active: Arc<AtomicUsize>,
+    capacity_waiters: Arc<Mutex<Vec<Waker>>>,
     tasks: Mutex<BTreeMap<crate::report::ResourceId, Arc<CleanupTaskState>>>,
 }
 
 /// One cleanup concurrency slot. Dropping it returns the slot.
 pub struct CleanupPermit {
     active: Arc<AtomicUsize>,
+    capacity_waiters: Arc<Mutex<Vec<Waker>>>,
 }
 
 /// Panic fact for a cleanup future whose independent recovery capsule remains registered.
@@ -94,6 +96,7 @@ impl CleanupScheduler {
             state: Arc::new(SchedulerState {
                 limit,
                 active: Arc::new(AtomicUsize::new(0)),
+                capacity_waiters: Arc::new(Mutex::new(Vec::new())),
                 tasks: Mutex::new(BTreeMap::new()),
             }),
         }
@@ -115,11 +118,66 @@ impl CleanupScheduler {
                 Ok(_) => {
                     return Some(CleanupPermit {
                         active: Arc::clone(&self.state.active),
+                        capacity_waiters: Arc::clone(&self.state.capacity_waiters),
                     });
                 }
                 Err(observed) => active = observed,
             }
         }
+    }
+
+    pub(crate) fn poll_acquire(&self, cx: &mut Context<'_>) -> Poll<Option<CleanupPermit>> {
+        if let Some(permit) = self.try_acquire() {
+            return Poll::Ready(Some(permit));
+        }
+        if self.state.limit == 0 {
+            return Poll::Ready(None);
+        }
+        let mut candidate = Some(cx.waker().clone());
+        let inserted = {
+            let mut waiters = self
+                .state
+                .capacity_waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if waiters.iter().any(|waker| waker.will_wake(cx.waker())) {
+                false
+            } else {
+                waiters.push(candidate.take().expect("candidate is present"));
+                true
+            }
+        };
+        if !inserted {
+            drop(candidate);
+        }
+        if let Some(permit) = self.try_acquire() {
+            self.remove_capacity_waiter(cx.waker());
+            Poll::Ready(Some(permit))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn remove_capacity_waiter(&self, waker: &Waker) {
+        let removed = {
+            let mut waiters = self
+                .state
+                .capacity_waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut kept = Vec::with_capacity(waiters.len());
+            let mut removed = Vec::new();
+            for waiter in waiters.drain(..) {
+                if waiter.will_wake(waker) {
+                    removed.push(waiter);
+                } else {
+                    kept.push(waiter);
+                }
+            }
+            *waiters = kept;
+            removed
+        };
+        drop(removed);
     }
 
     /// Return the number of currently reserved cleanup slots.
@@ -152,6 +210,15 @@ impl CleanupScheduler {
         let Some(permit) = self.try_acquire() else {
             return Err(future);
         };
+        self.schedule_with_permit(resource_id, permit, future)
+    }
+
+    pub(crate) fn schedule_with_permit(
+        &self,
+        resource_id: crate::report::ResourceId,
+        permit: CleanupPermit,
+        future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>>,
+    ) -> Result<CleanupTask, Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>>> {
         let mut tasks = self
             .state
             .tasks
@@ -233,6 +300,16 @@ impl CleanupResponsibility {
 impl Drop for CleanupPermit {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
+        let waiters = {
+            let mut waiters = self
+                .capacity_waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *waiters)
+        };
+        for waiter in waiters {
+            waiter.wake();
+        }
     }
 }
 

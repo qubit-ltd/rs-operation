@@ -5,8 +5,9 @@ use qubit_operation::protocol::ManagedOperationControl;
 use qubit_operation::protocol::{CleanupContext, OwnedCleanup};
 use qubit_operation::report::{
     ChildBusinessOutcome, ChildBusinessSummary, ChildSettlement, ChildSnapshot, CleanupFailure,
-    CleanupStage, DiagnosticSummary, OperationId, OperationOutcome, OperationPhase, RecoveryKey,
-    RecoveryOwner, ResourceId, ResourcePhase, StopReason, SupervisorLimits,
+    CleanupOutcome, CleanupStage, DiagnosticSummary, EffectFact, EffectRecord, OperationId,
+    OperationOutcome, OperationPhase, RecoveryKey, RecoveryOwner, ResourceId, ResourcePhase,
+    ScopeLimits, StopReason, SupervisorLimits,
 };
 use qubit_operation::report::{ClockDomainId, MonotonicTime};
 use qubit_operation::resource::RecoveryRegistry;
@@ -107,6 +108,16 @@ impl ProbeControl {
     fn stop_requests(&self) -> usize {
         self.state.0.lock().unwrap().stop_requests
     }
+    fn stopped_before_watchdog(&self) -> bool {
+        let (lock, changed) = &*self.state;
+        let state = lock.lock().unwrap();
+        let (state, timeout) = changed
+            .wait_timeout_while(state, std::time::Duration::from_secs(2), |s| {
+                s.stop_requests == 0
+            })
+            .unwrap();
+        !timeout.timed_out() || state.stop_requests != 0
+    }
 }
 
 impl ManagedOperationControl for ProbeControl {
@@ -157,6 +168,18 @@ impl ManagedOperationControl for ProbeControl {
 struct GateCleanup {
     gate: Gate,
     started: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct PanicCleanup(Arc<std::sync::atomic::AtomicBool>);
+
+impl OwnedCleanup for PanicCleanup {
+    fn begin(
+        self: Box<Self>,
+        _: CleanupContext,
+    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+        self.0.store(true, Ordering::SeqCst);
+        Box::pin(async { panic!("contract cleanup panic") })
+    }
 }
 impl OwnedCleanup for GateCleanup {
     fn begin(
@@ -259,9 +282,10 @@ impl OwnedCleanup for TransferCleanup {
 
 #[test]
 fn handle_is_unique_observer_is_clone_and_body_can_start() {
+    let supervisor = supervisor();
     fn assert_clone<T: Clone>() {}
     assert_clone::<OperationObserver<usize, std::io::Error>>();
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start(ScopeOptions::default(), |_| async {
             Ok::<_, std::io::Error>(7)
         })
@@ -277,11 +301,12 @@ fn handle_is_unique_observer_is_clone_and_body_can_start() {
 
 #[test]
 fn cancellation_before_commit_prevents_start_and_after_commit_reaches_control() {
+    let supervisor = supervisor();
     let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let before = ProbeControl::new(ChildBusinessOutcome::Succeeded, true);
     let before_control = before.clone();
     let before_starts = Arc::clone(&starts);
-    let mut first = supervisor()
+    let mut first = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let mut reservation = scope.reserve_child(ChildRequirement::Required).unwrap();
             reservation.attach(Arc::new(before_control)).unwrap();
@@ -303,7 +328,7 @@ fn cancellation_before_commit_prevents_start_and_after_commit_reaches_control() 
     let after = ProbeControl::new(ChildBusinessOutcome::Succeeded, true);
     let after_control = after.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let mut second = supervisor()
+    let mut second = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let mut reservation = scope.reserve_child(ChildRequirement::Required).unwrap();
             reservation.attach(Arc::new(after_control.clone())).unwrap();
@@ -321,15 +346,16 @@ fn cancellation_before_commit_prevents_start_and_after_commit_reaches_control() 
     gate.release();
     assert!(matches!(
         second.result_blocking().unwrap(),
-        OperationOutcome::Succeeded(())
+        OperationOutcome::Stopped(ref stop) if stop.reason == StopReason::UserCancelled
     ));
 }
 
 #[test]
 fn required_failure_with_different_error_type_becomes_child_failed_optional_can_fallback() {
+    let supervisor = supervisor();
     let required = ProbeControl::new(ChildBusinessOutcome::Failed, true);
     let control = required.clone();
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let mut reservation = scope.reserve_child(ChildRequirement::Required).unwrap();
             reservation.attach(Arc::new(control)).unwrap();
@@ -344,7 +370,7 @@ fn required_failure_with_different_error_type_becomes_child_failed_optional_can_
 
     let optional = ProbeControl::new(ChildBusinessOutcome::Failed, true);
     let control = optional.clone();
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let mut reservation = scope.reserve_child(ChildRequirement::Optional).unwrap();
             reservation.attach(Arc::new(control)).unwrap();
@@ -360,9 +386,10 @@ fn required_failure_with_different_error_type_becomes_child_failed_optional_can_
 
 #[test]
 fn typed_result_precedes_release_and_snapshot_is_repeatable() {
+    let supervisor = supervisor();
     let control = ProbeControl::new(ChildBusinessOutcome::Succeeded, false);
     let child = control.clone();
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let mut reservation = scope.reserve_child(ChildRequirement::Required).unwrap();
             reservation.attach(Arc::new(child)).unwrap();
@@ -384,6 +411,7 @@ fn typed_result_precedes_release_and_snapshot_is_repeatable() {
 
 #[test]
 fn resource_use_and_cleanup_gate_keep_released_pending_until_confirmation() {
+    let supervisor = supervisor();
     struct Noop;
     impl std::task::Wake for Noop {
         fn wake(self: Arc<Self>) {}
@@ -396,7 +424,7 @@ fn resource_use_and_cleanup_gate_keep_released_pending_until_confirmation() {
     let child_control = ProbeControl::new(ChildBusinessOutcome::Succeeded, false);
     let child = child_control.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let resource = scope
                 .register_resource(GateCleanup {
@@ -448,6 +476,7 @@ fn resource_use_and_cleanup_gate_keep_released_pending_until_confirmation() {
 
 #[test]
 fn child_scope_transfer_keeps_owner_supervised_until_parent_join_confirms_cleanup() {
+    let supervisor = supervisor();
     let cleanup_gate = Gate::new();
     let body_gate = cleanup_gate.clone();
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -456,7 +485,7 @@ fn child_scope_transfer_keeps_owner_supervised_until_parent_join_confirms_cleanu
     let child = child_control.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let (joined_tx, joined_rx) = std::sync::mpsc::sync_channel(1);
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let resource = scope
                 .register_resource(GateCleanup {
@@ -520,6 +549,7 @@ fn child_scope_transfer_keeps_owner_supervised_until_parent_join_confirms_cleanu
 #[test]
 fn fail_fast_stops_active_siblings_while_collect_leaves_them_running() {
     for (policy, expect_stop) in [(ScopePolicy::FailFast, true), (ScopePolicy::Collect, false)] {
+        let supervisor = supervisor();
         let failed = ProbeControl::new(ChildBusinessOutcome::Failed, true);
         let sibling = ProbeControl::new(ChildBusinessOutcome::Succeeded, false);
         let failed_child = failed.clone();
@@ -528,7 +558,7 @@ fn fail_fast_stops_active_siblings_while_collect_leaves_them_running() {
             policy,
             ..ScopeOptions::default()
         };
-        let mut handle = supervisor()
+        let mut handle = supervisor
             .start(options, move |scope| async move {
                 let mut first = scope.reserve_child(ChildRequirement::Required).unwrap();
                 first.attach(Arc::new(failed_child)).unwrap();
@@ -554,12 +584,13 @@ fn fail_fast_stops_active_siblings_while_collect_leaves_them_running() {
 
 #[test]
 fn handle_drop_requests_stop_but_detach_keeps_operation_running() {
+    let supervisor = supervisor();
     let gate = Gate::new();
     let body_gate = gate.clone();
     let control = ProbeControl::new(ChildBusinessOutcome::Succeeded, true);
     let child = control.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let handle = supervisor()
+    let handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let mut reservation = scope.reserve_child(ChildRequirement::Optional).unwrap();
             reservation.attach(Arc::new(child.clone())).unwrap();
@@ -582,7 +613,7 @@ fn handle_drop_requests_stop_but_detach_keeps_operation_running() {
     let control = ProbeControl::new(ChildBusinessOutcome::Succeeded, true);
     let child = control.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let handle = supervisor()
+    let handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let mut reservation = scope.reserve_child(ChildRequirement::Optional).unwrap();
             reservation.attach(Arc::new(child.clone())).unwrap();
@@ -724,8 +755,9 @@ fn result_is_taken_once_and_observation_releases_reserved_result_slot() {
 
 #[test]
 fn dropping_result_wait_future_keeps_handle_and_operation_live() {
+    let supervisor = supervisor();
     let gate = Gate::new();
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start(ScopeOptions::default(), {
             let gate = gate.clone();
             move |_| async move {
@@ -817,10 +849,11 @@ fn queued_root_waits_for_execution_lease_promotion_before_body_start() {
 
 #[test]
 fn scope_clone_cannot_commit_after_body_close_but_committed_child_retains_authority() {
+    let supervisor = supervisor();
     let control = ProbeControl::new(ChildBusinessOutcome::Succeeded, false);
     let child = control.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let clone = scope.clone();
             let mut reservation = scope.reserve_child(ChildRequirement::Required).unwrap();
@@ -850,13 +883,14 @@ fn scope_clone_cannot_commit_after_body_close_but_committed_child_retains_author
 
 #[test]
 fn cleanup_recovery_is_transferred_and_report_remains_a_stable_history() {
+    let supervisor = supervisor();
     let recovery = RecoveryRegistry::new(1);
     let key_slot = Arc::new(Mutex::new(None));
     let cleanup_key_slot = Arc::clone(&key_slot);
     let id_slot = Arc::new(Mutex::new(None));
     let cleanup_id_slot = Arc::clone(&id_slot);
     let (scope_tx, scope_rx) = std::sync::mpsc::sync_channel(1);
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let child_scope = scope.clone();
             let resource = scope
@@ -934,6 +968,7 @@ fn cleanup_recovery_is_transferred_and_report_remains_a_stable_history() {
 
 #[test]
 fn transferred_cleanup_requires_receiver_release_receipt_to_clear_source_tombstone() {
+    let supervisor = supervisor();
     struct Noop;
     impl std::task::Wake for Noop {
         fn wake(self: Arc<Self>) {}
@@ -946,7 +981,7 @@ fn transferred_cleanup_requires_receiver_release_receipt_to_clear_source_tombsto
     let a_calls = Arc::clone(&a_cleanup_calls);
     let (accepted_tx, accepted_rx) = std::sync::mpsc::sync_channel(1);
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             let source_scope = scope.clone();
             let source_id = scope
@@ -1056,10 +1091,413 @@ fn transferred_cleanup_requires_receiver_release_receipt_to_clear_source_tombsto
 }
 
 #[test]
+fn active_body_deadline_requests_timeout_and_publishes_stopped() {
+    let clock = Arc::new(manual_clock::ManualClock::new(ClockDomainId(143)));
+    let deadline = Deadline::at(MonotonicTime::new(ClockDomainId(143), 1));
+    let gate = Gate::new();
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let supervisor = supervisor();
+    let mut handle = supervisor
+        .start(
+            ScopeOptions {
+                context: ContextOptions {
+                    clock: Some(clock.clone()),
+                    deadline: Some(deadline),
+                    ..ContextOptions::default()
+                },
+                ..ScopeOptions::default()
+            },
+            {
+                let gate = gate.clone();
+                move |_| async move {
+                    started_tx.send(()).unwrap();
+                    gate.wait().await;
+                    Ok::<_, std::io::Error>(8usize)
+                }
+            },
+        )
+        .unwrap();
+    let started = started_rx.recv_timeout(std::time::Duration::from_secs(5));
+    gate.wait_started();
+    clock.advance_by(1);
+    gate.release();
+    let outcome = handle.result_blocking().unwrap();
+    assert!(
+        started.is_ok(),
+        "body should start before deadline: {outcome:?}"
+    );
+    assert!(
+        matches!(outcome, OperationOutcome::Stopped(ref stop) if stop.reason == StopReason::Timeout),
+        "deadline should stop active body, got {outcome:?}"
+    );
+}
+
+#[test]
+fn child_scope_deadline_stops_its_active_children() {
+    let supervisor = supervisor();
+    let clock = Arc::new(manual_clock::ManualClock::new(ClockDomainId(144)));
+    let deadline = Deadline::at(MonotonicTime::new(ClockDomainId(144), 1));
+    let control = ProbeControl::new(ChildBusinessOutcome::Succeeded, false);
+    let body_control = control.clone();
+    let body_clock = Arc::clone(&clock);
+    let gate = Gate::new();
+    let body_gate = gate.clone();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let mut handle = supervisor
+        .start(ScopeOptions::default(), move |scope| async move {
+            let child = scope
+                .child_scope(ScopeOptions {
+                    context: ContextOptions {
+                        clock: Some(body_clock),
+                        deadline: Some(deadline),
+                        ..ContextOptions::default()
+                    },
+                    ..ScopeOptions::default()
+                })
+                .unwrap();
+            let mut reservation = child.reserve_child(ChildRequirement::Required).unwrap();
+            reservation.attach(Arc::new(body_control.clone())).unwrap();
+            reservation.commit().unwrap();
+            entered_tx.send(()).unwrap();
+            body_gate.wait().await;
+            Ok::<_, std::io::Error>(())
+        })
+        .unwrap();
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    gate.wait_started();
+    clock.advance_by(1);
+    let stopped = control.stopped_before_watchdog();
+    control.release();
+    gate.release();
+    assert!(
+        stopped,
+        "child deadline must stop its already committed child"
+    );
+    assert!(matches!(
+        handle.result_blocking().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    assert!(handle.released_blocking().unwrap().all_released);
+}
+
+#[test]
+fn pending_child_reservations_consume_quota_and_uncommitted_drop_returns_it() {
+    let supervisor = supervisor();
+    let options = ScopeOptions {
+        limits: ScopeLimits {
+            child_operations: 1,
+            ..ScopeLimits::default()
+        },
+        ..ScopeOptions::default()
+    };
+    let mut handle = supervisor
+        .start(options, move |scope| async move {
+            let first = scope.reserve_child(ChildRequirement::Required).unwrap();
+            let second_is_limited = matches!(
+                scope.reserve_child(ChildRequirement::Optional),
+                Err(qubit_operation::scope::ScopeError::LimitReached)
+            );
+            drop(first);
+            let returned = scope.reserve_child(ChildRequirement::Optional);
+            let dropped_reservation_returns_quota = returned.is_ok();
+            drop(returned);
+            Ok::<_, std::io::Error>((second_is_limited, dropped_reservation_returns_quota))
+        })
+        .unwrap();
+    let outcome = handle.result_blocking().unwrap();
+    match outcome {
+        OperationOutcome::Succeeded((second_is_limited, dropped_reservation_returns_quota)) => {
+            assert!(
+                second_is_limited,
+                "pending reservations must consume child quota"
+            );
+            assert!(
+                dropped_reservation_returns_quota,
+                "dropping an uncommitted reservation returns quota"
+            );
+        }
+        other => panic!("unexpected operation outcome: {other:?}"),
+    }
+}
+
+#[test]
+fn async_body_error_under_fail_fast_stops_committed_child() {
+    let control = ProbeControl::new(ChildBusinessOutcome::Succeeded, false);
+    let control_for_body = control.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let supervisor = supervisor();
+    let mut handle = supervisor
+        .start(ScopeOptions::default(), move |scope| async move {
+            let mut reservation = scope.reserve_child(ChildRequirement::Required).unwrap();
+            reservation
+                .attach(Arc::new(control_for_body.clone()))
+                .unwrap();
+            reservation.commit().unwrap();
+            tx.send(()).unwrap();
+            Err::<(), _>("async body failed")
+        })
+        .unwrap();
+    rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    let stopped = control.stopped_before_watchdog();
+    control.release();
+    let outcome = handle.result_blocking().unwrap();
+    assert!(
+        stopped,
+        "FailFast must stop active committed children on body error"
+    );
+    assert!(matches!(
+        outcome,
+        OperationOutcome::Failed("async body failed")
+    ));
+}
+
+#[test]
+fn blocking_body_error_under_fail_fast_stops_committed_child() {
+    let control = ProbeControl::new(ChildBusinessOutcome::Succeeded, false);
+    let control_for_body = control.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let supervisor = supervisor();
+    let executor = ThreadExecutor::new(1, 1).unwrap();
+    let mut handle = supervisor
+        .start_blocking(&executor, ScopeOptions::default(), move |scope| {
+            let mut reservation = scope.reserve_child(ChildRequirement::Required).unwrap();
+            reservation
+                .attach(Arc::new(control_for_body.clone()))
+                .unwrap();
+            reservation.commit().unwrap();
+            tx.send(()).unwrap();
+            Err::<(), _>("blocking body failed")
+        })
+        .unwrap();
+    rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    let stopped = control.stopped_before_watchdog();
+    control.release();
+    let outcome = handle.result_blocking().unwrap();
+    assert!(
+        stopped,
+        "FailFast must stop active committed children on body error"
+    );
+    assert!(matches!(
+        outcome,
+        OperationOutcome::Failed("blocking body failed")
+    ));
+}
+
+#[test]
+fn async_body_panic_publishes_panicked_and_settles_root() {
+    let supervisor = supervisor();
+    let (panic_tx, panic_rx) = std::sync::mpsc::channel();
+    let mut handle = supervisor
+        .start::<_, _, (), ()>(ScopeOptions::default(), move |_| async move {
+            panic_tx.send(()).unwrap();
+            panic!("contract body panic");
+        })
+        .unwrap();
+    panic_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("body entered before watchdog");
+    let report = supervisor.shutdown_blocking(
+        qubit_operation::supervisor::ShutdownMode::Drain,
+        std::time::Duration::from_millis(20),
+    );
+    assert_eq!(report.pending_requests, 0);
+    let mut result = Box::pin(handle.result());
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    assert!(matches!(
+        result.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(OperationOutcome::Panicked(_)))
+    ));
+}
+
+#[test]
+fn cleanup_panic_publishes_unconfirmed_settlement_instead_of_stalling() {
+    let supervisor = supervisor();
+    let cleanup_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let body_cleanup_started = Arc::clone(&cleanup_started);
+    let mut handle = supervisor
+        .start(ScopeOptions::default(), move |scope| async move {
+            scope
+                .register_resource(PanicCleanup(body_cleanup_started))
+                .unwrap();
+            Ok::<_, std::io::Error>(())
+        })
+        .unwrap();
+    assert!(matches!(
+        handle.result_blocking().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    let observer = handle.observer();
+    let mut released = Box::pin(observer.released());
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let report = loop {
+        if let Poll::Ready(report) = released.as_mut().poll(&mut cx) {
+            break Some(report);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        thread::yield_now();
+    };
+    assert!(cleanup_started.load(Ordering::SeqCst));
+    assert!(
+        report.is_some(),
+        "cleanup panic must publish a terminal report"
+    );
+    assert_eq!(report.unwrap().resource_phase, ResourcePhase::Unconfirmed);
+}
+
+#[test]
+fn committed_effect_record_survives_later_cancellation() {
+    let supervisor = supervisor();
+    let gate = Gate::new();
+    let body_gate = gate.clone();
+    let (recorded_tx, recorded_rx) = std::sync::mpsc::sync_channel(1);
+    let mut handle = supervisor
+        .start(ScopeOptions::default(), move |scope| async move {
+            scope
+                .record_effect(EffectRecord {
+                    operation_id: scope.operation_id(),
+                    resource_id: None,
+                    description: DiagnosticSummary::new("fake upload committed"),
+                    fact: EffectFact::Known,
+                })
+                .unwrap();
+            recorded_tx.send(()).unwrap();
+            body_gate.wait().await;
+            Ok::<_, std::io::Error>(())
+        })
+        .unwrap();
+    recorded_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    gate.wait_started();
+    handle.request_cancel(StopReason::UserCancelled);
+    gate.release();
+    assert!(matches!(
+        handle.result_blocking().unwrap(),
+        OperationOutcome::Stopped(ref stop) if stop.reason == StopReason::UserCancelled
+    ));
+    let report = handle.released_blocking().unwrap();
+    assert_eq!(report.effects.len(), 1);
+    assert_eq!(report.effects[0].operation_id, report.operation_id);
+    assert_eq!(report.effects[0].fact, EffectFact::Known);
+    assert_eq!(
+        report.effects[0].description,
+        DiagnosticSummary::new("fake upload committed")
+    );
+    assert_eq!(report.effect_overflow, 0);
+}
+
+#[test]
+fn dropping_last_resource_use_wakes_scope_cleanup_drain() {
+    let supervisor = supervisor();
+    let cleanup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let body_cleanup_calls = Arc::clone(&cleanup_calls);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let mut handle = supervisor
+        .start(ScopeOptions::default(), move |scope| async move {
+            let id = scope
+                .register_resource(CountCleanup(body_cleanup_calls))
+                .unwrap();
+            let resource_use = scope.acquire_use(id).unwrap();
+            tx.send(resource_use).unwrap();
+            Ok::<_, std::io::Error>(())
+        })
+        .unwrap();
+    let resource_use = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        handle.result_blocking().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    let mut released = Box::pin(handle.released());
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    assert!(released.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), 0);
+    drop(resource_use);
+    assert!(handle.released_blocking().unwrap().all_released);
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cleanup_pool_saturation_keeps_owner_until_capacity_returns() {
+    let supervisor = OperationSupervisor::new(SupervisorLimits {
+        cleanup_concurrency: 1,
+        ..SupervisorLimits::default()
+    });
+    let first_gate = Gate::new();
+    let first_cleanup_gate = first_gate.clone();
+    let first_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let first_cleanup_started = Arc::clone(&first_started);
+    let mut first = supervisor
+        .start(ScopeOptions::default(), move |scope| async move {
+            scope
+                .register_resource(GateCleanup {
+                    gate: first_cleanup_gate,
+                    started: first_cleanup_started,
+                })
+                .unwrap();
+            Ok::<_, std::io::Error>(())
+        })
+        .unwrap();
+    assert!(matches!(
+        first.result_blocking().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    first_gate.wait_started();
+
+    let second_cleanup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let body_cleanup_calls = Arc::clone(&second_cleanup_calls);
+    let second_clock = Arc::new(manual_clock::ManualClock::new(ClockDomainId(211)));
+    let mut second = supervisor
+        .start(
+            ScopeOptions {
+                context: ContextOptions {
+                    clock: Some(second_clock.clone()),
+                    ..ContextOptions::default()
+                },
+                ..ScopeOptions::default()
+            },
+            move |scope| async move {
+                scope
+                    .register_resource(CountCleanup(body_cleanup_calls))
+                    .unwrap();
+                Ok::<_, std::io::Error>(())
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        second.result_blocking().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    let observer = second.observer();
+    first_gate.release();
+    let clock = Arc::clone(&second_clock);
+    let advance = thread::spawn(move || {
+        thread::sleep(std::time::Duration::from_millis(20));
+        clock.advance_by(1);
+    });
+    let observed =
+        block_on(observer.observe_until(Deadline::at(MonotonicTime::new(ClockDomainId(211), 1))))
+            .unwrap();
+    advance.join().unwrap();
+    assert!(observed.snapshot.settlement.is_some());
+    assert_eq!(second_cleanup_calls.load(Ordering::SeqCst), 1);
+    assert!(first.released_blocking().unwrap().all_released);
+    assert!(second.released_blocking().unwrap().all_released);
+}
+
+#[test]
 fn observer_deadline_returns_snapshot_and_keeps_observation_live() {
+    let supervisor = supervisor();
     let gate = Gate::new();
     let clock = Arc::new(manual_clock::ManualClock::new(ClockDomainId(77)));
-    let handle = supervisor()
+    let handle = supervisor
         .start(
             ScopeOptions {
                 context: ContextOptions {
@@ -1104,7 +1542,8 @@ fn observer_deadline_returns_snapshot_and_keeps_observation_live() {
 
 #[test]
 fn observer_deadline_without_context_clock_returns_explicit_error() {
-    let mut handle = supervisor()
+    let supervisor = supervisor();
+    let mut handle = supervisor
         .start(ScopeOptions::default(), move |_| async move {
             Ok::<_, std::io::Error>(5usize)
         })
@@ -1127,6 +1566,7 @@ fn observer_deadline_without_context_clock_returns_explicit_error() {
 
 #[test]
 fn start_wait_returns_unstarted_body_on_expired_context() {
+    let supervisor = supervisor();
     let clock = Arc::new(manual_clock::ManualClock::new(ClockDomainId(88)));
     let deadline = Deadline::at(MonotonicTime::new(ClockDomainId(88), 1));
     clock.advance_by(1);
@@ -1144,7 +1584,7 @@ fn start_wait_returns_unstarted_body_on_expired_context() {
         },
         ..ScopeOptions::default()
     };
-    let error = match block_on(supervisor().start_wait(options, body)) {
+    let error = match block_on(supervisor.start_wait(options, body)) {
         Ok(_) => panic!("expired context must reject admission"),
         Err(error) => error,
     };
@@ -1154,7 +1594,7 @@ fn start_wait_returns_unstarted_body_on_expired_context() {
     );
     assert_eq!(starts.load(Ordering::SeqCst), 0);
     let recovered = error.into_body();
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start(ScopeOptions::default(), recovered)
         .unwrap();
     assert!(matches!(
@@ -1411,10 +1851,11 @@ fn start_blocking_rejects_managed_worker_without_running_body() {
 
 #[test]
 fn start_blocking_runs_on_injected_executor_after_active_admission() {
+    let supervisor = supervisor();
     let executor = ThreadExecutor::new(1, 1).unwrap();
     let worker_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed_flag = Arc::clone(&worker_flag);
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start_blocking(&executor, ScopeOptions::default(), move |_| {
             observed_flag.store(is_thread_executor_worker(), Ordering::SeqCst);
             Ok::<_, std::io::Error>(33usize)
@@ -1429,10 +1870,11 @@ fn start_blocking_runs_on_injected_executor_after_active_admission() {
 
 #[test]
 fn blocking_body_panic_publishes_panicked_and_releases_resources() {
+    let supervisor = supervisor();
     let executor = ThreadExecutor::new(1, 1).unwrap();
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let body_started = Arc::clone(&started);
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start_blocking(
             &executor,
             ScopeOptions::default(),
@@ -1476,6 +1918,7 @@ fn blocking_body_panic_publishes_panicked_and_releases_resources() {
 
 #[test]
 fn start_blocking_queue_rejection_returns_original_unstarted_body() {
+    let supervisor = supervisor();
     let executor = ThreadExecutor::new(1, 1).unwrap();
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -1493,7 +1936,7 @@ fn start_blocking_queue_rejection_returns_original_unstarted_body() {
     assert!(executor.execute(|| {}).is_ok());
     let starts = Arc::new(AtomicU64::new(0));
     let body_starts = Arc::clone(&starts);
-    let error = match supervisor().start_blocking(&executor, ScopeOptions::default(), move |_| {
+    let error = match supervisor.start_blocking(&executor, ScopeOptions::default(), move |_| {
         body_starts.fetch_add(1, Ordering::SeqCst);
         Ok::<_, std::io::Error>(44usize)
     }) {
@@ -1506,7 +1949,7 @@ fn start_blocking_queue_rejection_returns_original_unstarted_body() {
     );
     assert_eq!(starts.load(Ordering::SeqCst), 0);
     let recovered = error.into_body();
-    let mut handle = supervisor()
+    let mut handle = supervisor
         .start(ScopeOptions::default(), move |scope| async move {
             recovered(scope)
         })

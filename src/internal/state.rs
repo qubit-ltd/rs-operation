@@ -491,6 +491,8 @@ mod tests {
             cleanup_failures: Arc::from([]),
             transfers: Arc::from([]),
             unconfirmed_count: 0,
+            effects: Arc::from([]),
+            effect_overflow: 0,
         };
         let published = cell.publish_settlement(report).unwrap();
         let first_observation = cell.settlement().unwrap();

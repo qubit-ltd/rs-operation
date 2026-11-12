@@ -6,6 +6,8 @@ pub struct ScopeLimits {
     pub child_operations: usize,
     /// Maximum resource registrations, including resources retained for recovery.
     pub resources: usize,
+    /// Maximum caller-declared side-effect records retained in the root settlement.
+    pub effect_records: usize,
 }
 
 impl Default for ScopeLimits {
@@ -13,6 +15,7 @@ impl Default for ScopeLimits {
         Self {
             child_operations: 64,
             resources: 128,
+            effect_records: 64,
         }
     }
 }

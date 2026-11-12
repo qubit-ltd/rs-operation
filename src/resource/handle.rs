@@ -70,8 +70,11 @@ impl ResourceHandle {
             .active_uses
             .checked_add(1)
             .ok_or(ResourceError::LeaseCountOverflow)?;
+        drop(entry_state);
+        drop(registry_state);
         Ok(ResourceUse {
             entry: Arc::clone(&self.entry),
+            registry,
         })
     }
 

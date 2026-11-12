@@ -78,8 +78,26 @@ impl ResourceRegistry {
                     slots,
                     dependencies: BTreeMap::new(),
                 }),
+                change_epoch: AtomicU64::new(0),
+                change_wakers: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    pub(crate) fn change_epoch(&self) -> u64 {
+        self.inner.change_epoch()
+    }
+
+    pub(crate) fn notify_change(&self) {
+        self.inner.notify_change();
+    }
+
+    pub(crate) fn register_change_waker(&self, waker: &std::task::Waker) {
+        self.inner.register_change_waker(waker);
+    }
+
+    pub(crate) fn remove_change_waker(&self, waker: &std::task::Waker) {
+        self.inner.remove_change_waker(waker);
     }
 
     /// Register an owned cleanup adapter, returning it unchanged if capacity is full.

@@ -222,21 +222,35 @@ impl<T, E> OperationObserver<T, E> {
                 _ => ObservationError::InvalidObserver,
             })?;
         let snapshot = std::future::poll_fn(|cx| {
-            let mut state = lock(&self.shared.state);
-            if let Some(report) = &state.released {
-                return Poll::Ready(observer_snapshot(&state, Some(report.clone())));
+            let timed_out = Pin::new(&mut timer).poll(cx).is_ready();
+            let mut candidate = Some(cx.waker().clone());
+            let (snapshot, remove_waiter) = {
+                let mut state = lock(&self.shared.state);
+                if let Some(report) = &state.released {
+                    (Some(observer_snapshot(&state, Some(report.clone()))), false)
+                } else {
+                    if !state
+                        .release_waiters
+                        .iter()
+                        .any(|w| w.will_wake(cx.waker()))
+                    {
+                        state
+                            .release_waiters
+                            .push(candidate.take().expect("candidate waker is present"));
+                    }
+                    (
+                        timed_out.then(|| observer_snapshot(&state, None)),
+                        timed_out,
+                    )
+                }
+            };
+            drop(candidate);
+            if remove_waiter {
+                remove_release_waiter(&self.shared, cx.waker());
             }
-            if !state
-                .release_waiters
-                .iter()
-                .any(|w| w.will_wake(cx.waker()))
-            {
-                state.release_waiters.push(cx.waker().clone());
-            }
-            if Pin::new(&mut timer).poll(cx).is_ready() {
-                Poll::Ready(observer_snapshot(&state, None))
-            } else {
-                Poll::Pending
+            match snapshot {
+                Some(snapshot) => Poll::Ready(snapshot),
+                None => Poll::Pending,
             }
         })
         .await;
@@ -284,6 +298,7 @@ fn poll_result<T, E>(
     shared: &Arc<Shared<T, E>>,
     cx: &mut Context<'_>,
 ) -> Poll<Result<OperationOutcome<T, E>, ObservationError>> {
+    let mut candidate = Some(cx.waker().clone());
     let (result, lease, discarded, already) = {
         let mut state = lock(&shared.state);
         if state.result_taken {
@@ -295,11 +310,14 @@ fn poll_result<T, E>(
             (Some(result), state.result_lease.take(), false, false)
         } else {
             if !state.result_waiters.iter().any(|w| w.will_wake(cx.waker())) {
-                state.result_waiters.push(cx.waker().clone());
+                state
+                    .result_waiters
+                    .push(candidate.take().expect("candidate waker is present"));
             }
             (None, None, false, false)
         }
     };
+    drop(candidate);
     if already {
         return Poll::Ready(Err(ObservationError::AlreadyTaken));
     }
@@ -316,18 +334,44 @@ fn poll_result<T, E>(
     }
 }
 fn poll_released<T, E>(shared: &Arc<Shared<T, E>>, cx: &mut Context<'_>) -> Poll<SettlementReport> {
-    let mut state = lock(&shared.state);
-    if let Some(report) = &state.released {
-        return Poll::Ready(report.clone());
-    }
-    if !state
-        .release_waiters
-        .iter()
-        .any(|w| w.will_wake(cx.waker()))
-    {
-        state.release_waiters.push(cx.waker().clone());
-    }
-    Poll::Pending
+    let mut candidate = Some(cx.waker().clone());
+    let result = {
+        let mut state = lock(&shared.state);
+        if let Some(report) = &state.released {
+            Poll::Ready(report.clone())
+        } else {
+            if !state
+                .release_waiters
+                .iter()
+                .any(|w| w.will_wake(cx.waker()))
+            {
+                state
+                    .release_waiters
+                    .push(candidate.take().expect("candidate waker is present"));
+            }
+            Poll::Pending
+        }
+    };
+    drop(candidate);
+    result
+}
+
+fn remove_release_waiter<T, E>(shared: &Arc<Shared<T, E>>, waker: &Waker) {
+    let removed = {
+        let mut state = lock(&shared.state);
+        let mut retained = Vec::with_capacity(state.release_waiters.len());
+        let mut removed = Vec::new();
+        for waiter in state.release_waiters.drain(..) {
+            if waiter.will_wake(waker) {
+                removed.push(waiter);
+            } else {
+                retained.push(waiter);
+            }
+        }
+        state.release_waiters = retained;
+        removed
+    };
+    drop(removed);
 }
 
 impl OperationSupervisor {
@@ -481,8 +525,13 @@ impl OperationSupervisor {
             changed: Condvar::new(),
             context: context.clone(),
         });
-        let scope =
-            OperationScope::new(id, options.limits, options.policy, self.cleanup_scheduler());
+        let scope = OperationScope::new(
+            id,
+            options.limits,
+            options.policy,
+            self.cleanup_scheduler(),
+            context.clone(),
+        );
         let scope_for_job = scope.clone();
         let completion = Arc::new(Mutex::new(BlockingCompletion {
             result: None,
@@ -495,6 +544,7 @@ impl OperationSupervisor {
         let manager_supervisor = self.internal_handle();
         let manager_context = context.clone();
         let manager_stop = manager_context.stop_signal();
+        let manager_deadline = manager_context.deadline_signal();
         let lease = Arc::new(Mutex::new(Some(task_lease)));
         let worker_lease = Arc::clone(&lease);
         let manager = async move {
@@ -512,6 +562,7 @@ impl OperationSupervisor {
                     }
                 })),
                 stop: manager_stop,
+                deadline: manager_deadline,
                 scope: manager_scope.clone(),
                 stopped: false,
                 stop_reason: None,
@@ -520,6 +571,11 @@ impl OperationSupervisor {
             let (Some(result), stopped) = result else {
                 return;
             };
+            if matches!(&result, BlockingBodyResult::Returned(Err(_)))
+                && manager_scope.policy() == crate::scope::ScopePolicy::FailFast
+            {
+                manager_scope.request_cancel(StopReason::ParentStopped);
+            }
             manager_scope.close_body();
             manager_scope.close_body_resources();
             if matches!(result, BlockingBodyResult::Panicked) {
@@ -559,6 +615,7 @@ impl OperationSupervisor {
             let settlement = cleanup_scope_tree(&manager_scope).await;
             let resource_phase = settlement.phase;
             let unconfirmed_count = settlement.unconfirmed;
+            let (effects, effect_overflow) = manager_scope.effect_snapshot();
             publish_released(
                 &manager_shared,
                 SettlementReport {
@@ -571,6 +628,8 @@ impl OperationSupervisor {
                     cleanup_failures: settlement.failures.into(),
                     transfers: settlement.transfers.into(),
                     unconfirmed_count,
+                    effects,
+                    effect_overflow,
                 },
             );
         };
@@ -669,23 +728,42 @@ impl OperationSupervisor {
         let gate_shared = Arc::clone(&shared);
         let worker_context = context.clone();
         let body_context = worker_context.clone();
+        let scope_context = worker_context.clone();
         let mut admission_stop = worker_context.stop_signal();
         let worker_body = Arc::clone(&body_cell);
         let cleanup_scheduler = self.cleanup_scheduler();
         let manager_supervisor = self.internal_handle();
         let future = async move {
-            let scope = OperationScope::new(id, options.limits, options.policy, cleanup_scheduler);
+            let scope = OperationScope::new(
+                id,
+                options.limits,
+                options.policy,
+                cleanup_scheduler,
+                scope_context,
+            );
             manager_supervisor.track_scope_recovery(&scope);
             let f = lock(&worker_body).take().expect("body invoked once");
-            let body_future = f(scope.clone());
+            let body_scope = scope.clone();
+            let body_future = async move {
+                let body_future = f(body_scope);
+                body_future.await
+            };
             let (result, stopped) = Cancellable {
-                future: Box::pin(body_future),
+                future: Box::pin(CatchUnwind::new(body_future)),
                 stop: body_context.stop_signal(),
+                deadline: body_context.deadline_signal(),
                 scope: scope.clone(),
                 stopped: false,
                 stop_reason: None,
             }
             .await;
+            if stopped.is_none()
+                && (result.is_err()
+                    || (matches!(&result, Ok(Err(_)))
+                        && scope.policy() == crate::scope::ScopePolicy::FailFast))
+            {
+                scope.request_cancel(StopReason::ParentStopped);
+            }
             scope.close_body();
             scope.close_body_resources();
             let mut facts = JoinFacts::default();
@@ -698,7 +776,11 @@ impl OperationSupervisor {
                 })
             } else {
                 match result {
-                    Ok(value) if facts.failed_required.is_some() => {
+                    Err(()) => OperationOutcome::Panicked(PanicSummary {
+                        operation_id: id,
+                        phase: DiagnosticSummary::new("async body"),
+                    }),
+                    Ok(Ok(value)) if facts.failed_required.is_some() => {
                         drop(value);
                         let child = facts.failed_required.as_ref().expect("checked");
                         OperationOutcome::ChildFailed(ChildFailureSummary {
@@ -706,8 +788,8 @@ impl OperationSupervisor {
                             summary: child.summary.clone(),
                         })
                     }
-                    Ok(value) => OperationOutcome::Succeeded(value),
-                    Err(error) => OperationOutcome::Failed(error),
+                    Ok(Ok(value)) => OperationOutcome::Succeeded(value),
+                    Ok(Err(error)) => OperationOutcome::Failed(error),
                 }
             };
             publish_result(&worker_shared, outcome);
@@ -717,6 +799,7 @@ impl OperationSupervisor {
             let failures = settlement.failures;
             let transfers = settlement.transfers;
             let unconfirmed_count = settlement.unconfirmed;
+            let (effects, effect_overflow) = scope.effect_snapshot();
             let report = SettlementReport {
                 operation_id: id,
                 resource_phase,
@@ -727,6 +810,8 @@ impl OperationSupervisor {
                 cleanup_failures: failures.into(),
                 transfers: transfers.into(),
                 unconfirmed_count,
+                effects,
+                effect_overflow,
             };
             publish_released(&worker_shared, report);
         };
@@ -770,6 +855,8 @@ impl OperationSupervisor {
                         cleanup_failures: Arc::from([]),
                         transfers: Arc::from([]),
                         unconfirmed_count: 0,
+                        effects: Arc::from([]),
+                        effect_overflow: 0,
                     },
                 );
             }
@@ -956,13 +1043,21 @@ async fn cleanup_resources(scope: &OperationScope) -> CleanupFacts {
     let mut unconfirmed: usize = 0;
     loop {
         let seen = scope.resource_epoch();
+        let permit = match std::future::poll_fn(|cx| scheduler.poll_acquire(cx)).await {
+            Some(permit) => permit,
+            None => {
+                unconfirmed = registry.pending_cleanup_count().max(1);
+                break;
+            }
+        };
         let Some(ready) = registry.take_ready_cleanup() else {
+            drop(permit);
             let pending = registry.pending_cleanup_count();
             if pending == 0 {
                 break;
             }
-            if !failures.is_empty() {
-                unconfirmed = unconfirmed.saturating_add(pending.saturating_sub(failures.len()));
+            if !failures.is_empty() || unconfirmed > 0 {
+                unconfirmed = unconfirmed.max(pending);
                 break;
             }
             scope.wait_for_resource_change(seen).await;
@@ -971,7 +1066,7 @@ async fn cleanup_resources(scope: &OperationScope) -> CleanupFacts {
         let id = ready.resource_id();
         let (_, owner) = ready.into_parts();
         let future = owner.begin(CleanupContext { deadline: None });
-        let mut task = match scheduler.schedule(id, future) {
+        let mut task = match scheduler.schedule_with_permit(id, permit, future) {
             Ok(task) => task,
             Err(_future) => {
                 unconfirmed += 1;
@@ -1039,13 +1134,43 @@ async fn cleanup_resources(scope: &OperationScope) -> CleanupFacts {
 struct Cancellable<F> {
     future: Pin<Box<F>>,
     stop: crate::context::StopSignal,
+    deadline: Option<crate::context::DeadlineSignal>,
     scope: OperationScope,
     stopped: bool,
     stop_reason: Option<StopReason>,
 }
+
+struct CatchUnwind<F> {
+    future: Pin<Box<F>>,
+}
+
+impl<F> CatchUnwind<F> {
+    fn new(future: F) -> Self {
+        Self {
+            future: Box::pin(future),
+        }
+    }
+}
+
+impl<F: Future> Future for CatchUnwind<F> {
+    type Output = Result<F::Output, ()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            this.future.as_mut().poll(cx)
+        })) {
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_) => Poll::Ready(Err(())),
+        }
+    }
+}
+
 impl<F: Future> Future for Cancellable<F> {
     type Output = (F::Output, Option<StopReason>);
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.scope.poll_deadlines(cx);
         if !self.stopped
             && let Poll::Ready(Ok(reason)) = Pin::new(&mut self.stop).poll(cx)
         {
@@ -1053,9 +1178,125 @@ impl<F: Future> Future for Cancellable<F> {
             self.stop_reason = Some(reason);
             self.scope.request_cancel(reason);
         }
+        if !self.stopped
+            && let Some(deadline) = self.deadline.as_mut()
+            && Pin::new(deadline).poll(cx).is_ready()
+        {
+            self.stopped = true;
+            self.stop_reason = Some(StopReason::Timeout);
+            self.scope.request_cancel(StopReason::Timeout);
+        }
         match self.future.as_mut().poll(cx) {
             Poll::Ready(output) => Poll::Ready((output, self.stop_reason)),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                self.scope.poll_deadlines(cx);
+                Poll::Pending
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Shared, State, poll_released, poll_result, publish_released, publish_result};
+    use crate::context::{ContextOptions, OperationContext};
+    use crate::report::{OperationId, OperationOutcome, ResourcePhase, SettlementReport};
+    use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::task::Poll;
+
+    struct Probe {
+        shared: Arc<Shared<(), ()>>,
+        lock_reentries: Arc<AtomicUsize>,
+    }
+
+    fn check_reentry(probe: &Probe) {
+        if probe.shared.state.try_lock().is_err() {
+            probe.lock_reentries.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    unsafe fn clone_waker(data: *const ()) -> RawWaker {
+        let probe = unsafe { Arc::<Probe>::from_raw(data.cast()) };
+        check_reentry(&probe);
+        let clone = Arc::clone(&probe);
+        std::mem::forget(probe);
+        RawWaker::new(Arc::into_raw(clone).cast(), &VTABLE)
+    }
+
+    unsafe fn wake_waker(data: *const ()) {
+        let probe = unsafe { Arc::<Probe>::from_raw(data.cast()) };
+        check_reentry(&probe);
+        drop(probe);
+    }
+
+    unsafe fn wake_by_ref(data: *const ()) {
+        let probe = unsafe { &*data.cast::<Probe>() };
+        check_reentry(probe);
+    }
+
+    unsafe fn drop_waker(data: *const ()) {
+        let probe = unsafe { Arc::<Probe>::from_raw(data.cast()) };
+        check_reentry(&probe);
+        drop(probe);
+    }
+
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref, drop_waker);
+
+    fn reentrant_waker(shared: &Arc<Shared<(), ()>>, lock_reentries: &Arc<AtomicUsize>) -> Waker {
+        let probe = Arc::new(Probe {
+            shared: Arc::clone(shared),
+            lock_reentries: Arc::clone(lock_reentries),
+        });
+        let raw = RawWaker::new(Arc::into_raw(probe).cast(), &VTABLE);
+        unsafe { Waker::from_raw(raw) }
+    }
+
+    fn shared() -> Arc<Shared<(), ()>> {
+        Arc::new(Shared {
+            state: Mutex::new(State {
+                result: None,
+                result_taken: false,
+                result_discarded: false,
+                released: None,
+                result_waiters: Vec::new(),
+                release_waiters: Vec::new(),
+                result_lease: None,
+                completion_guards: Vec::new(),
+            }),
+            changed: Condvar::new(),
+            context: OperationContext::new(ContextOptions::default()),
+        })
+    }
+
+    fn report() -> SettlementReport {
+        SettlementReport {
+            operation_id: OperationId::new(1),
+            resource_phase: ResourcePhase::Released,
+            all_released: true,
+            children: Arc::from([]),
+            cleanup_failures: Arc::from([]),
+            transfers: Arc::from([]),
+            unconfirmed_count: 0,
+            effects: Arc::from([]),
+            effect_overflow: 0,
+        }
+    }
+
+    #[test]
+    fn result_and_released_wakers_reenter_only_after_state_unlocks() {
+        let shared = shared();
+        let lock_reentries = Arc::new(AtomicUsize::new(0));
+        let waker = reentrant_waker(&shared, &lock_reentries);
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(poll_result(&shared, &mut cx), Poll::Pending));
+        publish_result(&shared, OperationOutcome::Succeeded(()));
+        assert_eq!(lock_reentries.load(Ordering::SeqCst), 0);
+
+        assert!(matches!(poll_released(&shared, &mut cx), Poll::Pending));
+        publish_released(&shared, report());
+        assert_eq!(lock_reentries.load(Ordering::SeqCst), 0);
     }
 }
