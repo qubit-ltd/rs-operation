@@ -8,8 +8,9 @@ use qubit_operation::protocol::ManagedOperationControl;
 use qubit_operation::protocol::{CleanupContext, OwnedCleanup};
 use qubit_operation::report::CleanupOutcome;
 use qubit_operation::report::{
-    ChildBusinessOutcome, ChildBusinessSummary, ChildSettlement, ChildSnapshot, DiagnosticSummary,
-    OperationId, OperationPhase, ResourcePhase, StopReason, SupervisorLimits,
+    ChildBusinessOutcome, ChildBusinessSummary, ChildSettlement, ChildSnapshot, ClockDomainId,
+    DiagnosticSummary, MonotonicTime, OperationId, OperationPhase, ResourcePhase, StopReason,
+    SupervisorLimits,
 };
 use qubit_operation::scope::{ChildRequirement, ScopeOptions};
 use qubit_operation::supervisor::OperationSupervisor;
@@ -18,10 +19,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 #[path = "support/gate.rs"]
 mod gate;
 use gate::Gate;
+#[path = "support/clock.rs"]
+mod clock;
 
 #[derive(Default)]
 struct ControlState {
@@ -127,6 +130,69 @@ fn cancellation_accepted_before_body_completion_is_the_stable_result() {
     );
 }
 
+struct ThreadWake {
+    thread: std::thread::Thread,
+    wakes: AtomicUsize,
+}
+
+impl Wake for ThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+        self.thread.unpark();
+    }
+}
+
+#[test]
+fn result_waiter_registered_before_completion_is_woken_once_result_is_published() {
+    let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+    let body_gate = Gate::new();
+    let body_gate_task = body_gate.clone();
+    let mut handle = supervisor
+        .start(ScopeOptions::default(), move |_| async move {
+            body_gate_task.wait().await;
+            Ok::<_, ()>("complete")
+        })
+        .expect("root operation starts");
+    body_gate.wait_started();
+    let waiter = Arc::new(ThreadWake {
+        thread: std::thread::current(),
+        wakes: AtomicUsize::new(0),
+    });
+    let waker = Waker::from(Arc::clone(&waiter));
+    let mut cx = Context::from_waker(&waker);
+    let mut result = Box::pin(handle.result());
+    assert!(matches!(result.as_mut().poll(&mut cx), Poll::Pending));
+    body_gate.release();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let outcome = loop {
+        if let Poll::Ready(value) = result.as_mut().poll(&mut cx) {
+            break value.expect("single result delivered");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "result waiter timed out"
+        );
+        std::thread::park_timeout(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(
+        outcome,
+        qubit_operation::report::OperationOutcome::Succeeded("complete")
+    );
+    assert!(waiter.wakes.load(Ordering::SeqCst) > 0);
+    drop(result);
+    assert!(
+        handle
+            .released_blocking()
+            .expect("root settles")
+            .all_released
+    );
+}
+
 #[test]
 fn body_panic_is_reported_without_skipping_root_settlement() {
     let supervisor = OperationSupervisor::new(SupervisorLimits::default());
@@ -197,4 +263,49 @@ fn dropping_unclosed_service_group_does_not_drop_cleanup_owner_without_cleanup()
 
     assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
     assert_eq!(owner_drops.load(Ordering::SeqCst), 1);
+}
+
+struct WakerProbe;
+
+impl Wake for WakerProbe {
+    fn wake(self: Arc<Self>) {}
+}
+
+#[test]
+fn shutdown_observer_timeout_drops_its_registered_waker() {
+    let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+    let body_gate = Gate::new();
+    let task_gate = body_gate.clone();
+    let mut handle = supervisor
+        .start(ScopeOptions::default(), move |_| async move {
+            task_gate.wait().await;
+            Ok::<_, ()>(())
+        })
+        .expect("active root starts");
+    body_gate.wait_started();
+    supervisor.close();
+    let observer = supervisor.shutdown_observer();
+    let clock = Arc::new(clock::ManualClock::new(ClockDomainId(77)));
+    let wake_owner = Arc::new(WakerProbe);
+    let waker = Waker::from(Arc::clone(&wake_owner));
+    let mut cx = Context::from_waker(&waker);
+    let deadline = qubit_operation::context::Deadline::at(MonotonicTime::new(ClockDomainId(77), 1));
+    let mut wait = Box::pin(observer.wait_async(deadline, clock.clone()));
+    assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Pending));
+    assert_eq!(clock.pending_timers(), 1);
+
+    clock.advance_by(1);
+    assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+    assert_eq!(clock.pending_timers(), 0);
+    drop(wait);
+    assert_eq!(
+        Arc::strong_count(&wake_owner),
+        2,
+        "timed-out observer must unregister its shutdown waker"
+    );
+    body_gate.release();
+    let _ = handle
+        .result_blocking()
+        .expect("root completes after gate release");
+    let _ = handle.released_blocking().expect("root settles");
 }

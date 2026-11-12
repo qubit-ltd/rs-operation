@@ -4,19 +4,24 @@
 //    SPDX-License-Identifier: Apache-2.0
 // =============================================================================
 
+#[path = "support/clock.rs"]
+mod clock;
 #[path = "support/gate.rs"]
 mod gate;
 
 use gate::Gate;
+#[path = "support/control.rs"]
+mod control;
+use control::{BusinessResult, FakeControl};
 use qubit_operation::protocol::{CleanupContext, OwnedCleanup};
 use qubit_operation::report::{CleanupOutcome, OperationOutcome, StopReason, SupervisorLimits};
-use qubit_operation::scope::ScopeOptions;
+use qubit_operation::scope::{ChildRequirement, ScopeOptions};
 use qubit_operation::supervisor::OperationSupervisor;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Wake, Waker};
 
 struct FakeInputCleanup(Arc<AtomicUsize>);
 
@@ -48,6 +53,48 @@ impl Future for PanicCleanupFuture {
 
     fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
         panic!("fake upload cleanup panic")
+    }
+}
+
+struct GateCleanup {
+    gate: Gate,
+    calls: Arc<AtomicUsize>,
+}
+
+impl OwnedCleanup for GateCleanup {
+    fn begin(
+        self: Box<Self>,
+        _: CleanupContext,
+    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            self.gate.wait().await;
+            CleanupOutcome::Cleaned
+        })
+    }
+}
+
+struct ThreadWake(std::thread::Thread);
+
+impl Wake for ThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::park(),
+        }
     }
 }
 
@@ -119,5 +166,226 @@ fn upload_error_remains_primary_when_resource_cleanup_also_panics() {
     assert_eq!(
         shutdown.pending_requests, 0,
         "cleanup panic must settle without leaving a root operation active"
+    );
+    let settlement = operation
+        .released_blocking()
+        .expect("cleanup panic has a stable settlement report");
+    assert_eq!(settlement.cleanup_failures.len(), 1);
+    assert_eq!(
+        settlement.cleanup_failures[0].summary.as_str(),
+        "cleanup panicked"
+    );
+}
+
+#[test]
+fn pipeline_records_ordered_stages_and_cancel_at_each_boundary() {
+    for cancel_at in [Some(0), Some(1), Some(2), Some(3), None] {
+        let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let body_cleanup_calls = Arc::clone(&cleanup_calls);
+        let gates = (0..4).map(|_| Gate::new()).collect::<Vec<_>>();
+        let body_gates = gates.clone();
+        let (stage_tx, stage_rx) = std::sync::mpsc::channel();
+        let mut operation = supervisor
+            .start(ScopeOptions::default(), move |scope| async move {
+                let input = scope
+                    .register_resource(FakeInputCleanup(body_cleanup_calls))
+                    .expect("file owner registered before download");
+                let input_use = scope
+                    .acquire_use(input)
+                    .expect("pipeline helper leases input");
+                let stages = ["download", "stage", "convert", "upload"];
+                for (index, (stage, gate)) in stages.into_iter().zip(body_gates).enumerate() {
+                    let mut reservation = scope
+                        .reserve_child(ChildRequirement::Required)
+                        .expect("stage has a reserved child slot");
+                    let control = FakeControl::new();
+                    reservation
+                        .attach(Arc::new(control.clone()))
+                        .expect("fake command/upload control attached before start");
+                    if let Err(error) = reservation.commit() {
+                        assert_eq!(
+                            error,
+                            qubit_operation::scope::ScopeError::Cancelled,
+                            "cancellation prevents committing the next stage"
+                        );
+                        break;
+                    }
+                    stage_tx
+                        .send((index, stage, control))
+                        .expect("test observes each committed fake pipeline stage");
+                    gate.wait().await;
+                }
+                drop(input_use);
+                Ok::<_, &'static str>("published")
+            })
+            .expect("pipeline root accepted");
+
+        let expected_last_stage = cancel_at.unwrap_or(3);
+        let mut observed = Vec::new();
+        for (index, gate) in gates.iter().enumerate().take(expected_last_stage + 1) {
+            let (actual_index, stage_name, control) = stage_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("next committed domain stage starts");
+            assert_eq!(actual_index, index);
+            assert_eq!(
+                stage_name,
+                ["download", "stage", "convert", "upload"][index]
+            );
+            assert_ne!(control.operation_id().0, 0);
+            gate.wait_started();
+            observed.push(index);
+            if cancel_at == Some(index) {
+                operation.request_cancel(StopReason::UserCancelled);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while control.stop_requests() == 0 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "child stop was not delivered"
+                    );
+                    std::thread::yield_now();
+                }
+                assert_eq!(control.first_stop_reason(), Some(StopReason::UserCancelled));
+                assert_eq!(cleanup_calls.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(control.first_stop_reason(), None);
+            }
+            control.complete_business(BusinessResult::Succeeded);
+            control.confirm_release();
+            gate.release();
+        }
+        assert_eq!(observed, (0..=expected_last_stage).collect::<Vec<_>>());
+        let outcome = operation
+            .result_blocking()
+            .expect("pipeline result available");
+        match cancel_at {
+            Some(_) => assert!(matches!(
+                outcome,
+                OperationOutcome::Stopped(ref stop)
+                    if stop.reason == StopReason::UserCancelled
+            )),
+            None => assert_eq!(outcome, OperationOutcome::Succeeded("published")),
+        }
+        if cancel_at.is_some() {
+            assert!(
+                stage_rx.try_recv().is_err(),
+                "no later stage commits after cancellation"
+            );
+        }
+        assert!(
+            operation
+                .released_blocking()
+                .expect("pipeline settles")
+                .all_released
+        );
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn required_upload_child_failure_is_published_as_child_failed() {
+    let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+    let mut operation = supervisor
+        .start(ScopeOptions::default(), move |scope| async move {
+            let mut reservation = scope
+                .reserve_child(ChildRequirement::Required)
+                .expect("upload child slot available");
+            let control = FakeControl::new();
+            reservation
+                .attach(Arc::new(control.clone()))
+                .expect("upload control attached before start");
+            reservation.commit().expect("upload child committed");
+            control.complete_business(BusinessResult::Failed);
+            control.confirm_release();
+            Ok::<_, &'static str>(())
+        })
+        .expect("pipeline root accepted");
+
+    assert!(matches!(
+        operation
+            .result_blocking()
+            .expect("child failure is observable"),
+        OperationOutcome::ChildFailed(_)
+    ));
+    assert!(
+        operation
+            .released_blocking()
+            .expect("failed upload settles")
+            .all_released
+    );
+}
+
+#[test]
+fn deadline_snapshot_keeps_observation_live_until_cleanup_is_confirmed() {
+    let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+    let manual_clock = Arc::new(clock::ManualClock::new(
+        qubit_operation::report::ClockDomainId(78),
+    ));
+    let operation_clock = Arc::clone(&manual_clock);
+    let cleanup_gate = Gate::new();
+    let cleanup_started = cleanup_gate.clone();
+    let cleanup_calls = Arc::new(AtomicUsize::new(0));
+    let body_cleanup_calls = Arc::clone(&cleanup_calls);
+    let mut operation = supervisor
+        .start(
+            ScopeOptions {
+                context: qubit_operation::context::ContextOptions {
+                    clock: Some(operation_clock),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            move |scope| async move {
+                scope
+                    .register_resource(GateCleanup {
+                        gate: cleanup_gate,
+                        calls: body_cleanup_calls,
+                    })
+                    .expect("input owner registered");
+                Ok::<_, ()>("business result")
+            },
+        )
+        .expect("root accepted");
+    assert_eq!(
+        operation
+            .result_blocking()
+            .expect("business result is ready"),
+        OperationOutcome::Succeeded("business result")
+    );
+    cleanup_started.wait_started();
+    let observer = operation.observer();
+    let timer_clock = Arc::clone(&manual_clock);
+    let timer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while timer_clock.pending_timers() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "observer timer was not registered"
+            );
+            std::thread::yield_now();
+        }
+        timer_clock.advance_by(1);
+    });
+    let snapshot = block_on(
+        observer.observe_until(qubit_operation::context::Deadline::at(
+            qubit_operation::report::MonotonicTime::new(
+                qubit_operation::report::ClockDomainId(78),
+                1,
+            ),
+        )),
+    )
+    .expect("deadline observation succeeds")
+    .snapshot;
+    timer.join().expect("manual clock timer completed");
+    assert!(snapshot.settlement.is_none());
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+
+    cleanup_started.release();
+    cleanup_started.wait_released();
+    assert!(
+        observer
+            .released_blocking()
+            .expect("same observer continues")
+            .all_released
     );
 }
