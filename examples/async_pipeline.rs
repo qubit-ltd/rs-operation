@@ -1,3 +1,14 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
+//! Runs a supervisor-managed asynchronous operation and inspects its receipt,
+//! resource settlement, and shutdown result.
+
 use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
@@ -12,6 +23,7 @@ use qubit_operation::scope::ScopeOptions;
 use qubit_operation::supervisor::OperationSupervisor;
 use qubit_operation::supervisor::ShutdownMode;
 
+/// Waker adapter that resumes a parked thread when the future notifies it.
 struct ThreadWaker(std::thread::Thread);
 impl Wake for ThreadWaker {
     fn wake(self: Arc<Self>) {
@@ -22,6 +34,7 @@ impl Wake for ThreadWaker {
     }
 }
 
+/// Drive a future on the current thread by parking until its waker unparks it.
 fn block_on<F: Future>(future: F) -> F::Output {
     let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
     let mut context = Context::from_waker(&waker);
