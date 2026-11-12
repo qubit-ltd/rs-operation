@@ -1,3 +1,11 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -84,7 +92,7 @@ impl OwnedCleanup for FailedCleanup {
 }
 
 #[test]
-fn cleanup_permits_are_independent_of_business_queue_and_bounded() {
+fn test_cleanup_permits_are_independent_of_business_queue_and_bounded() {
     let scheduler = CleanupScheduler::new(1);
     let permit = scheduler.try_acquire().expect("cleanup slot available");
     assert!(scheduler.try_acquire().is_none());
@@ -93,7 +101,7 @@ fn cleanup_permits_are_independent_of_business_queue_and_bounded() {
 }
 
 #[test]
-fn receiver_receipt_requires_acceptance_and_source_tombstone_waits_for_release() {
+fn test_receiver_receipt_requires_acceptance_and_source_tombstone_waits_for_release() {
     let source = ResourceRegistry::new(OperationId::new(1), 1);
     let destination = ResourceRegistry::new(OperationId::new(2), 1);
     let calls = Arc::new(AtomicUsize::new(0));
@@ -128,7 +136,7 @@ fn receiver_receipt_requires_acceptance_and_source_tombstone_waits_for_release()
 }
 
 #[test]
-fn recovery_registry_preserves_typed_owner_until_single_extraction() {
+fn test_recovery_registry_preserves_typed_owner_until_single_extraction() {
     let id = ResourceId::new(OperationId::new(4), 2, 9);
     let recovery = RecoveryRegistry::new(1);
     let key = recovery.register(id, String::from("reopen handle")).unwrap();
@@ -138,7 +146,7 @@ fn recovery_registry_preserves_typed_owner_until_single_extraction() {
 }
 
 #[test]
-fn recovery_key_from_another_registry_cannot_take_owner_with_same_resource_id() {
+fn test_recovery_key_from_another_registry_cannot_take_owner_with_same_resource_id() {
     let id = ResourceId::new(OperationId::new(90), 1, 3);
     let registry_a = RecoveryRegistry::new(1);
     let registry_b = RecoveryRegistry::new(1);
@@ -154,7 +162,7 @@ fn recovery_key_from_another_registry_cannot_take_owner_with_same_resource_id() 
 }
 
 #[test]
-fn responsibility_owner_retains_pending_task_after_scheduler_and_observer_drop() {
+fn test_responsibility_owner_retains_pending_task_after_scheduler_and_observer_drop() {
     let id = ResourceId::new(OperationId::new(91), 0, 1);
     let scheduler = CleanupScheduler::new(1);
     let responsibility: CleanupResponsibility = scheduler.responsibility_owner();
@@ -196,7 +204,7 @@ fn responsibility_owner_retains_pending_task_after_scheduler_and_observer_drop()
 }
 
 #[test]
-fn cleanup_panic_is_reported_and_independent_capsule_remains_retrievable() {
+fn test_cleanup_panic_is_reported_and_independent_capsule_remains_retrievable() {
     let id = ResourceId::new(OperationId::new(7), 1, 2);
     let recovery = RecoveryRegistry::new(1);
     let key = recovery.register(id, String::from("reopen resource")).unwrap();
@@ -227,7 +235,7 @@ fn cleanup_panic_is_reported_and_independent_capsule_remains_retrievable() {
 }
 
 #[test]
-fn expired_deadline_reports_unconfirmed_without_dropping_task_or_permit() {
+fn test_expired_deadline_reports_unconfirmed_without_dropping_task_or_permit() {
     let id = ResourceId::new(OperationId::new(8), 1, 0);
     let scheduler = CleanupScheduler::new(1);
     let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> = Box::pin(async { CleanupOutcome::Cleaned });
@@ -261,7 +269,7 @@ fn expired_deadline_reports_unconfirmed_without_dropping_task_or_permit() {
 }
 
 #[test]
-fn failed_prerequisite_blocks_dependent_even_after_capsule_is_taken() {
+fn test_failed_prerequisite_blocks_dependent_even_after_capsule_is_taken() {
     let registry = ResourceRegistry::new(OperationId::new(10), 2);
     let calls = Arc::new(AtomicUsize::new(0));
     let dependent = registry.register(Box::new(CountCleanup(Arc::clone(&calls)))).unwrap();
@@ -316,7 +324,7 @@ fn failed_prerequisite_blocks_dependent_even_after_capsule_is_taken() {
 }
 
 #[test]
-fn recovery_key_is_single_use_and_capacity_failure_returns_owner() {
+fn test_recovery_key_is_single_use_and_capacity_failure_returns_owner() {
     let id = ResourceId::new(OperationId::new(11), 0, 4);
     let old_generation = ResourceId::new(OperationId::new(11), 0, 3);
     let recovery = RecoveryRegistry::new(1);
@@ -332,7 +340,7 @@ fn recovery_key_is_single_use_and_capacity_failure_returns_owner() {
 }
 
 #[test]
-fn settlement_report_remains_a_stable_historical_snapshot_after_recovery() {
+fn test_settlement_report_remains_a_stable_historical_snapshot_after_recovery() {
     let id = ResourceId::new(OperationId::new(15), 2, 3);
     let recovery = RecoveryRegistry::new(1);
     let key = recovery.register(id, String::from("capsule")).unwrap();
@@ -354,7 +362,7 @@ fn settlement_report_remains_a_stable_historical_snapshot_after_recovery() {
 }
 
 #[test]
-fn retry_keeps_capsule_and_dependency_group_transfer_is_atomic() {
+fn test_retry_keeps_capsule_and_dependency_group_transfer_is_atomic() {
     let id = ResourceId::new(OperationId::new(12), 0, 2);
     let recovery = RecoveryRegistry::new(1);
     let key = recovery.register(id, String::from("capsule")).unwrap();

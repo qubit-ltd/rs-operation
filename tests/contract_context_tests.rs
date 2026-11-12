@@ -1,3 +1,11 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
 use std::cmp::Ordering;
 use std::future::Future;
 use std::sync::Arc;
@@ -147,7 +155,7 @@ impl Wake for CountingWake {
 }
 
 #[test]
-fn parent_stop_reaches_all_descendants_without_stopping_siblings_from_child_stop() {
+fn test_parent_stop_reaches_all_descendants_without_stopping_siblings_from_child_stop() {
     let root = OperationContext::new(ContextOptions::default());
     let left = root.child(ContextOptions::default()).expect("left");
     let right = root.child(ContextOptions::default()).expect("right");
@@ -161,7 +169,7 @@ fn parent_stop_reaches_all_descendants_without_stopping_siblings_from_child_stop
 }
 
 #[test]
-fn first_stop_reason_wins_and_repeated_requests_are_idempotent() {
+fn test_first_stop_reason_wins_and_repeated_requests_are_idempotent() {
     let context = OperationContext::new(ContextOptions::default());
     context.request_stop(StopReason::UserCancelled);
     context.request_stop(StopReason::Timeout);
@@ -169,7 +177,7 @@ fn first_stop_reason_wins_and_repeated_requests_are_idempotent() {
 }
 
 #[test]
-fn deadline_compares_only_within_its_clock_domain_and_child_takes_earliest() {
+fn test_deadline_compares_only_within_its_clock_domain_and_child_takes_earliest() {
     let clock = Arc::new(ManualClock::new(7));
     let first = Deadline::at(MonotonicTime::new(ClockDomainId(7), 10));
     let earlier = Deadline::at(MonotonicTime::new(ClockDomainId(7), 8));
@@ -201,7 +209,7 @@ fn deadline_compares_only_within_its_clock_domain_and_child_takes_earliest() {
 }
 
 #[test]
-fn child_deadline_cannot_extend_parent_deadline() {
+fn test_child_deadline_cannot_extend_parent_deadline() {
     let clock = Arc::new(ManualClock::new(9));
     let parent_deadline = Deadline::at(MonotonicTime::new(ClockDomainId(9), 5));
     let parent = OperationContext::new(ContextOptions {
@@ -220,7 +228,7 @@ fn child_deadline_cannot_extend_parent_deadline() {
 }
 
 #[test]
-fn child_budget_must_satisfy_both_parent_and_child_leases() {
+fn test_child_budget_must_satisfy_both_parent_and_child_leases() {
     let denied_parent = Arc::new(TestBudget(AtomicBool::new(false)));
     let permissive_child = Arc::new(TestBudget(AtomicBool::new(true)));
     let parent = OperationContext::new(ContextOptions {
@@ -251,7 +259,7 @@ fn child_budget_must_satisfy_both_parent_and_child_leases() {
 }
 
 #[test]
-fn deadline_signal_requests_timeout_and_cancels_its_timer_registration() {
+fn test_deadline_signal_requests_timeout_and_cancels_its_timer_registration() {
     let clock = Arc::new(ManualClock::new(10));
     let deadline = Deadline::at(MonotonicTime::new(ClockDomainId(10), 3));
     let context = OperationContext::new(ContextOptions {
@@ -291,7 +299,7 @@ fn deadline_signal_requests_timeout_and_cancels_its_timer_registration() {
 }
 
 #[test]
-fn cleanup_context_does_not_inherit_business_cancellation_or_deadline() {
+fn test_cleanup_context_does_not_inherit_business_cancellation_or_deadline() {
     let clock = Arc::new(ManualClock::new(11));
     let business = OperationContext::new(ContextOptions {
         clock: Some(clock),
@@ -306,7 +314,7 @@ fn cleanup_context_does_not_inherit_business_cancellation_or_deadline() {
 }
 
 #[test]
-fn stop_signal_waiters_are_bounded_and_reclaimed_on_drop() {
+fn test_stop_signal_waiters_are_bounded_and_reclaimed_on_drop() {
     let operation = OperationContext::new(ContextOptions::default());
     let waker = Waker::from(Arc::new(CountingWake(Arc::new(AtomicUsize::new(0)))));
     let mut task_context = Context::from_waker(&waker);

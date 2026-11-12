@@ -1,3 +1,11 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
 use core::future::Future;
 use core::task::Context;
 use core::task::Poll;
@@ -73,7 +81,7 @@ fn assert_clock_object_safe(_: &dyn ClockSource) {}
 fn assert_cleanup_object_safe(_: Box<dyn OwnedCleanup>) {}
 
 #[test]
-fn lifecycle_ports_are_object_safe_and_reports_do_not_require_clone_errors() {
+fn test_lifecycle_ports_are_object_safe_and_reports_do_not_require_clone_errors() {
     assert_control_object_safe(&Control);
     assert_clock_object_safe(&Clock);
     assert_cleanup_object_safe(Box::new(Cleanup));

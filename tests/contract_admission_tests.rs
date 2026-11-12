@@ -1,3 +1,11 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
 use qubit_operation::report::AdmissionError;
 use qubit_operation::report::SupervisorLimits;
 use qubit_operation::supervisor::OperationSupervisor;
@@ -12,7 +20,7 @@ fn limits(active_roots: usize, queued_roots: usize, unobserved_results: usize) -
 }
 
 #[test]
-fn root_capacity_and_result_reservations_are_released_independently() {
+fn test_root_capacity_and_result_reservations_are_released_independently() {
     let supervisor = OperationSupervisor::new(limits(1, 1, 2));
     let active = supervisor.try_admit().unwrap();
     let queued = supervisor.try_admit().unwrap();
@@ -35,7 +43,7 @@ fn root_capacity_and_result_reservations_are_released_independently() {
 }
 
 #[test]
-fn dropping_a_queued_admission_rolls_back_without_running_body() {
+fn test_dropping_a_queued_admission_rolls_back_without_running_body() {
     let supervisor = OperationSupervisor::new(limits(0, 1, 1));
     let marker = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let body_marker = marker.clone();
@@ -52,14 +60,14 @@ fn dropping_a_queued_admission_rolls_back_without_running_body() {
 }
 
 #[test]
-fn closure_and_expired_admission_have_stable_errors() {
+fn test_closure_and_expired_admission_have_stable_errors() {
     let supervisor = OperationSupervisor::new(limits(0, 1, 1));
     supervisor.close();
     assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Closed);
 }
 
 #[test]
-fn rejected_body_is_returned_unchanged_and_reservations_roll_back() {
+fn test_rejected_body_is_returned_unchanged_and_reservations_roll_back() {
     let supervisor = OperationSupervisor::new(limits(0, 0, 1));
     let original = String::from("unstarted body");
     let error = supervisor.try_admit_body(original).unwrap_err();
@@ -71,7 +79,7 @@ fn rejected_body_is_returned_unchanged_and_reservations_roll_back() {
 }
 
 #[test]
-fn admission_waiter_drop_unregisters_and_close_returns_its_body() {
+fn test_admission_waiter_drop_unregisters_and_close_returns_its_body() {
     use core::future::Future;
     use core::pin::Pin;
     use std::sync::Arc;
@@ -121,7 +129,7 @@ fn admission_waiter_drop_unregisters_and_close_returns_its_body() {
 }
 
 #[test]
-fn business_capacity_does_not_consume_cleanup_capacity() {
+fn test_business_capacity_does_not_consume_cleanup_capacity() {
     let supervisor = OperationSupervisor::new(SupervisorLimits {
         active_roots: 1,
         queued_roots: 0,
@@ -136,7 +144,7 @@ fn business_capacity_does_not_consume_cleanup_capacity() {
 }
 
 #[test]
-fn released_capacity_wakes_waiter_and_admits_without_running_body() {
+fn test_released_capacity_wakes_waiter_and_admits_without_running_body() {
     use core::future::Future;
     use core::pin::Pin;
     use std::sync::Arc;
@@ -181,7 +189,7 @@ fn released_capacity_wakes_waiter_and_admits_without_running_body() {
 }
 
 #[test]
-fn admission_wait_deadline_returns_expired_error_and_unstarted_body() {
+fn test_admission_wait_deadline_returns_expired_error_and_unstarted_body() {
     use core::future::Future;
     use core::pin::Pin;
     use std::sync::Arc;
@@ -259,7 +267,7 @@ fn admission_wait_deadline_returns_expired_error_and_unstarted_body() {
 }
 
 #[test]
-fn context_stop_wakes_pending_admission_waiter_and_returns_body() {
+fn test_context_stop_wakes_pending_admission_waiter_and_returns_body() {
     use core::future::Future;
     use core::pin::Pin;
     use std::sync::Arc;
