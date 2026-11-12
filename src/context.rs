@@ -285,6 +285,20 @@ impl OperationContext {
             Arc::downgrade(&self.node),
         ))
     }
+
+    /// Register an observer-only timer in this context's clock domain.
+    pub(crate) fn signal_at(&self, deadline: Deadline) -> Result<DeadlineSignal, ContextError> {
+        let clock = self.clock.clone().ok_or(ContextError::ClockUnavailable)?;
+        if clock.now().domain != deadline.time_point().domain {
+            return Err(ContextError::ClockDomainMismatch);
+        }
+        let observer_node = Arc::new(Node::new());
+        Ok(DeadlineSignal::new(
+            deadline,
+            clock,
+            Arc::downgrade(&observer_node),
+        ))
+    }
 }
 
 /// Future that resolves with this context's first stop reason.

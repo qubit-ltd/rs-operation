@@ -22,6 +22,7 @@ pub use external::DriverStatus;
 pub use external::ExternalDriver;
 pub use external::ExternalDriverError;
 pub use external::ExternalDriverGuard;
+pub(crate) use internal::is_portable_worker_thread;
 pub use portable::PortableDriver;
 pub use portable::PortableDriverConfig;
 pub use portable::PortableDriverError;

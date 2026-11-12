@@ -50,6 +50,8 @@ impl PortableDriver {
             ready: Condvar::new(),
             task_capacity: config.task_capacity,
             polls_per_turn: config.polls_per_turn,
+            #[cfg(test)]
+            active_workers: std::sync::atomic::AtomicUsize::new(0),
         });
         let mut workers: Vec<JoinHandle<()>> = Vec::with_capacity(config.worker_count);
         for index in 0..config.worker_count {
@@ -121,8 +123,16 @@ impl PortableDriver {
 impl Drop for PortableDriver {
     fn drop(&mut self) {
         close_portable(&self.shared);
+        let current_thread = thread::current().id();
         for worker in self.workers.drain(..) {
-            let _ = worker.join();
+            if worker.thread().id() == current_thread {
+                // The last admission lease can release the shared supervisor from
+                // inside a managed task. Detach this already-closing worker rather
+                // than asking it to join itself; it exits on the closed flag.
+                drop(worker);
+            } else {
+                let _ = worker.join();
+            }
         }
         let tasks: Vec<Arc<PortableTask>> = {
             let mut state = lock(&self.shared.state);
@@ -138,4 +148,74 @@ impl Drop for PortableDriver {
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PortableDriver, PortableDriverConfig};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct DropNotice {
+        sender: mpsc::SyncSender<bool>,
+        completed: Arc<AtomicBool>,
+    }
+
+    impl Drop for DropNotice {
+        fn drop(&mut self) {
+            let _ = self.sender.send(self.completed.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn dropping_driver_on_its_own_worker_detaches_self_and_drains_workers() {
+        let driver = PortableDriver::new(PortableDriverConfig {
+            worker_count: 2,
+            task_capacity: 1,
+            polls_per_turn: 1,
+        })
+        .expect("driver starts");
+        let shared = Arc::clone(&driver.shared);
+        let owner = Arc::new(Mutex::new(Some(driver)));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_owner = Arc::clone(&owner);
+        let task_completed = Arc::clone(&completed);
+        let _task = owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("driver owner exists")
+            .spawn(async move {
+                let _notice = DropNotice {
+                    sender,
+                    completed: Arc::clone(&task_completed),
+                };
+                let last_owner = task_owner
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("last driver owner");
+                drop(last_owner);
+                task_completed.store(true, Ordering::SeqCst);
+            })
+            .expect("managed task accepted");
+        drop(owner);
+
+        assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("managed task drops its observable notice")
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.active_workers.load(Ordering::Acquire) != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "closing workers exit within watchdog"
+            );
+            thread::yield_now();
+        }
+    }
 }

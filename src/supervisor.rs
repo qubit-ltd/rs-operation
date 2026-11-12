@@ -4,7 +4,9 @@
 //! observation are attached by the operation handle layer.
 
 use crate::context::{ContextError, DeadlineSignal, OperationContext, StopSignal};
+use crate::driver::{PortableDriver, PortableDriverConfig, PortableDriverError, TaskHandle};
 use crate::report::{AdmissionError, StartError, SupervisorLimits};
+use crate::resource::{CleanupResponsibility, CleanupScheduler};
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -15,6 +17,9 @@ use std::sync::{Arc, Mutex, Weak};
 struct Inner {
     limits: SupervisorLimits,
     state: Mutex<State>,
+    driver: Mutex<Option<Arc<PortableDriver>>>,
+    cleanup_scheduler: CleanupScheduler,
+    cleanup_responsibility: CleanupResponsibility,
 }
 
 struct State {
@@ -33,6 +38,7 @@ struct LeaseState {
     active: bool,
     execution_released: bool,
     result_reserved: bool,
+    active_waiters: Vec<Waker>,
 }
 
 /// Application-owned bounded root operation admission service.
@@ -44,6 +50,8 @@ pub struct OperationSupervisor {
 impl OperationSupervisor {
     /// Create a supervisor with explicit finite capacities.
     pub fn new(limits: SupervisorLimits) -> Self {
+        let cleanup_scheduler = CleanupScheduler::new(limits.cleanup_concurrency);
+        let cleanup_responsibility = cleanup_scheduler.responsibility_owner();
         Self {
             inner: Arc::new(Inner {
                 limits,
@@ -56,8 +64,48 @@ impl OperationSupervisor {
                     waiters: Vec::new(),
                     next_waiter: 1,
                 }),
+                driver: Mutex::new(None),
+                cleanup_scheduler,
+                cleanup_responsibility,
             }),
         }
+    }
+
+    pub(crate) fn cleanup_scheduler(&self) -> CleanupScheduler {
+        self.inner.cleanup_scheduler.clone()
+    }
+
+    /// Number of cleanup permits retained by this shared supervisor.
+    pub fn cleanup_tasks_active(&self) -> usize {
+        self.inner.cleanup_responsibility.active()
+    }
+
+    /// Submit a managed future to the supervisor's shared bounded portable driver.
+    /// This is crate-private so public operation APIs remain the only submission path.
+    pub(crate) fn spawn_managed<F>(&self, future: F) -> Result<TaskHandle, PortableDriverError>
+    where
+        F: core::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut driver = lock(&self.inner.driver);
+        if driver.is_none() {
+            let Some(task_capacity) = self
+                .inner
+                .limits
+                .active_roots
+                .checked_add(self.inner.limits.queued_roots)
+            else {
+                return Err(PortableDriverError::InvalidConfiguration);
+            };
+            let task_capacity = task_capacity.max(1);
+            let driver_handle = PortableDriver::new(PortableDriverConfig {
+                worker_count: self.inner.limits.active_roots.max(1),
+                task_capacity,
+                polls_per_turn: 16,
+            })
+            .map_err(|_| PortableDriverError::WorkerSpawn)?;
+            *driver = Some(Arc::new(driver_handle));
+        }
+        driver.as_ref().expect("driver initialized").spawn(future)
     }
 
     /// Reserve a root execution position and its typed-result slot.
@@ -308,6 +356,25 @@ pub(crate) struct TaskLease {
 impl TaskLease {
     /// Mark task completion and release execution capacity.
     pub(crate) fn complete(self) {}
+
+    /// Poll until this reservation owns an active root execution slot.
+    pub(crate) fn poll_active(&self, cx: &mut Context<'_>) -> Poll<bool> {
+        let mut lease = lock(&self.lease);
+        if lease.active {
+            return Poll::Ready(true);
+        }
+        if lease.execution_released {
+            return Poll::Ready(false);
+        }
+        if !lease
+            .active_waiters
+            .iter()
+            .any(|waker| waker.will_wake(cx.waker()))
+        {
+            lease.active_waiters.push(cx.waker().clone());
+        }
+        Poll::Pending
+    }
 }
 
 impl Drop for TaskLease {
@@ -341,10 +408,11 @@ fn release_execution(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
             return;
         }
         lease_state.execution_released = true;
+        let mut promoted = Vec::new();
         if lease_state.active {
             lease_state.active = false;
             state.active = state.active.saturating_sub(1);
-            promote_one(&mut state, inner.limits.active_roots);
+            promoted.extend(promote_one(&mut state, inner.limits.active_roots));
         }
         if lease_state.queued {
             lease_state.queued = false;
@@ -354,7 +422,8 @@ fn release_execution(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
                     .is_some_and(|candidate| !Arc::ptr_eq(&candidate, lease))
             });
         }
-        take_waiter_wakers(&mut state)
+        promoted.extend(take_waiter_wakers(&mut state));
+        promoted
     };
     wake(waiters);
 }
@@ -377,12 +446,13 @@ fn release_all(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
     let waiters = {
         let mut state = lock(&inner.state);
         let mut lease_state = lock(lease);
+        let mut promoted = Vec::new();
         if !lease_state.execution_released {
             lease_state.execution_released = true;
             if lease_state.active {
                 lease_state.active = false;
                 state.active = state.active.saturating_sub(1);
-                promote_one(&mut state, inner.limits.active_roots);
+                promoted.extend(promote_one(&mut state, inner.limits.active_roots));
             }
             if lease_state.queued {
                 lease_state.queued = false;
@@ -397,7 +467,8 @@ fn release_all(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
             lease_state.result_reserved = false;
             state.results = state.results.saturating_sub(1);
         }
-        take_waiter_wakers(&mut state)
+        promoted.extend(take_waiter_wakers(&mut state));
+        promoted
     };
     wake(waiters);
 }
@@ -600,10 +671,10 @@ fn wake(waiters: Vec<Waker>) {
     }
 }
 
-fn promote_one(state: &mut State, active_limit: usize) {
+fn promote_one(state: &mut State, active_limit: usize) -> Vec<Waker> {
     while state.active < active_limit {
         let Some(next) = state.queued.pop_front() else {
-            return;
+            return Vec::new();
         };
         let Some(next) = next.upgrade() else {
             continue;
@@ -615,8 +686,9 @@ fn promote_one(state: &mut State, active_limit: usize) {
         lease.queued = false;
         lease.active = true;
         state.active += 1;
-        return;
+        return std::mem::take(&mut lease.active_waiters);
     }
+    Vec::new()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

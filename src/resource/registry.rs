@@ -160,6 +160,51 @@ impl ResourceRegistry {
         lookup_entry(&state, resource_id).is_some()
     }
 
+    /// Count registrations whose local cleanup responsibility is still pending.
+    /// A transferred prerequisite remains pending while it blocks dependent cleanup.
+    pub fn pending_cleanup_count(&self) -> usize {
+        let Ok(state) = self.inner.state.lock() else {
+            return usize::MAX;
+        };
+        state
+            .slots
+            .iter()
+            .filter_map(|slot| slot.entry.as_ref())
+            .filter(|entry| {
+                let Ok(entry_state) = entry.state.lock() else {
+                    return true;
+                };
+                match entry_state.phase {
+                    EntryPhase::Released => false,
+                    EntryPhase::Transferred => state
+                        .dependencies
+                        .get(&entry_state.id)
+                        .is_some_and(|dependents| !dependents.is_empty()),
+                    EntryPhase::Open | EntryPhase::Closed | EntryPhase::Cleaning => true,
+                }
+            })
+            .count()
+    }
+
+    /// Whether a closed, unused registration can be handed to a cleanup driver now.
+    pub fn has_ready_cleanup(&self) -> bool {
+        let Ok(state) = self.inner.state.lock() else {
+            return false;
+        };
+        state
+            .slots
+            .iter()
+            .filter_map(|slot| slot.entry.as_ref())
+            .any(|entry| {
+                let Ok(entry_state) = entry.state.lock() else {
+                    return false;
+                };
+                entry_state.phase == EntryPhase::Closed
+                    && entry_state.active_uses == 0
+                    && !has_unreleased_prerequisite(&state, entry_state.id)
+            })
+    }
+
     /// Take the first resource whose use leases and cleanup prerequisites are settled.
     ///
     /// Resources are considered in ascending resource ID order. The returned
@@ -264,7 +309,7 @@ impl ResourceRegistry {
                 dependents.remove(&resource_id);
             }
             release_slot(&mut state.slots[slot_index]);
-            return Ok(release_receipt);
+            Ok(release_receipt)
         }
     }
 
@@ -298,6 +343,25 @@ impl ResourceRegistry {
             entry_state.transfer_receiver = Some(receipt.receiver());
             entry_state.phase = EntryPhase::Transferred;
         }
+        Ok(())
+    }
+
+    /// Record that the supervisor's recovery registry accepted an owned cleanup failure.
+    pub fn accept_recovery(&self, resource_id: ResourceId) -> Result<(), RegistryError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| RegistryError::RegistryPoisoned)?;
+        let (_, entry) = lookup_slot(&state, resource_id).ok_or(RegistryError::NotRegistered)?;
+        let mut entry_state = entry
+            .state
+            .lock()
+            .map_err(|_| RegistryError::RegistryPoisoned)?;
+        if entry_state.phase != EntryPhase::Cleaning {
+            return Err(RegistryError::NotCleaning);
+        }
+        entry_state.phase = EntryPhase::Transferred;
         Ok(())
     }
 

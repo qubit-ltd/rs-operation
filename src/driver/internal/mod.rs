@@ -30,6 +30,7 @@ pub use portable_state::PortableState;
 pub use portable_task::PortableTask;
 pub use portable_wake::PortableTaskWake;
 pub use portable_worker::close_portable;
+pub use portable_worker::is_portable_worker_thread;
 pub use portable_worker::portable_worker_loop;
 pub use portable_worker::schedule_portable_task;
 pub use thread_job::ThreadJob;

@@ -17,4 +17,6 @@ pub struct PortableShared {
     pub ready: Condvar,
     pub task_capacity: usize,
     pub polls_per_turn: usize,
+    #[cfg(test)]
+    pub active_workers: std::sync::atomic::AtomicUsize,
 }

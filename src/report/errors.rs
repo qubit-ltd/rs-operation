@@ -16,6 +16,8 @@ pub enum AdmissionError {
     ReservationLimit,
     /// No driver can accept the work.
     DriverUnavailable,
+    /// A blocking admission wait from a managed worker would deadlock.
+    WouldDeadlock,
 }
 
 impl fmt::Display for AdmissionError {
@@ -27,6 +29,7 @@ impl fmt::Display for AdmissionError {
             Self::DeadlineExpired => "operation deadline has expired",
             Self::ReservationLimit => "operation reservation limit reached",
             Self::DriverUnavailable => "operation driver is unavailable",
+            Self::WouldDeadlock => "blocking admission wait would deadlock",
         })
     }
 }
@@ -85,6 +88,10 @@ pub enum ObservationError {
     WouldDeadlock,
     /// The observer does not refer to a registered operation.
     InvalidObserver,
+    /// The observer deadline has no configured clock source.
+    ClockUnavailable,
+    /// The observer deadline belongs to a different clock domain.
+    ClockDomainMismatch,
     /// The operation already has the maximum number of asynchronous result waiters.
     WaiterCapacityExceeded,
 }
@@ -96,6 +103,8 @@ impl fmt::Display for ObservationError {
             Self::ResultDiscarded => "operation result was discarded",
             Self::WouldDeadlock => "blocking observation would deadlock",
             Self::InvalidObserver => "operation observer is invalid",
+            Self::ClockUnavailable => "operation observer has no clock source",
+            Self::ClockDomainMismatch => "operation observer deadline uses another clock domain",
             Self::WaiterCapacityExceeded => {
                 "operation has reached its asynchronous waiter capacity"
             }

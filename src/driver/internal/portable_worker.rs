@@ -6,15 +6,58 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Context;
 use std::thread;
 
+thread_local! { static IN_PORTABLE_WORKER: Cell<bool> = const { Cell::new(false) }; }
+
+pub fn is_portable_worker_thread() -> bool {
+    IN_PORTABLE_WORKER.with(Cell::get)
+}
+
+struct WorkerMarker;
+impl WorkerMarker {
+    fn enter() -> Self {
+        IN_PORTABLE_WORKER.with(|value| value.set(true));
+        Self
+    }
+}
+impl Drop for WorkerMarker {
+    fn drop(&mut self) {
+        IN_PORTABLE_WORKER.with(|value| value.set(false));
+    }
+}
+
+#[cfg(test)]
+struct ActiveWorkerMarker(Arc<PortableShared>);
+#[cfg(test)]
+impl ActiveWorkerMarker {
+    fn enter(shared: Arc<PortableShared>) -> Self {
+        shared
+            .active_workers
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(shared)
+    }
+}
+#[cfg(test)]
+impl Drop for ActiveWorkerMarker {
+    fn drop(&mut self) {
+        self.0
+            .active_workers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 use super::PortableShared;
 
 /// Poll portable tasks in bounded FIFO turns without holding the scheduler lock.
 pub fn portable_worker_loop(shared: Arc<PortableShared>) {
+    let _worker_marker = WorkerMarker::enter();
+    #[cfg(test)]
+    let _active_marker = ActiveWorkerMarker::enter(Arc::clone(&shared));
     loop {
         let mut completed_this_turn = 0;
         while completed_this_turn < shared.polls_per_turn {
@@ -63,11 +106,11 @@ pub fn schedule_portable_task(shared: &PortableShared, id: u64) {
     if state.closed {
         return;
     }
-    if let Some(task) = state.tasks.get(&id) {
-        if !task.queued.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            state.ready.push_back(id);
-            shared.ready.notify_one();
-        }
+    if let Some(task) = state.tasks.get(&id)
+        && !task.queued.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        state.ready.push_back(id);
+        shared.ready.notify_one();
     }
 }
 
