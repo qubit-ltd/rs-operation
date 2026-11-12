@@ -14,7 +14,10 @@ use gate::Gate;
 mod control;
 use control::{BusinessResult, FakeControl};
 use qubit_operation::protocol::{CleanupContext, OwnedCleanup};
-use qubit_operation::report::{CleanupOutcome, OperationOutcome, StopReason, SupervisorLimits};
+use qubit_operation::report::{
+    CleanupOutcome, DiagnosticSummary, EffectFact, EffectRecord, OperationOutcome, StopReason,
+    SupervisorLimits,
+};
 use qubit_operation::scope::{ChildRequirement, ScopeOptions};
 use qubit_operation::supervisor::OperationSupervisor;
 use std::future::Future;
@@ -388,4 +391,58 @@ fn deadline_snapshot_keeps_observation_live_until_cleanup_is_confirmed() {
             .expect("same observer continues")
             .all_released
     );
+}
+
+#[test]
+fn upload_effect_record_survives_cancellation_in_settlement() {
+    let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+    let upload_gate = Gate::new();
+    let body_gate = upload_gate.clone();
+    let mut operation = supervisor
+        .start(ScopeOptions::default(), move |scope| async move {
+            scope
+                .record_effect(EffectRecord {
+                    operation_id: scope.operation_id(),
+                    resource_id: None,
+                    description: DiagnosticSummary::new("fake upload committed"),
+                    fact: EffectFact::Known,
+                })
+                .expect("known upload effect fits report capacity");
+            scope
+                .record_effect(EffectRecord {
+                    operation_id: scope.operation_id(),
+                    resource_id: None,
+                    description: DiagnosticSummary::new("remote upload acknowledgement lost"),
+                    fact: EffectFact::Unknown,
+                })
+                .expect("uncertain remote effect fits report capacity");
+            body_gate.wait().await;
+            Ok::<_, &'static str>(())
+        })
+        .expect("pipeline root accepted");
+
+    upload_gate.wait_started();
+    operation.request_cancel(StopReason::UserCancelled);
+    upload_gate.release();
+    assert!(matches!(
+        operation.result_blocking().expect("result available"),
+        OperationOutcome::Stopped(ref stop) if stop.reason == StopReason::UserCancelled
+    ));
+    let settlement = operation
+        .released_blocking()
+        .expect("recorded upload settles");
+    assert_eq!(settlement.effects.len(), 2);
+    assert_eq!(
+        settlement.effects[0].description.as_str(),
+        "fake upload committed"
+    );
+    assert_eq!(settlement.effects[0].fact, EffectFact::Known);
+    assert_eq!(settlement.effects[0].operation_id, settlement.operation_id);
+    assert_eq!(
+        settlement.effects[1].description.as_str(),
+        "remote upload acknowledgement lost"
+    );
+    assert_eq!(settlement.effects[1].fact, EffectFact::Unknown);
+    assert_eq!(settlement.effects[1].operation_id, settlement.operation_id);
+    assert_eq!(settlement.effect_overflow, 0);
 }
