@@ -4,6 +4,7 @@
 //    SPDX-License-Identifier: Apache-2.0
 // =============================================================================
 
+use qubit_operation::driver::{PortableDriver, PortableDriverConfig};
 use qubit_operation::protocol::ManagedOperationControl;
 use qubit_operation::protocol::{CleanupContext, OwnedCleanup};
 use qubit_operation::report::CleanupOutcome;
@@ -29,6 +30,7 @@ mod clock;
 #[derive(Default)]
 struct ControlState {
     stop_requests: usize,
+    released: bool,
 }
 
 struct ControlledChild {
@@ -42,12 +44,23 @@ impl ManagedOperationControl for ControlledChild {
     }
 
     fn snapshot(&self) -> ChildSnapshot {
+        let state = self.state.lock().expect("state lock");
         ChildSnapshot {
             operation_id: self.id,
-            phase: OperationPhase::Running,
-            resource_phase: ResourcePhase::Active,
-            stop_requested: self.state.lock().expect("state lock").stop_requests > 0,
-            released: false,
+            phase: if state.released {
+                OperationPhase::ResultReady
+            } else {
+                OperationPhase::Running
+            },
+            resource_phase: if state.released {
+                ResourcePhase::Released
+            } else if state.stop_requests > 0 {
+                ResourcePhase::Stopping
+            } else {
+                ResourcePhase::Active
+            },
+            stop_requested: state.stop_requests > 0,
+            released: state.released,
         }
     }
 
@@ -60,7 +73,58 @@ impl ManagedOperationControl for ControlledChild {
     }
 
     fn poll_released(&self, _: &mut Context<'_>) -> Poll<ChildSettlement> {
-        Poll::Pending
+        let state = self.state.lock().expect("state lock");
+        if state.released {
+            Poll::Ready(ChildSettlement {
+                operation_id: self.id,
+                released: true,
+                summary: DiagnosticSummary::new("fake child released"),
+            })
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl ControlledChild {
+    fn stop_requests(&self) -> usize {
+        self.state.lock().expect("state lock").stop_requests
+    }
+
+    fn confirm_release(&self) {
+        self.state.lock().expect("state lock").released = true;
+    }
+}
+
+struct FacadeControl(Arc<dyn ManagedOperationControl>);
+
+impl ManagedOperationControl for FacadeControl {
+    fn request_stop(&self, reason: StopReason) {
+        self.0.request_stop(reason);
+    }
+
+    fn snapshot(&self) -> ChildSnapshot {
+        self.0.snapshot()
+    }
+
+    fn poll_business(&self, cx: &mut Context<'_>) -> Poll<ChildBusinessSummary> {
+        self.0.poll_business(cx)
+    }
+
+    fn poll_released(&self, cx: &mut Context<'_>) -> Poll<ChildSettlement> {
+        self.0.poll_released(cx)
+    }
+}
+
+struct FacadeCleanup(Arc<AtomicUsize>);
+
+impl OwnedCleanup for FacadeCleanup {
+    fn begin(
+        self: Box<Self>,
+        _: CleanupContext,
+    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { CleanupOutcome::Cleaned })
     }
 }
 
@@ -194,6 +258,74 @@ fn result_waiter_registered_before_completion_is_woken_once_result_is_published(
 }
 
 #[test]
+fn facade_control_wraps_one_registered_domain_owner_and_cleans_its_lease_once() {
+    let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+    let body_gate = Gate::new();
+    let body_gate_task = body_gate.clone();
+    let cleanup_calls = Arc::new(AtomicUsize::new(0));
+    let body_cleanup_calls = Arc::clone(&cleanup_calls);
+    let inner_control = Arc::new(std::sync::Mutex::new(None));
+    let body_inner_control = Arc::clone(&inner_control);
+    let mut handle = supervisor
+        .start(ScopeOptions::default(), move |scope| async move {
+            let resource = scope
+                .register_resource(FacadeCleanup(body_cleanup_calls))
+                .expect("facade-owned domain resource registered once");
+            let use_lease = scope
+                .acquire_use(resource)
+                .expect("wrapped operation holds lease");
+            let domain_control = Arc::new(ControlledChild {
+                id: OperationId::new(14_001),
+                state: Arc::new(std::sync::Mutex::new(ControlState::default())),
+            });
+            let mut reservation = scope
+                .reserve_child(ChildRequirement::Required)
+                .expect("one facade registration slot available");
+            reservation
+                .attach_with_uses(
+                    Arc::new(FacadeControl(domain_control.clone())),
+                    vec![use_lease],
+                )
+                .expect("facade forwards one suspended domain control and its lease");
+            reservation.commit().expect("facade child committed once");
+            *body_inner_control.lock().expect("control slot lock") = Some(domain_control);
+            body_gate_task.wait().await;
+            Ok::<_, ()>(())
+        })
+        .expect("root operation starts");
+    body_gate.wait_started();
+    handle.request_cancel(StopReason::UserCancelled);
+    let control = inner_control
+        .lock()
+        .expect("control slot lock")
+        .clone()
+        .expect("wrapped control registered before gate");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while control.stop_requests() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "facade did not forward stop"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(control.stop_requests(), 1);
+    control.confirm_release();
+    body_gate.release();
+
+    assert!(matches!(
+        handle.result_blocking().expect("facade operation stops"),
+        qubit_operation::report::OperationOutcome::Stopped(_)
+    ));
+    assert!(
+        handle
+            .released_blocking()
+            .expect("facade lease settles")
+            .all_released
+    );
+    assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn body_panic_is_reported_without_skipping_root_settlement() {
     let supervisor = OperationSupervisor::new(SupervisorLimits::default());
     let (panic_tx, panic_rx) = std::sync::mpsc::channel();
@@ -308,4 +440,37 @@ fn shutdown_observer_timeout_drops_its_registered_waker() {
         .result_blocking()
         .expect("root completes after gate release");
     let _ = handle.released_blocking().expect("root settles");
+}
+
+#[test]
+fn portable_driver_keeps_serving_after_a_future_panics() {
+    let driver = PortableDriver::new(PortableDriverConfig {
+        worker_count: 1,
+        task_capacity: 2,
+        polls_per_turn: 1,
+    })
+    .expect("portable driver starts");
+    let (panic_tx, panic_rx) = std::sync::mpsc::channel();
+    driver
+        .spawn(async move {
+            panic_tx.send(()).expect("test observes panic task entry");
+            panic!("fake driver task panic");
+        })
+        .expect("panic task accepted");
+    panic_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("panic task entered");
+
+    let (next_tx, next_rx) = std::sync::mpsc::channel();
+    driver
+        .spawn(async move {
+            next_tx.send(()).expect("next task completes");
+        })
+        .expect("driver still accepts tasks after a task panic");
+    assert!(
+        next_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_ok(),
+        "worker continues polling after one task panics"
+    );
 }
