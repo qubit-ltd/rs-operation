@@ -18,3 +18,4 @@ mod internal;
 pub mod context;
 pub mod protocol;
 pub mod report;
+pub mod resource;
