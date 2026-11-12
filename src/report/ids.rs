@@ -1,6 +1,5 @@
 use core::marker::PhantomData;
 
-/// Stable identifier for an operation in a supervisor.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// Stable identifier for an operation within its supervisor.
 pub struct OperationId(pub u128);
@@ -16,7 +15,6 @@ impl OperationId {
     }
 }
 
-/// Stable identifier for a resource registration, including its generation.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// Resource registration identity; slot reuse must increment `generation`.
 pub struct ResourceId {
@@ -39,8 +37,8 @@ impl ResourceId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// Identity of one monotonic clock domain.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ClockDomainId(pub u64);
 
 /// Opaque typed key for taking a resource's recovery owner exactly once.
@@ -76,12 +74,39 @@ impl<R> core::fmt::Debug for RecoveryKey<R> {
     }
 }
 
-/// Evidence that a cleanup owner was accepted by a new recovery owner.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 /// Evidence that a cleanup owner was accepted by a new recovery owner.
+///
+/// Callers can inspect receipts but cannot construct one before a receiving
+/// registry accepts responsibility.
+///
+/// ```compile_fail
+/// use qubit_operation::report::{ResourceId, OperationId, TransferReceipt};
+/// let resource = ResourceId::new(OperationId::new(1), 2, 3);
+/// let _ = TransferReceipt { resource, generation: 3 };
+/// ```
 pub struct TransferReceipt {
-    /// Resource whose responsibility was transferred.
-    pub resource: ResourceId,
-    /// Generation accepted by the receiving recovery registry.
-    pub generation: u32,
+    resource: ResourceId,
+    generation: u32,
+}
+
+impl TransferReceipt {
+    /// Create a receipt only after the receiving registry accepted responsibility.
+    #[allow(dead_code)] // Called by the recovery registry after accepting an owner.
+    pub(crate) const fn accepted_by_registry(resource: ResourceId) -> Self {
+        Self {
+            resource,
+            generation: resource.generation,
+        }
+    }
+
+    /// Return the resource whose responsibility was transferred.
+    pub const fn resource(self) -> ResourceId {
+        self.resource
+    }
+
+    /// Return the accepted resource generation.
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
 }

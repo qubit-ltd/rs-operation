@@ -48,6 +48,11 @@ pub enum CleanupOutcome {
 
 /// Opaque owned recovery payload. Taking it requires the original typed key.
 /// This object cannot be cloned or inspected through `Any`.
+///
+/// ```compile_fail
+/// use qubit_operation::report::{RecoveryOwner, RecoveryKey};
+/// let _ = RecoveryOwner::new::<String>(unreachable!(), String::new());
+/// ```
 pub struct RecoveryOwner {
     pub(crate) resource_id: ResourceId,
     pub(crate) nonce: u64,
@@ -56,7 +61,8 @@ pub struct RecoveryOwner {
 
 impl RecoveryOwner {
     /// Erase an owner behind the key issued for its resource registration.
-    pub fn new<R: Send + 'static>(key: &RecoveryKey<R>, value: R) -> Self {
+    #[allow(dead_code)] // Called by the recovery registry introduced with T08.
+    pub(crate) fn new<R: Send + 'static>(key: &RecoveryKey<R>, value: R) -> Self {
         Self {
             resource_id: key.resource_id(),
             nonce: key.nonce,
@@ -145,16 +151,25 @@ mod tests {
     #[test]
     fn recovery_key_must_match_resource_generation_and_nonce() {
         let id = ResourceId::new(OperationId::new(1), 4, 8);
-        let owner = RecoveryOwner {
-            resource_id: id,
-            nonce: 13,
-            value: Box::new(String::from("owned")),
-        };
+        let owner = RecoveryOwner::new(&RecoveryKey::<String>::new(id, 13), String::from("owned"));
         let wrong = RecoveryKey::<String>::new(ResourceId::new(OperationId::new(1), 4, 7), 13);
         let owner = owner.take(wrong).unwrap_err();
         let wrong = RecoveryKey::<String>::new(id, 12);
         let owner = owner.take(wrong).unwrap_err();
         let key = RecoveryKey::<String>::new(id, 13);
         assert_eq!(owner.take(key).unwrap(), "owned");
+    }
+
+    #[test]
+    fn recovery_key_must_match_the_erased_owner_type() {
+        let id = ResourceId::new(OperationId::new(2), 1, 3);
+        let owner = RecoveryOwner::new(&RecoveryKey::<String>::new(id, 21), String::from("owned"));
+        let wrong_type = RecoveryKey::<u64>::new(id, 21);
+
+        let owner = owner.take(wrong_type).unwrap_err();
+        assert_eq!(
+            owner.take(RecoveryKey::<String>::new(id, 21)).unwrap(),
+            "owned"
+        );
     }
 }

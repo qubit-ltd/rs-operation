@@ -8,7 +8,7 @@ crate root 由集成者声明 `pub mod protocol; pub mod report;`。报告类型
 
 报告包含：`OperationId(u128)`、由 operation/slot/generation 构成的 `ResourceId`、`ClockDomainId`、带时钟域的 `MonotonicTime`、受理与观察错误、保留未启动输入的 `StartError<F>`、泛型 `OperationOutcome<T, E>`、子操作/停止/副作用摘要、panic 摘要、清理失败与结果、不可变 `SettlementReport` 及资源状态快照。`DiagnosticSummary` 将每段诊断限制在 256 UTF-8 字节，并在字符边界截断。所有快照只存受控摘要和共享不可变数据，不接管业务 `T` 或 recovery owner。
 
-`RecoveryKey<R>` 构造器仅 crate 内可见；它绑定完整 `ResourceId`（含 generation）与单次 nonce。`RecoveryOwner` 不公开 `Any`、downcast 或原始 payload 访问；只有持有对应 `RecoveryKey<R>` 的 owner 能尝试取出 `R`。类型或 key 不匹配时 owner 原样归还。Recovery owner 与结算历史分开保存，`SettlementReport` 不因后续恢复操作而被回写。
+`RecoveryKey<R>` 构造器仅 crate 内可见；它绑定完整 `ResourceId`（含 generation）与单次 nonce。`RecoveryOwner` 只能由 crate 内恢复注册表构造，不公开 `Any`、downcast 或原始 payload 访问；只有持有对应 `RecoveryKey<R>` 的 owner 能尝试取出 `R`。类型或 key 不匹配时 owner 原样归还。`TransferReceipt` 的字段不可公开构造，只能在接收方接受责任后由注册表创建。Recovery owner 与结算历史分开保存，`SettlementReport` 不因后续恢复操作而被回写。
 
 ## 固定端口签名
 
@@ -36,7 +36,7 @@ pub trait OwnedCleanup: Send + 'static {
 
 `ClockSource` 产出的时间只在同一 `ClockDomainId` 内可比较。不同域的 deadline 必须显式换算，禁止比较 tick 数。`TimerRegistration::cancel(self: Box<Self>)` 只撤销该次注册，不能误删复用槽位上的新一代定时器。
 
-`OwnedCleanup` 接管 cleanup owner，Future 不借用业务栈，并必须返回 `Cleaned`、`Transferred(TransferReceipt)` 或 `FailedWithRecovery(CleanupFailure, RecoveryOwner)`。cleanup panic 的 recovery capsule 必须仍由 supervisor 的独立注册表持有；不得只把唯一 owner 移入可能 unwind 的 Future。不能提供独立 capsule 的适配器不能承诺 panic 后可恢复。
+`OwnedCleanup` 接管 cleanup owner，Future 不借用业务栈，并必须返回 `Cleaned`、`Transferred(TransferReceipt)` 或 `FailedWithRecovery(CleanupFailure, RecoveryOwner)`。T08 必须让外部 cleanup 适配器通过受控转交接口请求接收方注册表接纳 owner；只有接收方实际接纳后才能返回其签发的 `TransferReceipt`，适配器不能自行构造回执。cleanup panic 的 recovery capsule 必须仍由 supervisor 的独立注册表持有；不得只把唯一 owner 移入可能 unwind 的 Future。不能提供独立 capsule 的适配器不能承诺 panic 后可恢复。
 
 ## 状态与事实
 
