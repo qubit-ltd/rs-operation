@@ -3,7 +3,7 @@
 //! This module owns admission bookkeeping only. Operation execution and result
 //! observation are attached by the operation handle layer.
 
-use crate::context::{ContextError, DeadlineSignal, OperationContext};
+use crate::context::{ContextError, DeadlineSignal, OperationContext, StopSignal};
 use crate::report::{AdmissionError, StartError, SupervisorLimits};
 use core::future::Future;
 use core::pin::Pin;
@@ -23,7 +23,6 @@ struct State {
     queued: VecDeque<Weak<Mutex<LeaseState>>>,
     results: usize,
     cleanup_active: usize,
-    stop_requests: usize,
     waiters: Vec<(u64, Option<Waker>)>,
     next_waiter: u64,
 }
@@ -32,8 +31,8 @@ struct State {
 struct LeaseState {
     queued: bool,
     active: bool,
+    execution_released: bool,
     result_reserved: bool,
-    released: bool,
 }
 
 /// Application-owned bounded root operation admission service.
@@ -54,7 +53,6 @@ impl OperationSupervisor {
                     queued: VecDeque::new(),
                     results: 0,
                     cleanup_active: 0,
-                    stop_requests: 0,
                     waiters: Vec::new(),
                     next_waiter: 1,
                 }),
@@ -98,6 +96,7 @@ impl OperationSupervisor {
             inner: Arc::clone(&self.inner),
             lease,
             body: Some(body),
+            transferred: false,
         })
     }
 
@@ -127,13 +126,13 @@ impl OperationSupervisor {
         body: F,
         context: Option<OperationContext>,
     ) -> Result<AdmissionWait<F>, StartError<F>> {
-        if let Some(context) = &context {
-            if let Err(error) = context.admission_check() {
-                return Err(StartError::new(
-                    context_admission_error(context, error),
-                    body,
-                ));
-            }
+        if let Some(context) = &context
+            && let Err(error) = context.admission_check()
+        {
+            return Err(StartError::new(
+                context_admission_error(context, error),
+                body,
+            ));
         }
         let mut state = lock(&self.inner.state);
         let error = if state.closed {
@@ -154,12 +153,14 @@ impl OperationSupervisor {
         state.waiters.push((id, None));
         drop(state);
         let deadline_signal = context.as_ref().and_then(OperationContext::deadline_signal);
+        let stop_signal = context.as_ref().map(OperationContext::stop_signal);
         Ok(AdmissionWait {
             supervisor: self.clone(),
             waiter_id: id,
             body: Some(body),
             context,
             deadline_signal,
+            stop_signal,
             done: false,
         })
     }
@@ -187,17 +188,6 @@ impl OperationSupervisor {
     /// Number of reserved typed-result slots, including completed results.
     pub fn reserved_results(&self) -> usize {
         lock(&self.inner.state).results
-    }
-
-    /// Record a nonblocking stop control independently of business queue capacity.
-    pub fn request_stop(&self) {
-        let mut state = lock(&self.inner.state);
-        state.stop_requests = state.stop_requests.saturating_add(1);
-    }
-
-    /// Number of stop controls accepted by the independent control path.
-    pub fn stop_requests(&self) -> usize {
-        lock(&self.inner.state).stop_requests
     }
 
     /// Reserve a cleanup slot that does not consume business admission capacity.
@@ -240,6 +230,7 @@ pub struct RootAdmission<F> {
     inner: Arc<Inner>,
     lease: Arc<Mutex<LeaseState>>,
     body: Option<F>,
+    transferred: bool,
 }
 
 impl<F> RootAdmission<F> {
@@ -248,44 +239,28 @@ impl<F> RootAdmission<F> {
         lock(&self.lease).queued
     }
 
-    /// Complete execution capacity while keeping its result slot reserved.
-    pub fn complete(&mut self) {
-        let waiters = {
-            let mut state = lock(&self.inner.state);
-            let mut lease = lock(&self.lease);
-            if lease.released || !lease.active {
-                return;
-            }
-            lease.active = false;
-            state.active = state.active.saturating_sub(1);
-            promote_one(&mut state, self.inner.limits.active_roots);
-            take_waiter_wakers(&mut state)
-        };
-        wake(waiters);
-    }
-
-    /// Release the result slot after its result was taken or explicitly discarded.
-    pub fn take_result_slot(&mut self) {
-        let waiters = {
-            let mut state = lock(&self.inner.state);
-            let mut lease = lock(&self.lease);
-            if lease.result_reserved {
-                lease.result_reserved = false;
-                state.results = state.results.saturating_sub(1);
-            }
-            take_waiter_wakers(&mut state)
-        };
-        wake(waiters);
-    }
-
-    /// Move the still-unstarted body to its driver while retaining admission leases.
-    pub fn take_body(&mut self) -> Option<F> {
-        self.body.take()
-    }
-
-    /// Return the still-unstarted body and release this admission reservation.
-    pub fn into_body(mut self) -> F {
-        self.body.take().expect("body is present until consumed")
+    /// Transfer an accepted body and its independent execution/result leases to the coordinator.
+    ///
+    /// This is crate-private until the operation handle layer can bind both leases to
+    /// the actual task and result registry. Dropping this reservation after transfer
+    /// cannot release either lease.
+    pub(crate) fn transfer(&mut self) -> Option<AdmittedTask<F>> {
+        if self.transferred {
+            return None;
+        }
+        let body = self.body.take()?;
+        self.transferred = true;
+        Some(AdmittedTask {
+            body,
+            execution: Some(TaskLease {
+                inner: Arc::clone(&self.inner),
+                lease: Arc::clone(&self.lease),
+            }),
+            result: Some(ResultLease {
+                inner: Arc::clone(&self.inner),
+                lease: Arc::clone(&self.lease),
+            }),
+        })
     }
 }
 
@@ -293,40 +268,138 @@ impl<F> fmt::Debug for RootAdmission<F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RootAdmission")
             .field("queued", &self.is_queued())
+            .field("transferred", &self.transferred)
             .finish_non_exhaustive()
     }
 }
 
 impl<F> Drop for RootAdmission<F> {
     fn drop(&mut self) {
-        let waiters = {
-            let mut state = lock(&self.inner.state);
-            let mut lease = lock(&self.lease);
-            if lease.released {
-                return;
-            }
-            lease.released = true;
-            if lease.active {
-                lease.active = false;
+        if self.transferred {
+            return;
+        }
+        release_all(&self.inner, &self.lease);
+    }
+}
+
+/// Body transferred to a driver with separately owned lifecycle leases.
+pub(crate) struct AdmittedTask<F> {
+    body: F,
+    execution: Option<TaskLease>,
+    result: Option<ResultLease>,
+}
+
+impl<F> AdmittedTask<F> {
+    pub(crate) fn into_parts(mut self) -> (F, TaskLease, ResultLease) {
+        (
+            self.body,
+            self.execution.take().expect("execution lease exists"),
+            self.result.take().expect("result lease exists"),
+        )
+    }
+}
+
+/// Capacity token retained by the running task until it finishes or is dropped.
+pub(crate) struct TaskLease {
+    inner: Arc<Inner>,
+    lease: Arc<Mutex<LeaseState>>,
+}
+
+impl TaskLease {
+    /// Mark task completion and release execution capacity.
+    pub(crate) fn complete(self) {}
+}
+
+impl Drop for TaskLease {
+    fn drop(&mut self) {
+        release_execution(&self.inner, &self.lease);
+    }
+}
+
+/// Capacity token retained with a result until it is observed or discarded.
+pub(crate) struct ResultLease {
+    inner: Arc<Inner>,
+    lease: Arc<Mutex<LeaseState>>,
+}
+
+impl ResultLease {
+    /// Release this slot after the result is taken or explicitly discarded.
+    pub(crate) fn observe(self) {}
+}
+
+impl Drop for ResultLease {
+    fn drop(&mut self) {
+        release_result(&self.inner, &self.lease);
+    }
+}
+
+fn release_execution(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
+    let waiters = {
+        let mut state = lock(&inner.state);
+        let mut lease_state = lock(lease);
+        if lease_state.execution_released {
+            return;
+        }
+        lease_state.execution_released = true;
+        if lease_state.active {
+            lease_state.active = false;
+            state.active = state.active.saturating_sub(1);
+            promote_one(&mut state, inner.limits.active_roots);
+        }
+        if lease_state.queued {
+            lease_state.queued = false;
+            state.queued.retain(|entry| {
+                entry
+                    .upgrade()
+                    .is_some_and(|candidate| !Arc::ptr_eq(&candidate, lease))
+            });
+        }
+        take_waiter_wakers(&mut state)
+    };
+    wake(waiters);
+}
+
+fn release_result(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
+    let waiters = {
+        let mut state = lock(&inner.state);
+        let mut lease_state = lock(lease);
+        if !lease_state.result_reserved {
+            return;
+        }
+        lease_state.result_reserved = false;
+        state.results = state.results.saturating_sub(1);
+        take_waiter_wakers(&mut state)
+    };
+    wake(waiters);
+}
+
+fn release_all(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
+    let waiters = {
+        let mut state = lock(&inner.state);
+        let mut lease_state = lock(lease);
+        if !lease_state.execution_released {
+            lease_state.execution_released = true;
+            if lease_state.active {
+                lease_state.active = false;
                 state.active = state.active.saturating_sub(1);
-                promote_one(&mut state, self.inner.limits.active_roots);
+                promote_one(&mut state, inner.limits.active_roots);
             }
-            if lease.queued {
-                lease.queued = false;
+            if lease_state.queued {
+                lease_state.queued = false;
                 state.queued.retain(|entry| {
                     entry
                         .upgrade()
-                        .is_some_and(|candidate| !Arc::ptr_eq(&candidate, &self.lease))
+                        .is_some_and(|candidate| !Arc::ptr_eq(&candidate, lease))
                 });
             }
-            if lease.result_reserved {
-                lease.result_reserved = false;
-                state.results = state.results.saturating_sub(1);
-            }
-            take_waiter_wakers(&mut state)
-        };
-        wake(waiters);
-    }
+        }
+        if lease_state.result_reserved {
+            lease_state.result_reserved = false;
+            state.results = state.results.saturating_sub(1);
+        }
+        take_waiter_wakers(&mut state)
+    };
+    wake(waiters);
 }
 
 /// A bounded waiter for root admission. Dropping it removes its registration;
@@ -337,6 +410,7 @@ pub struct AdmissionWait<F> {
     body: Option<F>,
     context: Option<OperationContext>,
     deadline_signal: Option<DeadlineSignal>,
+    stop_signal: Option<StopSignal>,
     done: bool,
 }
 
@@ -358,14 +432,48 @@ impl<F> Future for AdmissionWait<F> {
         if this.done {
             panic!("admission waiter polled after completion");
         }
-        if let Some(context) = &this.context {
-            if let Some(signal) = &mut this.deadline_signal {
-                if Pin::new(signal).poll(cx).is_ready() {
-                    let error =
-                        StartError::new(AdmissionError::DeadlineExpired, this.body.take().unwrap());
+        if let Some(signal) = &mut this.stop_signal {
+            match Pin::new(signal).poll(cx) {
+                Poll::Ready(Ok(reason)) => {
+                    let error = if reason == crate::report::StopReason::Timeout {
+                        AdmissionError::DeadlineExpired
+                    } else {
+                        AdmissionError::Stopped
+                    };
+                    let error = StartError::new(error, this.body.take().expect("body retained"));
                     this.unregister();
                     return Poll::Ready(Err(error));
                 }
+                Poll::Ready(Err(ContextError::WaiterCapacityExceeded)) => {
+                    let error = StartError::new(
+                        AdmissionError::Busy,
+                        this.body.take().expect("body retained"),
+                    );
+                    this.unregister();
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Ready(Err(error)) => {
+                    let error = StartError::new(
+                        context_admission_error(
+                            this.context.as_ref().expect("signal has context"),
+                            error,
+                        ),
+                        this.body.take().expect("body retained"),
+                    );
+                    this.unregister();
+                    return Poll::Ready(Err(error));
+                }
+                Poll::Pending => {}
+            }
+        }
+        if let Some(context) = &this.context {
+            if let Some(signal) = &mut this.deadline_signal
+                && Pin::new(signal).poll(cx).is_ready()
+            {
+                let error =
+                    StartError::new(AdmissionError::DeadlineExpired, this.body.take().unwrap());
+                this.unregister();
+                return Poll::Ready(Err(error));
             }
             if let Err(error) = context.admission_check() {
                 let error = StartError::new(
@@ -415,16 +523,25 @@ impl<F> Future for AdmissionWait<F> {
 
 impl<F> AdmissionWait<F> {
     fn register_waker(&self, waker: &Waker) {
-        let mut state = lock(&self.supervisor.inner.state);
-        if let Some((_, registered)) = state
-            .waiters
-            .iter_mut()
-            .find(|(id, _)| *id == self.waiter_id)
-        {
-            if registered.as_ref().is_none_or(|old| !old.will_wake(waker)) {
-                *registered = Some(waker.clone());
-            }
-        }
+        let mut replacement = Some(waker.clone());
+        let replaced = {
+            let mut state = lock(&self.supervisor.inner.state);
+            state
+                .waiters
+                .iter_mut()
+                .find(|(id, _)| *id == self.waiter_id)
+                .and_then(|(_, registered)| {
+                    if registered.as_ref().is_some_and(|old| {
+                        old.will_wake(replacement.as_ref().expect("waker cloned"))
+                    }) {
+                        None
+                    } else {
+                        registered.replace(replacement.take().expect("waker cloned"))
+                    }
+                })
+        };
+        drop(replaced);
+        drop(replacement);
     }
 
     fn unregister(&mut self) {
@@ -432,9 +549,17 @@ impl<F> AdmissionWait<F> {
             return;
         }
         self.done = true;
-        lock(&self.supervisor.inner.state)
-            .waiters
-            .retain(|(id, _)| *id != self.waiter_id);
+        let removed = {
+            let mut state = lock(&self.supervisor.inner.state);
+            state
+                .waiters
+                .iter()
+                .position(|(id, _)| *id == self.waiter_id)
+                .map(|index| state.waiters.swap_remove(index).1)
+        };
+        drop(removed);
+        self.deadline_signal.take();
+        self.stop_signal.take();
     }
 }
 
@@ -452,8 +577,9 @@ fn context_admission_error(context: &OperationContext, error: ContextError) -> A
         {
             AdmissionError::DeadlineExpired
         }
-        ContextError::Stopped => AdmissionError::Closed,
+        ContextError::Stopped => AdmissionError::Stopped,
         ContextError::BudgetUnavailable => AdmissionError::ReservationLimit,
+        ContextError::WaiterCapacityExceeded => AdmissionError::Busy,
         ContextError::ClockUnavailable | ContextError::ClockDomainMismatch => {
             AdmissionError::DriverUnavailable
         }
@@ -483,7 +609,7 @@ fn promote_one(state: &mut State, active_limit: usize) {
             continue;
         };
         let mut lease = lock(&next);
-        if lease.released || !lease.queued {
+        if lease.execution_released || !lease.queued {
             continue;
         }
         lease.queued = false;
@@ -521,18 +647,23 @@ mod tests {
     #[test]
     fn root_and_result_capacity_are_reserved_and_released_separately() {
         let supervisor = OperationSupervisor::new(limits(1, 1, 2));
-        let mut active = supervisor.try_admit().unwrap();
-        let mut queued = supervisor.try_admit().unwrap();
+        let active = supervisor.try_admit().unwrap();
+        let queued = supervisor.try_admit().unwrap();
         assert!(queued.is_queued());
         assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Busy);
 
-        active.complete();
+        drop(active);
         assert_eq!(supervisor.active_roots(), 1);
         assert_eq!(supervisor.queued_roots(), 0);
+        let replacement = supervisor.try_admit().unwrap();
+        assert!(replacement.is_queued());
         assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Busy);
 
-        queued.take_result_slot();
-        assert_eq!(supervisor.reserved_results(), 1);
+        drop(queued);
+        assert_eq!(supervisor.active_roots(), 1);
+        drop(replacement);
+        assert_eq!(supervisor.active_roots(), 0);
+        assert_eq!(supervisor.reserved_results(), 0);
         assert!(supervisor.try_admit().is_ok());
     }
 
@@ -601,22 +732,31 @@ mod tests {
     #[test]
     fn result_slot_limit_is_one_shot_and_released_separately() {
         let supervisor = OperationSupervisor::new(limits(1, 0, 1));
-        let mut first = supervisor.try_admit().unwrap();
+        let mut first = supervisor.try_admit_body(String::from("body")).unwrap();
+        let work = first.transfer().unwrap();
+        drop(first);
+        let (body, task_lease, result_lease) = work.into_parts();
+        assert_eq!(body, "body");
+        assert_eq!(supervisor.active_roots(), 1);
+        assert_eq!(supervisor.reserved_results(), 1);
         assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Busy);
-        first.take_result_slot();
+
+        task_lease.complete();
+        assert_eq!(supervisor.active_roots(), 0);
+        assert_eq!(supervisor.reserved_results(), 1);
+        assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Busy);
+
+        result_lease.observe();
         assert_eq!(supervisor.reserved_results(), 0);
-        first.complete();
         assert!(supervisor.try_admit().is_ok());
     }
 
     #[test]
-    fn stop_and_cleanup_paths_remain_available_when_business_admission_is_full() {
+    fn cleanup_capacity_remains_available_when_business_admission_is_full() {
         let supervisor = OperationSupervisor::new(limits(1, 0, 1));
         let _root = supervisor.try_admit().unwrap();
         assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Busy);
-        supervisor.request_stop();
         let _cleanup = supervisor.try_reserve_cleanup().unwrap();
-        assert_eq!(supervisor.stop_requests(), 1);
         assert_eq!(supervisor.cleanup_active(), 1);
     }
 
@@ -661,5 +801,131 @@ mod tests {
         let supervisor = OperationSupervisor::new(limits(0, 1, 1));
         supervisor.close();
         assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Closed);
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    use crate::report::SupervisorLimits;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn dropping_admission_handle_does_not_release_transferred_running_body_quota() {
+        let supervisor = OperationSupervisor::new(SupervisorLimits {
+            active_roots: 1,
+            queued_roots: 0,
+            unobserved_results: 1,
+            ..SupervisorLimits::default()
+        });
+        let runs = Arc::new(AtomicUsize::new(0));
+        let body_runs = Arc::clone(&runs);
+        let mut admission = supervisor
+            .try_admit_body(move || body_runs.fetch_add(1, Ordering::SeqCst))
+            .unwrap();
+        let work = admission.transfer().unwrap();
+        let (body, execution, result) = work.into_parts();
+        drop(admission);
+
+        assert_eq!(body(), 0);
+        assert_eq!(supervisor.active_roots(), 1);
+        assert_eq!(supervisor.reserved_results(), 1);
+        assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Busy);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        execution.complete();
+        assert_eq!(supervisor.active_roots(), 0);
+        assert_eq!(supervisor.reserved_results(), 1);
+        assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Busy);
+        result.observe();
+        assert_eq!(supervisor.reserved_results(), 0);
+    }
+}
+
+#[cfg(test)]
+mod reentrant_waker_regression {
+    use super::*;
+    use core::task::{Context, RawWaker, RawWakerVTable, Waker};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct Probe {
+        supervisor: OperationSupervisor,
+        lock_timeouts: Arc<AtomicUsize>,
+    }
+
+    fn check_reentry(probe: &Probe) {
+        let supervisor = probe.supervisor.clone();
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = supervisor.active_roots();
+            let _ = send.send(());
+        });
+        if receive.recv_timeout(Duration::from_millis(100)).is_err() {
+            probe.lock_timeouts.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    unsafe fn clone_waker(data: *const ()) -> RawWaker {
+        let probe = unsafe { Arc::<Probe>::from_raw(data.cast()) };
+        check_reentry(&probe);
+        let clone = Arc::clone(&probe);
+        std::mem::forget(probe);
+        RawWaker::new(Arc::into_raw(clone).cast(), &VTABLE)
+    }
+
+    unsafe fn wake_waker(data: *const ()) {
+        unsafe { drop_waker(data) };
+    }
+
+    unsafe fn wake_by_ref(data: *const ()) {
+        let probe = unsafe { &*data.cast::<Probe>() };
+        check_reentry(probe);
+    }
+
+    unsafe fn drop_waker(data: *const ()) {
+        let probe = unsafe { Arc::<Probe>::from_raw(data.cast()) };
+        check_reentry(&probe);
+        drop(probe);
+    }
+
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref, drop_waker);
+
+    fn reentrant_waker(
+        supervisor: &OperationSupervisor,
+        lock_timeouts: &Arc<AtomicUsize>,
+    ) -> Waker {
+        let probe = Arc::new(Probe {
+            supervisor: supervisor.clone(),
+            lock_timeouts: Arc::clone(lock_timeouts),
+        });
+        let raw = RawWaker::new(Arc::into_raw(probe).cast(), &VTABLE);
+        unsafe { Waker::from_raw(raw) }
+    }
+
+    #[test]
+    fn raw_waker_clone_replacement_and_removal_can_reenter_without_lock() {
+        let supervisor = OperationSupervisor::new(SupervisorLimits {
+            active_roots: 0,
+            queued_roots: 0,
+            unobserved_results: 1,
+            ..SupervisorLimits::default()
+        });
+        let lock_timeouts = Arc::new(AtomicUsize::new(0));
+        let first_waker = reentrant_waker(&supervisor, &lock_timeouts);
+        let second_waker = reentrant_waker(&supervisor, &lock_timeouts);
+        let mut first_cx = Context::from_waker(&first_waker);
+        let mut second_cx = Context::from_waker(&second_waker);
+        let mut waiter = Box::pin(supervisor.start_wait_body(()).unwrap());
+        assert!(matches!(waiter.as_mut().poll(&mut first_cx), Poll::Pending));
+        // Different RawWaker data forces a replacement and destruction of the old waker.
+        assert!(matches!(
+            waiter.as_mut().poll(&mut second_cx),
+            Poll::Pending
+        ));
+        drop(waiter);
+        assert_eq!(lock_timeouts.load(Ordering::SeqCst), 0);
     }
 }

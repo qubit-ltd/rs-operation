@@ -13,18 +13,23 @@ fn limits(active_roots: usize, queued_roots: usize, unobserved_results: usize) -
 #[test]
 fn root_capacity_and_result_reservations_are_released_independently() {
     let supervisor = OperationSupervisor::new(limits(1, 1, 2));
-    let mut active = supervisor.try_admit().unwrap();
-    let mut queued = supervisor.try_admit().unwrap();
+    let active = supervisor.try_admit().unwrap();
+    let queued = supervisor.try_admit().unwrap();
     assert!(queued.is_queued());
     assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Busy);
 
-    active.complete();
+    drop(active);
     assert_eq!(supervisor.active_roots(), 1);
     assert_eq!(supervisor.queued_roots(), 0);
+    let replacement = supervisor.try_admit().unwrap();
+    assert!(replacement.is_queued());
     assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Busy);
 
-    queued.take_result_slot();
-    assert_eq!(supervisor.reserved_results(), 1);
+    drop(queued);
+    assert_eq!(supervisor.active_roots(), 1);
+    drop(replacement);
+    assert_eq!(supervisor.active_roots(), 0);
+    assert_eq!(supervisor.reserved_results(), 0);
     assert!(supervisor.try_admit().is_ok());
 }
 
@@ -118,7 +123,7 @@ fn admission_waiter_drop_unregisters_and_close_returns_its_body() {
 }
 
 #[test]
-fn business_capacity_does_not_consume_stop_or_cleanup_capacity() {
+fn business_capacity_does_not_consume_cleanup_capacity() {
     let supervisor = OperationSupervisor::new(SupervisorLimits {
         active_roots: 1,
         queued_roots: 0,
@@ -128,9 +133,7 @@ fn business_capacity_does_not_consume_stop_or_cleanup_capacity() {
     });
     let _root = supervisor.try_admit().unwrap();
     assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Busy);
-    supervisor.request_stop();
     let _cleanup = supervisor.try_reserve_cleanup().unwrap();
-    assert_eq!(supervisor.stop_requests(), 1);
     assert_eq!(supervisor.cleanup_active(), 1);
 }
 
@@ -247,4 +250,54 @@ fn admission_wait_deadline_returns_expired_error_and_unstarted_body() {
     }
     assert_eq!(supervisor.queued_roots(), 0);
     assert_eq!(supervisor.reserved_results(), 0);
+}
+
+#[test]
+fn context_stop_wakes_pending_admission_waiter_and_returns_body() {
+    use core::future::Future;
+    use core::pin::Pin;
+    use qubit_operation::context::{ContextOptions, OperationContext};
+    use qubit_operation::report::StopReason;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+    struct CountWake(Arc<AtomicUsize>);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let supervisor = OperationSupervisor::new(SupervisorLimits {
+        active_roots: 0,
+        queued_roots: 0,
+        unobserved_results: 1,
+        admission_waiters: 1,
+        ..SupervisorLimits::default()
+    });
+    let operation_context = OperationContext::new(ContextOptions::default());
+    let mut waiter = Box::pin(
+        supervisor
+            .start_wait_body_with_context(String::from("body"), Some(operation_context.clone()))
+            .unwrap(),
+    );
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(
+        Pin::as_mut(&mut waiter).poll(&mut cx),
+        Poll::Pending
+    ));
+    assert!(operation_context.request_stop(StopReason::UserCancelled));
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    match Pin::as_mut(&mut waiter).poll(&mut cx) {
+        Poll::Ready(Err(error)) => {
+            assert_eq!(error.reason(), AdmissionError::Stopped);
+            assert_eq!(error.into_body(), "body");
+        }
+        other => panic!("expected stop rejection, got {other:?}"),
+    }
+    assert_eq!(supervisor.reserved_results(), 0);
+    let second_waiter = supervisor.start_wait_body("capacity returned").unwrap();
+    drop(second_waiter);
 }

@@ -308,3 +308,37 @@ fn cleanup_context_does_not_inherit_business_cancellation_or_deadline() {
     assert_eq!(cleanup.deadline(), None);
     assert_eq!(cleanup.admission_check(), Ok(()));
 }
+
+#[test]
+fn stop_signal_waiters_are_bounded_and_reclaimed_on_drop() {
+    let operation = OperationContext::new(ContextOptions::default());
+    let waker = Waker::from(Arc::new(CountingWake(Arc::new(AtomicUsize::new(0)))));
+    let mut task_context = Context::from_waker(&waker);
+    let mut signals = (0..64)
+        .map(|_| Box::pin(operation.stop_signal()))
+        .collect::<Vec<_>>();
+    for signal in &mut signals {
+        assert!(matches!(
+            signal.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
+    }
+
+    let mut excess = Box::pin(operation.stop_signal());
+    assert!(matches!(
+        excess.as_mut().poll(&mut task_context),
+        Poll::Ready(Err(ContextError::WaiterCapacityExceeded))
+    ));
+
+    drop(signals.pop());
+    let mut replacement = Box::pin(operation.stop_signal());
+    assert!(matches!(
+        replacement.as_mut().poll(&mut task_context),
+        Poll::Pending
+    ));
+    operation.request_stop(StopReason::UserCancelled);
+    assert!(matches!(
+        replacement.as_mut().poll(&mut task_context),
+        Poll::Ready(Ok(StopReason::UserCancelled))
+    ));
+}

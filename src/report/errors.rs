@@ -8,6 +8,8 @@ pub enum AdmissionError {
     Busy,
     /// New work is no longer accepted.
     Closed,
+    /// The operation context has received a stop request.
+    Stopped,
     /// The operation deadline elapsed before admission.
     DeadlineExpired,
     /// A finite child/resource registration budget is exhausted.
@@ -21,6 +23,7 @@ impl fmt::Display for AdmissionError {
         f.write_str(match self {
             Self::Busy => "operation capacity is busy",
             Self::Closed => "operation supervisor is closed",
+            Self::Stopped => "operation context has been stopped",
             Self::DeadlineExpired => "operation deadline has expired",
             Self::ReservationLimit => "operation reservation limit reached",
             Self::DriverUnavailable => "operation driver is unavailable",

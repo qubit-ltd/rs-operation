@@ -8,7 +8,10 @@ pub use deadline::{ClockDomainMismatch, Deadline, DeadlineSignal};
 use crate::protocol::{ClockSource, StopReason};
 use crate::report::MonotonicTime;
 use core::fmt;
+use core::future::Future;
+use core::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll, Waker};
 
 /// A borrowed policy reference for a caller-owned finite budget.
 ///
@@ -78,6 +81,8 @@ pub enum ContextError {
     DeadlineExpired,
     /// The caller-owned budget lease rejected work.
     BudgetUnavailable,
+    /// The finite cancellation waiter table is full.
+    WaiterCapacityExceeded,
 }
 
 impl fmt::Display for ContextError {
@@ -88,15 +93,20 @@ impl fmt::Display for ContextError {
             Self::Stopped => "operation context has been stopped",
             Self::DeadlineExpired => "operation deadline has expired",
             Self::BudgetUnavailable => "operation budget lease is unavailable",
+            Self::WaiterCapacityExceeded => "operation context waiter capacity is full",
         })
     }
 }
 
 impl std::error::Error for ContextError {}
 
+const STOP_WAITER_CAPACITY: usize = 64;
+
 struct NodeState {
     stop_reason: Option<StopReason>,
     children: Vec<Weak<Node>>,
+    stop_waiters: Vec<(u64, Waker)>,
+    next_waiter: u64,
 }
 
 struct Node {
@@ -109,12 +119,14 @@ impl Node {
             state: Mutex::new(NodeState {
                 stop_reason: None,
                 children: Vec::new(),
+                stop_waiters: Vec::new(),
+                next_waiter: 1,
             }),
         })
     }
 
     fn request_stop(&self, reason: StopReason) -> bool {
-        let children = {
+        let (children, waiters) = {
             let Ok(mut state) = self.state.lock() else {
                 return false;
             };
@@ -123,12 +135,16 @@ impl Node {
             }
             state.stop_reason = Some(reason);
             state.children.retain(|child| child.strong_count() > 0);
-            state
+            let children = state
                 .children
                 .iter()
                 .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (children, std::mem::take(&mut state.stop_waiters))
         };
+        for waker in waiters.into_iter().map(|(_, waker)| waker) {
+            waker.wake();
+        }
         for child in children {
             child.request_stop(StopReason::ParentStopped);
         }
@@ -212,6 +228,15 @@ impl OperationContext {
         self.node.stop_reason()
     }
 
+    /// Observe the first stop request asynchronously. The node retains at most 64 waiters.
+    pub fn stop_signal(&self) -> StopSignal {
+        StopSignal {
+            node: Arc::clone(&self.node),
+            waiter_id: None,
+            completed: false,
+        }
+    }
+
     /// Return the effective absolute deadline inherited by this context.
     pub const fn deadline(&self) -> Option<Deadline> {
         self.deadline
@@ -260,6 +285,102 @@ impl OperationContext {
             Arc::downgrade(&self.node),
         ))
     }
+}
+
+/// Future that resolves with this context's first stop reason.
+pub struct StopSignal {
+    node: Arc<Node>,
+    waiter_id: Option<u64>,
+    completed: bool,
+}
+
+impl Unpin for StopSignal {}
+
+impl Future for StopSignal {
+    type Output = Result<StopReason, ContextError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.completed {
+            panic!("stop signal polled after completion");
+        }
+        let replacement = cx.waker().clone();
+        let (result, old_waker, unused_waker) = {
+            let mut state = lock(&this.node.state);
+            if let Some(reason) = state.stop_reason {
+                let old_waker = this
+                    .waiter_id
+                    .take()
+                    .and_then(|id| {
+                        state
+                            .stop_waiters
+                            .iter()
+                            .position(|(candidate, _)| *candidate == id)
+                    })
+                    .map(|index| state.stop_waiters.swap_remove(index).1);
+                (Some(Ok(reason)), old_waker, Some(replacement))
+            } else if let Some(id) = this.waiter_id {
+                let Some((_, stored)) = state
+                    .stop_waiters
+                    .iter_mut()
+                    .find(|(candidate, _)| *candidate == id)
+                else {
+                    this.completed = true;
+                    return Poll::Ready(Err(ContextError::Stopped));
+                };
+                if stored.will_wake(&replacement) {
+                    (None, None, Some(replacement))
+                } else {
+                    (None, Some(std::mem::replace(stored, replacement)), None)
+                }
+            } else if state.stop_waiters.len() >= STOP_WAITER_CAPACITY {
+                this.completed = true;
+                (
+                    Some(Err(ContextError::WaiterCapacityExceeded)),
+                    None,
+                    Some(replacement),
+                )
+            } else {
+                let id = state.next_waiter;
+                let Some(next) = id.checked_add(1) else {
+                    this.completed = true;
+                    return Poll::Ready(Err(ContextError::WaiterCapacityExceeded));
+                };
+                state.next_waiter = next;
+                state.stop_waiters.push((id, replacement));
+                this.waiter_id = Some(id);
+                (None, None, None)
+            }
+        };
+        drop(old_waker);
+        drop(unused_waker);
+        if let Some(result) = result {
+            this.completed = true;
+            Poll::Ready(result)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for StopSignal {
+    fn drop(&mut self) {
+        let removed = self.waiter_id.take().and_then(|id| {
+            let mut state = lock(&self.node.state);
+            state
+                .stop_waiters
+                .iter()
+                .position(|(candidate, _)| *candidate == id)
+                .map(|index| state.stop_waiters.swap_remove(index).1)
+        });
+        drop(removed);
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn validate_clock(
