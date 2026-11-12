@@ -12,8 +12,9 @@ mod portable_shared;
 mod portable_state;
 #[path = "portable_task.rs"]
 mod portable_task;
-#[path = "portable_wake.rs"]
-mod portable_wake;
+// Waker implementation that schedules the corresponding portable task.
+#[path = "portable_task_wake.rs"]
+mod portable_task_wake;
 #[path = "portable_worker.rs"]
 mod portable_worker;
 #[path = "thread_job.rs"]
@@ -28,7 +29,7 @@ mod thread_worker;
 pub use portable_shared::PortableShared;
 pub use portable_state::PortableState;
 pub use portable_task::PortableTask;
-pub use portable_wake::PortableTaskWake;
+pub use portable_task_wake::PortableTaskWake;
 pub use portable_worker::close_portable;
 pub use portable_worker::is_portable_worker_thread;
 pub use portable_worker::portable_worker_loop;

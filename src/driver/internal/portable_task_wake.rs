@@ -15,11 +15,14 @@ use super::schedule_portable_task;
 
 /// Waker that requeues one registered task at most once.
 pub struct PortableTaskWake {
+    /// Weak reference to shared portable-driver state.
     pub shared: Weak<PortableShared>,
+    /// Identifier of the task to schedule when this waker fires.
     pub id: u64,
 }
 
 impl Wake for PortableTaskWake {
+    #[inline]
     fn wake(self: Arc<Self>) {
         self.wake_by_ref();
     }
