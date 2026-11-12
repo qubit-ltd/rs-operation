@@ -10,4 +10,10 @@
 //!
 //! Foundation for managed operation lifecycles and composition.
 //!
-//! This crate is an initial scaffold. The operation APIs are not implemented.
+//! The crate currently exposes lifecycle protocol and report types. Managed
+//! operation execution and composition are being built on these foundations.
+
+mod internal;
+
+pub mod protocol;
+pub mod report;
