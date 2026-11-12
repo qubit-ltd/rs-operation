@@ -7,34 +7,66 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![English](https://img.shields.io/badge/docs-English-blue.svg)](README.md)
 
-为 Rust 程序设计的操作生命周期与组合机制。目前仓库仅完成初始化，尚未实现公共操作 API，也未发布到 crates.io；上方徽章不代表已有发布或覆盖率结果。
+`qubit-operation` 为 Rust 应用提供有界 supervisor，用来管理自有且满足 `Send + 'static` 的任务。业务结果与子任务完成、资源结算可以分别观察，适合需要协作取消、同时又必须确认资源何时真正释放的处理流程。
 
-## 为什么需要这个项目
+## 安装
 
-下载文件、运行转换程序、上传结果这类任务往往涉及多个操作。失败或取消之后，应用仍要等待进程停止访问临时文件，再执行清理，并区分业务结果已确定和资源已释放。项目计划统一这些生命周期规则，同时支持同步与异步调用。
+若从本仓库 checkout 使用，可在应用中添加本地 crate：
 
-## 开发入门
-
-当前可以构建空库并生成 API 文档；暂时没有可调用的生命周期 API 示例。
-
-```bash
-cargo test --locked
-cargo doc --no-deps --locked
+```toml
+[dependencies]
+qubit-operation = { path = "../rs-operation" }
 ```
 
-## 当前状态
+本 crate 面向 Rust 1.94，没有默认 feature，也没有运行时依赖。Crates.io 徽章显示的是 registry 状态；使用尚未发布的 checkout 时请采用 path 依赖。
 
-仅提供 Rust crate 骨架、Apache-2.0 许可证及受管理的共享基础设施。取消、操作作用域、资源依赖和后台收尾均为待设计实现的能力。
+## 快速开始
 
-当前空库没有可执行代码的覆盖率数据，因此完整 CI 的覆盖率任务会失败，依赖它的 Pages 部署也无法完成。待实现可执行逻辑后再验证覆盖率；初始化阶段不添加占位 API 或虚构覆盖率测试。
+下面的流程提交一个自有任务，读取业务结果，再等待资源结算。实际应用可在任务中执行下载、转换和发布；创建受管理资源时，应通过传入的 scope 登记对应清理责任。
+
+```rust,no_run
+use qubit_operation::report::{OperationOutcome, SupervisorLimits};
+use qubit_operation::scope::ScopeOptions;
+use qubit_operation::supervisor::{OperationSupervisor, ShutdownMode};
+use std::time::Duration;
+
+let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+let mut operation = supervisor.start(ScopeOptions::default(), |_scope| async {
+    Ok::<_, &'static str>("artifact-42")
+})?;
+match operation.result_blocking()? {
+    OperationOutcome::Succeeded(id) => println!("发布完成：{id}"),
+    other => println!("任务结果：{other:?}"),
+}
+let settlement = operation.released_blocking()?;
+println!("资源阶段：{:?}", settlement.resource_phase);
+let shutdown = supervisor.shutdown_blocking(ShutdownMode::Drain, Duration::from_secs(1));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+业务结果说明任务做成了什么；结算报告说明受管理的子任务和资源是否到达终态。取消只是请求任务配合停止，不能据此认定阻塞调用或 native 调用已经返回。可以运行[同步示例](examples/sync_pipeline.rs)、[异步示例](examples/async_pipeline.rs)和[取消示例](examples/inference_cancel.rs)。
+
+## 提供的能力
+
+- 有限的 root 准入容量，以及每个 scope 的子任务和资源登记上限。
+- 一次性读取类型化业务结果，并重复查看最终结算报告。
+- 结构化子 scope、资源使用租约、清理依赖和类型化恢复 owner。
+- 同一生命周期的同步观察与异步等待。
+- 由应用显式持有、支持 Drain 或 Cancel 关闭的 supervisor。
+
+本库不提供分布式恢复、强制终止、业务重试或补偿、进度/事件总线集成，也没有正式 Tokio 适配器。`PortableDriver` 驱动可移植的自有 Future；绑定运行时的 Future 需要应用在对应运行时中接入合适的 `ExternalDriver`。不要在异步运行时工作线程上调用阻塞观察接口。
+
+## 延伸阅读
+
+- [中文用户指南](doc/user_guide.zh_CN.md)与[适配器接入指南](doc/adapter-guide.zh_CN.md)
+- [API 文档](https://docs.rs/qubit-operation)
+- [English README](README.md)
 
 ## 测试
 
 ```bash
-./update-infra.sh --check
-./.infra/bin/align-ci.sh
-./.infra/bin/ci-check.sh
-./.infra/bin/coverage.sh
+cargo check --examples --locked
+cargo test --locked
 ```
 
 ## 许可证
@@ -45,7 +77,7 @@ Copyright (c) 2026. Haixing Hu. All rights reserved.
 
 ## 贡献
 
-欢迎贡献。请遵循 Rust API 规范，保持文档与实现一致，并在提交前执行 `.infra/bin/align-ci.sh` 与 `.infra/bin/ci-check.sh`。
+欢迎贡献。请保持公开行为与双语文档同步，提交前运行 `.infra/bin/align-ci.sh` 和 `.infra/bin/ci-check.sh`。
 
 ## 作者
 

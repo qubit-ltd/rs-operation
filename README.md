@@ -7,34 +7,66 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![中文文档](https://img.shields.io/badge/文档-中文版-blue.svg)](README.zh_CN.md)
 
-Managed operation lifecycles and composition for Rust applications. This repository is an initial scaffold: no public operation API is implemented and no crate has been published. The badges above do not imply an existing release or coverage result.
+`qubit-operation` gives Rust applications a bounded supervisor for owned, `Send + 'static` work, so callers can observe a business result separately from child completion and resource settlement. It is useful when a pipeline must stop cooperatively while still retaining control of work that has not yet released its resources.
 
-## Why This Project Exists
+## Installation
 
-A download, conversion, and upload task spans several operations. On failure or cancellation, an application must still wait until the converter stops using temporary files before deleting them, and distinguish a known business result from released resources. This project plans to unify those lifecycle rules for synchronous and asynchronous callers.
+For a checkout of this repository, add the local crate to your application:
 
-## Development Quick Start
-
-The empty crate can currently be built and documented. There is no implemented lifecycle API to demonstrate yet.
-
-```bash
-cargo test --locked
-cargo doc --no-deps --locked
+```toml
+[dependencies]
+qubit-operation = { path = "../rs-operation" }
 ```
 
-## Current Status
+The crate targets Rust 1.94 and has no default features or runtime dependencies. The crates.io badge shows registry status; use the path dependency while working from an unpublished checkout.
 
-The repository contains a Rust crate scaffold, Apache-2.0 licensing, and managed shared infrastructure. Cancellation, operation scopes, resource dependencies, and supervised cleanup are planned capabilities.
+## Quick Start
 
-The full CI coverage task currently fails because this empty library has no executable coverage data. Coverage and the Pages job that requires it become applicable when executable implementation is added; no placeholder API or artificial coverage test is included.
+This small pipeline starts owned work, checks its typed outcome, then waits for settlement. An application should put its own download, transform, and publish logic in the body and register cleanup owners through the supplied scope when it creates managed resources.
+
+```rust,no_run
+use qubit_operation::report::{OperationOutcome, SupervisorLimits};
+use qubit_operation::scope::ScopeOptions;
+use qubit_operation::supervisor::{OperationSupervisor, ShutdownMode};
+use std::time::Duration;
+
+let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+let mut operation = supervisor.start(ScopeOptions::default(), |_scope| async {
+    Ok::<_, &'static str>("artifact-42")
+})?;
+match operation.result_blocking()? {
+    OperationOutcome::Succeeded(id) => println!("published {id}"),
+    other => println!("pipeline outcome: {other:?}"),
+}
+let settlement = operation.released_blocking()?;
+println!("resource phase: {:?}", settlement.resource_phase);
+let shutdown = supervisor.shutdown_blocking(ShutdownMode::Drain, Duration::from_secs(1));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The result answers what the operation did; settlement reports whether its managed children and resources reached a terminal state. Cancellation requests cooperative stop and does not prove that a blocking or native call has returned. See the [synchronous example](examples/sync_pipeline.rs), [asynchronous example](examples/async_pipeline.rs), and [cancellation example](examples/inference_cancel.rs).
+
+## What It Provides
+
+- Finite root admission and per-scope child/resource registration capacities.
+- One typed business outcome and repeatable observation of the final settlement report.
+- Structured child scopes, use leases, cleanup dependencies, and typed recovery ownership.
+- Synchronous observation and async futures over the same operation lifecycle.
+- An explicit supervisor with Drain or Cancel shutdown.
+
+The crate does not provide distributed recovery, forced termination, business retries or compensation, a progress/event integration, or a formal Tokio adapter. `PortableDriver` handles portable owned futures; runtime-bound futures need a suitable `ExternalDriver` that the application integrates with its runtime. Do not block an async runtime worker on the blocking observation methods.
+
+## Learn More
+
+- [中文用户指南](doc/user_guide.zh_CN.md) and [adapter integration guide](doc/adapter-guide.zh_CN.md)
+- [API reference](https://docs.rs/qubit-operation)
+- [中文 README](README.zh_CN.md)
 
 ## Testing
 
 ```bash
-./update-infra.sh --check
-./.infra/bin/align-ci.sh
-./.infra/bin/ci-check.sh
-./.infra/bin/coverage.sh
+cargo check --examples --locked
+cargo test --locked
 ```
 
 ## License
@@ -45,7 +77,7 @@ Licensed under the [Apache License 2.0](LICENSE).
 
 ## Contributing
 
-Contributions are welcome. Follow the Rust API guidelines, keep documentation aligned with implementation, and run `.infra/bin/align-ci.sh` and `.infra/bin/ci-check.sh` before submitting changes.
+Contributions are welcome. Keep public behavior and both language versions of the documentation aligned. Run `.infra/bin/align-ci.sh` and `.infra/bin/ci-check.sh` before submitting changes.
 
 ## Author
 
