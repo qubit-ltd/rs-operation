@@ -54,6 +54,7 @@ pub enum CleanupOutcome {
 /// let _ = RecoveryOwner::new::<String>(unreachable!(), String::new());
 /// ```
 pub struct RecoveryOwner {
+    pub(crate) registry_id: u64,
     pub(crate) resource_id: ResourceId,
     pub(crate) nonce: u64,
     pub(crate) value: Box<dyn std::any::Any + Send>,
@@ -64,6 +65,7 @@ impl RecoveryOwner {
     #[allow(dead_code)] // Called by the recovery registry introduced with T08.
     pub(crate) fn new<R: Send + 'static>(key: &RecoveryKey<R>, value: R) -> Self {
         Self {
+            registry_id: key.registry_id,
             resource_id: key.resource_id(),
             nonce: key.nonce,
             value: Box::new(value),
@@ -80,12 +82,16 @@ impl RecoveryOwner {
     /// On a type, resource-generation, or key mismatch, returns this owner
     /// unchanged. The erased value is never exposed for arbitrary downcasting.
     pub fn take<R: Send + 'static>(self, key: RecoveryKey<R>) -> Result<R, Self> {
-        if key.resource_id() != self.resource_id || key.nonce != self.nonce {
+        if key.registry_id != self.registry_id
+            || key.resource_id() != self.resource_id
+            || key.nonce != self.nonce
+        {
             return Err(self);
         }
         match self.value.downcast::<R>() {
             Ok(value) => Ok(*value),
             Err(value) => Err(Self {
+                registry_id: self.registry_id,
                 resource_id: self.resource_id,
                 nonce: self.nonce,
                 value,
@@ -151,25 +157,46 @@ mod tests {
     #[test]
     fn recovery_key_must_match_resource_generation_and_nonce() {
         let id = ResourceId::new(OperationId::new(1), 4, 8);
-        let owner = RecoveryOwner::new(&RecoveryKey::<String>::new(id, 13), String::from("owned"));
-        let wrong = RecoveryKey::<String>::new(ResourceId::new(OperationId::new(1), 4, 7), 13);
+        let owner = RecoveryOwner::new(
+            &RecoveryKey::<String>::new(1, id, 13),
+            String::from("owned"),
+        );
+        let wrong = RecoveryKey::<String>::new(1, ResourceId::new(OperationId::new(1), 4, 7), 13);
         let owner = owner.take(wrong).unwrap_err();
-        let wrong = RecoveryKey::<String>::new(id, 12);
+        let wrong = RecoveryKey::<String>::new(1, id, 12);
         let owner = owner.take(wrong).unwrap_err();
-        let key = RecoveryKey::<String>::new(id, 13);
+        let key = RecoveryKey::<String>::new(1, id, 13);
         assert_eq!(owner.take(key).unwrap(), "owned");
     }
 
     #[test]
     fn recovery_key_must_match_the_erased_owner_type() {
         let id = ResourceId::new(OperationId::new(2), 1, 3);
-        let owner = RecoveryOwner::new(&RecoveryKey::<String>::new(id, 21), String::from("owned"));
-        let wrong_type = RecoveryKey::<u64>::new(id, 21);
+        let owner = RecoveryOwner::new(
+            &RecoveryKey::<String>::new(1, id, 21),
+            String::from("owned"),
+        );
+        let wrong_type = RecoveryKey::<u64>::new(1, id, 21);
 
         let owner = owner.take(wrong_type).unwrap_err();
         assert_eq!(
-            owner.take(RecoveryKey::<String>::new(id, 21)).unwrap(),
+            owner.take(RecoveryKey::<String>::new(1, id, 21)).unwrap(),
             "owned"
+        );
+    }
+
+    #[test]
+    fn recovery_key_must_match_registry_namespace() {
+        let id = ResourceId::new(OperationId::new(3), 2, 6);
+        let owner = RecoveryOwner::new(
+            &RecoveryKey::<String>::new(17, id, 29),
+            String::from("namespace protected"),
+        );
+        let wrong_registry = RecoveryKey::<String>::new(18, id, 29);
+        let owner = owner.take(wrong_registry).unwrap_err();
+        assert_eq!(
+            owner.take(RecoveryKey::<String>::new(17, id, 29)).unwrap(),
+            "namespace protected"
         );
     }
 }

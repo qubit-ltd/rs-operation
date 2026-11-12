@@ -24,7 +24,8 @@ mod transfer_error;
 
 pub use crate::report::ReleaseReceipt;
 pub use cleanup_scheduler::{
-    CleanupObservation, CleanupPanic, CleanupPermit, CleanupScheduler, CleanupTask,
+    CleanupObservation, CleanupPanic, CleanupPermit, CleanupResponsibility, CleanupScheduler,
+    CleanupTask,
 };
 pub use dependency_error::DependencyError;
 pub use handle::ResourceHandle;

@@ -5,6 +5,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{future::Future, pin::Pin};
 
+static NEXT_RECOVERY_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_registry_id() -> u64 {
+    NEXT_RECOVERY_REGISTRY_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("recovery registry identity space exhausted")
+}
+
+fn next_nonce(counter: &AtomicU64) -> u64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nonce| {
+            nonce.checked_add(1)
+        })
+        .expect("recovery key nonce space exhausted")
+}
+
 /// Failure when retaining a recovery owner in the bounded recovery table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryError {
@@ -30,7 +46,7 @@ mod tests {
         let key = registry.register(id, String::from("owner")).unwrap();
         let nonce = key.nonce;
         assert_eq!(registry.take_recovery(key).unwrap(), "owner");
-        let stale = RecoveryKey::<String>::new(id, nonce);
+        let stale = RecoveryKey::<String>::new(registry.inner.registry_id, id, nonce);
         assert!(registry.take_recovery(stale).is_err());
         assert!(registry.is_empty());
     }
@@ -38,21 +54,22 @@ mod tests {
     #[test]
     fn wrong_generation_or_type_key_does_not_consume_recovery_owner() {
         let id = ResourceId::new(OperationId::new(2), 1, 8);
-        let key = RecoveryKey::<String>::new(id, 44);
+        let key = RecoveryKey::<String>::new(9, id, 44);
         let owner = RecoveryOwner::new(&key, String::from("still owned"));
         let old_generation =
-            RecoveryKey::<String>::new(ResourceId::new(OperationId::new(2), 1, 7), 44);
+            RecoveryKey::<String>::new(9, ResourceId::new(OperationId::new(2), 1, 7), 44);
         let owner = owner.take(old_generation).unwrap_err();
-        let wrong_type = RecoveryKey::<u64>::new(id, 44);
+        let wrong_type = RecoveryKey::<u64>::new(9, id, 44);
         let owner = owner.take(wrong_type).unwrap_err();
         assert_eq!(owner.take(key).unwrap(), "still owned");
     }
 }
 
 struct RecoveryInner {
+    registry_id: u64,
     capacity: usize,
     next_nonce: AtomicU64,
-    owners: Mutex<BTreeMap<(ResourceId, u64), RecoveryOwner>>,
+    owners: Mutex<BTreeMap<(u64, ResourceId, u64), RecoveryOwner>>,
 }
 
 impl RecoveryRegistry {
@@ -60,6 +77,7 @@ impl RecoveryRegistry {
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(RecoveryInner {
+                registry_id: next_registry_id(),
                 capacity,
                 next_nonce: AtomicU64::new(1),
                 owners: Mutex::new(BTreeMap::new()),
@@ -74,8 +92,8 @@ impl RecoveryRegistry {
         resource: ResourceId,
         value: R,
     ) -> Result<RecoveryKey<R>, R> {
-        let nonce = self.inner.next_nonce.fetch_add(1, Ordering::Relaxed);
-        let key = RecoveryKey::new(resource, nonce);
+        let nonce = next_nonce(&self.inner.next_nonce);
+        let key = RecoveryKey::new(self.inner.registry_id, resource, nonce);
         let owner = RecoveryOwner::new(&key, value);
         let mut owners = match self.inner.owners.lock() {
             Ok(owners) => owners,
@@ -84,7 +102,7 @@ impl RecoveryRegistry {
         if owners.len() >= self.inner.capacity {
             return Err(owner.take(key).ok().expect("matching recovery key"));
         }
-        owners.insert((resource, nonce), owner);
+        owners.insert((self.inner.registry_id, resource, nonce), owner);
         Ok(key)
     }
 
@@ -97,8 +115,8 @@ impl RecoveryRegistry {
         capsule: R,
         failure_owner: R,
     ) -> Result<(RecoveryKey<R>, RecoveryOwner), (R, R)> {
-        let nonce = self.inner.next_nonce.fetch_add(1, Ordering::Relaxed);
-        let key = RecoveryKey::new(resource, nonce);
+        let nonce = next_nonce(&self.inner.next_nonce);
+        let key = RecoveryKey::new(self.inner.registry_id, resource, nonce);
         let owner = RecoveryOwner::new(&key, capsule);
         let failed = RecoveryOwner::new(&key, failure_owner);
         let mut owners = match self.inner.owners.lock() {
@@ -107,7 +125,7 @@ impl RecoveryRegistry {
                 return Err((
                     owner.take(key).ok().expect("matching recovery key"),
                     failed
-                        .take(RecoveryKey::new(resource, nonce))
+                        .take(RecoveryKey::new(self.inner.registry_id, resource, nonce))
                         .ok()
                         .expect("matching recovery key"),
                 ));
@@ -117,12 +135,12 @@ impl RecoveryRegistry {
             return Err((
                 owner.take(key).ok().expect("matching recovery key"),
                 failed
-                    .take(RecoveryKey::new(resource, nonce))
+                    .take(RecoveryKey::new(self.inner.registry_id, resource, nonce))
                     .ok()
                     .expect("matching recovery key"),
             ));
         }
-        owners.insert((resource, nonce), owner);
+        owners.insert((self.inner.registry_id, resource, nonce), owner);
         Ok((key, failed))
     }
 
@@ -135,7 +153,10 @@ impl RecoveryRegistry {
         let Ok(mut owners) = self.inner.owners.lock() else {
             return Err(key);
         };
-        let Some(owner) = owners.remove(&(key.resource_id(), key.nonce)) else {
+        if key.registry_id != self.inner.registry_id {
+            return Err(key);
+        }
+        let Some(owner) = owners.remove(&(key.registry_id, key.resource_id(), key.nonce)) else {
             return Err(key);
         };
         match owner.take(key) {
@@ -154,7 +175,7 @@ impl RecoveryRegistry {
         self.inner
             .owners
             .lock()
-            .map(|owners| owners.contains_key(&(key.resource, key.nonce)))
+            .map(|owners| owners.contains_key(&(key.registry_id, key.resource, key.nonce)))
             .unwrap_or(false)
     }
 

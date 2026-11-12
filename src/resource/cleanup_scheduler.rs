@@ -16,6 +16,17 @@ pub struct CleanupScheduler {
     state: Arc<SchedulerState>,
 }
 
+/// Durable owner of active cleanup tasks for a supervisor or driver.
+///
+/// Keep this value for the lifetime of the managed operation. Dropping a
+/// `CleanupScheduler` or an observer does not cancel tasks while this owner is
+/// retained. The responsibility owner deliberately starts no thread/runtime;
+/// the supervisor reacquires task observers and drives them explicitly.
+#[derive(Clone)]
+pub struct CleanupResponsibility {
+    state: Arc<SchedulerState>,
+}
+
 struct SchedulerState {
     limit: usize,
     active: Arc<AtomicUsize>,
@@ -121,6 +132,13 @@ impl CleanupScheduler {
         self.state.limit
     }
 
+    /// Transfer an owning reference to the supervisor/driver lifecycle.
+    pub fn responsibility_owner(&self) -> CleanupResponsibility {
+        CleanupResponsibility {
+            state: Arc::clone(&self.state),
+        }
+    }
+
     /// Schedule a cleanup future if a cleanup slot is available.
     ///
     /// The future is polled outside scheduler locks. Panics are converted to a
@@ -179,6 +197,23 @@ impl CleanupScheduler {
     }
 
     /// Reacquire an observer for a cleanup task retained by this scheduler.
+    pub fn task(&self, resource_id: crate::report::ResourceId) -> Option<CleanupTask> {
+        self.responsibility_owner().task(resource_id)
+    }
+}
+
+impl CleanupResponsibility {
+    /// Number of cleanup permits still retained by active tasks.
+    pub fn active(&self) -> usize {
+        self.state.active.load(Ordering::Acquire)
+    }
+
+    /// Configured cleanup concurrency limit.
+    pub fn limit(&self) -> usize {
+        self.state.limit
+    }
+
+    /// Reacquire an observer while keeping task and permit owned here.
     pub fn task(&self, resource_id: crate::report::ResourceId) -> Option<CleanupTask> {
         let state = self
             .state

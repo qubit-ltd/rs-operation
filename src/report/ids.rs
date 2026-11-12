@@ -44,17 +44,19 @@ pub struct ClockDomainId(pub u64);
 /// Opaque typed key for taking a resource's recovery owner exactly once.
 ///
 /// It intentionally exposes no `Any` or downcast operation.
-/// A key is issued by the resource registry and is not `Clone`.
+/// A key is issued by one recovery registry and is not `Clone`.
 pub struct RecoveryKey<R: 'static> {
+    pub(crate) registry_id: u64,
     pub(crate) resource: ResourceId,
     pub(crate) nonce: u64,
     pub(crate) marker: PhantomData<fn() -> R>,
 }
 
 impl<R> RecoveryKey<R> {
-    #[allow(dead_code)] // Issued by the recovery registry in the recovery implementation task.
-    pub(crate) const fn new(resource: ResourceId, nonce: u64) -> Self {
+    #[allow(dead_code)] // Issued by the recovery registry.
+    pub(crate) const fn new(registry_id: u64, resource: ResourceId, nonce: u64) -> Self {
         Self {
+            registry_id,
             resource,
             nonce,
             marker: PhantomData,

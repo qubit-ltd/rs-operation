@@ -6,17 +6,40 @@ use qubit_operation::report::{
 };
 use qubit_operation::report::{ClockDomainId, MonotonicTime, OperationId, ResourceId};
 use qubit_operation::resource::{
-    CleanupObservation, CleanupScheduler, RecoveryRegistry, ResourceRegistry,
+    CleanupObservation, CleanupResponsibility, CleanupScheduler, RecoveryRegistry, ResourceRegistry,
 };
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 struct NoopWake;
 impl Wake for NoopWake {
     fn wake(self: Arc<Self>) {}
+}
+
+struct ControlledPending {
+    ready: Arc<AtomicBool>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl Future for ControlledPending {
+    type Output = CleanupOutcome;
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.ready.load(Ordering::SeqCst) {
+            Poll::Ready(CleanupOutcome::Cleaned)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for ControlledPending {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 struct CountCleanup(Arc<AtomicUsize>);
@@ -115,6 +138,67 @@ fn recovery_registry_preserves_typed_owner_until_single_extraction() {
     assert_eq!(recovery.len(), 1);
     assert_eq!(recovery.take_recovery(key).unwrap(), "reopen handle");
     assert_eq!(recovery.len(), 0);
+}
+
+#[test]
+fn recovery_key_from_another_registry_cannot_take_owner_with_same_resource_id() {
+    let id = ResourceId::new(OperationId::new(90), 1, 3);
+    let registry_a = RecoveryRegistry::new(1);
+    let registry_b = RecoveryRegistry::new(1);
+    let key_a = registry_a.register(id, String::from("owner a")).unwrap();
+    let key_b = registry_b.register(id, String::from("owner b")).unwrap();
+
+    let key_a = match registry_b.take_recovery(key_a) {
+        Ok(_) => panic!("a registry must reject another registry's key"),
+        Err(key) => key,
+    };
+    assert_eq!(registry_b.take_recovery(key_b).unwrap(), "owner b");
+    assert_eq!(registry_a.take_recovery(key_a).unwrap(), "owner a");
+}
+
+#[test]
+fn responsibility_owner_retains_pending_task_after_scheduler_and_observer_drop() {
+    let id = ResourceId::new(OperationId::new(91), 0, 1);
+    let scheduler = CleanupScheduler::new(1);
+    let responsibility: CleanupResponsibility = scheduler.responsibility_owner();
+    let ready = Arc::new(AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> =
+        Box::pin(ControlledPending {
+            ready: Arc::clone(&ready),
+            drops: Arc::clone(&drops),
+        });
+    let mut observer = scheduler
+        .schedule_until(id, MonotonicTime::new(ClockDomainId(3), 5), future)
+        .unwrap_or_else(|_| unreachable!());
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(
+        observer.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(3), 5)),
+        Poll::Ready(CleanupObservation::Unconfirmed { resource_id }) if resource_id == id
+    ));
+    assert_eq!(scheduler.active(), 1);
+
+    drop(observer);
+    drop(scheduler);
+    assert_eq!(responsibility.active(), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+    let mut observer = responsibility
+        .task(id)
+        .expect("supervisor responsibility retains task");
+    assert!(matches!(
+        observer.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(3), 6)),
+        Poll::Ready(CleanupObservation::Pending)
+    ));
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    ready.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        observer.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(3), 7)),
+        Poll::Ready(CleanupObservation::Settled(Ok(CleanupOutcome::Cleaned)))
+    ));
+    assert_eq!(responsibility.active(), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 #[test]
