@@ -1,6 +1,11 @@
 //! Narrow internal ports. These are intentionally not part of the public API.
 #![allow(dead_code)] // Ports are consumed by the later driver and cleanup tasks.
 
+// Shared generation-based condition variable and async waker notifications.
+mod notify;
+// Single-consumer result state and repeatable terminal snapshots.
+mod state;
+
 use crate::{
     protocol::{ManagedOperationControl, OwnedCleanup},
     report::{AdmissionError, CleanupOutcome, OperationId, SettlementReport},
