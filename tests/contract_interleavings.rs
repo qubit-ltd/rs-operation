@@ -392,7 +392,10 @@ fn dropping_unclosed_service_group_does_not_drop_cleanup_owner_without_cleanup()
 
     drop(scope);
     drop(group);
+    let report =
+        supervisor.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::from_secs(2));
 
+    assert!(report.is_complete());
     assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
     assert_eq!(owner_drops.load(Ordering::SeqCst), 1);
 }
