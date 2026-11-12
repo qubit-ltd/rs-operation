@@ -14,4 +14,6 @@ pub(in crate::resource) struct EntryState {
     pub(in crate::resource) id: ResourceId,
     pub(in crate::resource) phase: EntryPhase,
     pub(in crate::resource) active_uses: usize,
+    pub(in crate::resource) transfer_source: Option<ResourceId>,
+    pub(in crate::resource) transfer_receiver: Option<ResourceId>,
 }

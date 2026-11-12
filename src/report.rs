@@ -9,7 +9,9 @@ mod state;
 mod summary;
 
 pub use errors::{AdmissionError, ObservationError, StartError};
-pub use ids::{ClockDomainId, OperationId, RecoveryKey, ResourceId, TransferReceipt};
+pub use ids::{
+    ClockDomainId, OperationId, RecoveryKey, ReleaseReceipt, ResourceId, TransferReceipt,
+};
 pub use limits::{ScopeLimits, SupervisorLimits};
 pub use outcome::{
     CancelReason, ChildBusinessOutcome, ChildBusinessSummary, ChildFailureSummary, EffectFact,

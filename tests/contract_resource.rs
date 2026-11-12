@@ -184,10 +184,16 @@ fn test_cleanup_owner_transfer_needs_receiver_receipt_before_source_releases_it(
 
     let received = receiver.take_ready_cleanup().unwrap();
     assert_eq!(received.resource_id(), received_id);
-    let (received_id, owner) = received.into_parts();
-    drop(owner);
-    receiver.confirm_released(received_id).unwrap();
-    source.confirm_released(source_id).unwrap();
+    let (received_id, receiver_owner) = received.into_parts();
+    drop(receiver_owner);
+    let release = receiver
+        .confirm_released_with_receipt(received_id)
+        .unwrap()
+        .unwrap();
+    assert!(source.confirm_released(source_id).is_err());
+    source
+        .confirm_transferred_released(source_id, release)
+        .unwrap();
     assert!(!source.contains(source_id));
     assert_eq!(drop_count.load(Ordering::SeqCst), 1);
 }
@@ -206,10 +212,10 @@ fn test_transferred_prerequisite_stays_blocked_until_external_release_confirmati
     prerequisite.close_for_use().unwrap();
     let ready = source.take_ready_cleanup().unwrap();
     assert_eq!(ready.resource_id(), prerequisite_id);
-    let (_, owner) = ready.into_parts();
+    let (_, transferred_owner) = ready.into_parts();
 
     let (received_id, receipt) = receiver
-        .accept_cleanup_transfer(prerequisite_id, owner)
+        .accept_cleanup_transfer(prerequisite_id, transferred_owner)
         .unwrap();
     assert!(receiver.contains(received_id));
     source
@@ -220,16 +226,65 @@ fn test_transferred_prerequisite_stays_blocked_until_external_release_confirmati
     assert!(source.contains(prerequisite_id));
 
     let received = receiver.take_ready_cleanup().unwrap();
-    let (received_id, owner) = received.into_parts();
-    drop(owner);
-    receiver.confirm_released(received_id).unwrap();
-    source.confirm_released(prerequisite_id).unwrap();
+    let (received_id, receiver_owner) = received.into_parts();
+    drop(receiver_owner);
+    let release = receiver
+        .confirm_released_with_receipt(received_id)
+        .unwrap()
+        .unwrap();
+    assert!(source.confirm_released(prerequisite_id).is_err());
+
+    let decoy = ResourceRegistry::new(OperationId::new(16), 2);
+    let (_, decoy_acceptance) = decoy
+        .accept_cleanup_transfer(prerequisite_id, owner(&drop_count))
+        .unwrap();
+    let decoy_id = decoy_acceptance.receiver();
+    let decoy_ready = decoy.take_ready_cleanup().unwrap();
+    let (_, decoy_owner) = decoy_ready.into_parts();
+    drop(decoy_owner);
+    let wrong_receiver_proof = decoy
+        .confirm_released_with_receipt(decoy_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        source
+            .confirm_transferred_released(prerequisite_id, wrong_receiver_proof)
+            .is_err()
+    );
+    let (_, old_generation_acceptance) = decoy
+        .accept_cleanup_transfer(
+            ResourceId::new(
+                prerequisite_id.operation,
+                prerequisite_id.slot,
+                prerequisite_id.generation.wrapping_sub(1),
+            ),
+            owner(&drop_count),
+        )
+        .unwrap();
+    let old_generation_id = old_generation_acceptance.receiver();
+    let old_ready = decoy.take_ready_cleanup().unwrap();
+    let (_, old_owner) = old_ready.into_parts();
+    drop(old_owner);
+    let old_generation_proof = decoy
+        .confirm_released_with_receipt(old_generation_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        source
+            .confirm_transferred_released(prerequisite_id, old_generation_proof)
+            .is_err()
+    );
+    assert!(source.contains(prerequisite_id));
+    assert!(source.take_ready_cleanup().is_none());
+    source
+        .confirm_transferred_released(prerequisite_id, release)
+        .unwrap();
     let ready_dependent = source.take_ready_cleanup().unwrap();
     assert_eq!(ready_dependent.resource_id(), dependent_id);
     let (_, owner) = ready_dependent.into_parts();
     drop(owner);
     source.confirm_released(dependent_id).unwrap();
-    assert_eq!(drop_count.load(Ordering::SeqCst), 2);
+    assert_eq!(drop_count.load(Ordering::SeqCst), 4);
 }
 
 #[test]

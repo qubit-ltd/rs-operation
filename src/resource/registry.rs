@@ -10,6 +10,7 @@ use super::ReadyCleanup;
 use super::RegisterError;
 use super::RegisterErrorKind;
 use super::RegistryError;
+use super::ReleaseReceipt;
 use super::ResourceHandle;
 use super::TransferError;
 use super::internal::Entry;
@@ -99,7 +100,10 @@ impl ResourceRegistry {
     ) -> Result<(ResourceId, TransferReceipt), RegisterError> {
         let accepted = self.register_with_phase(owner, EntryPhase::Closed)?;
         let accepted_id = accepted.id();
-        let receipt = TransferReceipt::accepted_by_registry(source_resource);
+        if let Ok(mut accepted_state) = accepted.entry.state.lock() {
+            accepted_state.transfer_source = Some(source_resource);
+        }
+        let receipt = TransferReceipt::accepted_by_registry(source_resource, accepted_id);
         Ok((accepted_id, receipt))
     }
 
@@ -139,6 +143,8 @@ impl ResourceRegistry {
                 id: resource_id,
                 phase,
                 active_uses: 0,
+                transfer_source: None,
+                transfer_receiver: None,
             }),
             owner: Mutex::new(Some(owner)),
         });
@@ -187,6 +193,36 @@ impl ResourceRegistry {
 
     /// Record confirmed release and make the registry slot reusable.
     pub fn confirm_released(&self, resource_id: ResourceId) -> Result<(), RegistryError> {
+        self.finish_release(resource_id, None, false).map(|_| ())
+    }
+
+    /// Confirm receiver-side release and issue proof for the source tombstone.
+    pub fn confirm_released_with_receipt(
+        &self,
+        resource_id: ResourceId,
+    ) -> Result<Option<ReleaseReceipt>, RegistryError> {
+        self.finish_release(resource_id, None, true)
+    }
+
+    /// Clear a transferred source tombstone using the receiver's release proof.
+    pub fn confirm_transferred_released(
+        &self,
+        resource_id: ResourceId,
+        receipt: ReleaseReceipt,
+    ) -> Result<(), RegistryError> {
+        if receipt.source() != resource_id {
+            return Err(RegistryError::InvalidReceipt);
+        }
+        self.finish_release(resource_id, Some(receipt), false)
+            .map(|_| ())
+    }
+
+    fn finish_release(
+        &self,
+        resource_id: ResourceId,
+        receipt: Option<ReleaseReceipt>,
+        issue_release_receipt: bool,
+    ) -> Result<Option<ReleaseReceipt>, RegistryError> {
         let mut state = self
             .inner
             .state
@@ -200,19 +236,36 @@ impl ResourceRegistry {
                 .state
                 .lock()
                 .map_err(|_| RegistryError::RegistryPoisoned)?;
-            if entry_state.phase != EntryPhase::Cleaning
-                && entry_state.phase != EntryPhase::Transferred
+            if entry_state.phase == EntryPhase::Cleaning
+                && entry_state.transfer_source.is_some()
+                && receipt.is_none()
+                && !issue_release_receipt
             {
+                return Err(RegistryError::InvalidReceipt);
+            }
+            if entry_state.phase == EntryPhase::Transferred {
+                let Some(receipt) = receipt else {
+                    return Err(RegistryError::NotCleaning);
+                };
+                if receipt.source() != resource_id
+                    || Some(receipt.receiver()) != entry_state.transfer_receiver
+                {
+                    return Err(RegistryError::InvalidReceipt);
+                }
+            } else if entry_state.phase != EntryPhase::Cleaning {
                 return Err(RegistryError::NotCleaning);
             }
+            let release_receipt = entry_state
+                .transfer_source
+                .map(|source| ReleaseReceipt::confirmed(source, resource_id));
             entry_state.phase = EntryPhase::Released;
+            state.dependencies.remove(&resource_id);
+            for dependents in state.dependencies.values_mut() {
+                dependents.remove(&resource_id);
+            }
+            release_slot(&mut state.slots[slot_index]);
+            return Ok(release_receipt);
         }
-        state.dependencies.remove(&resource_id);
-        for dependents in state.dependencies.values_mut() {
-            dependents.remove(&resource_id);
-        }
-        release_slot(&mut state.slots[slot_index]);
-        Ok(())
     }
 
     /// Confirm transfer only after a receiver-issued receipt matches this generation.
@@ -242,6 +295,7 @@ impl ResourceRegistry {
             if entry_state.phase != EntryPhase::Cleaning {
                 return Err(RegistryError::NotCleaning);
             }
+            entry_state.transfer_receiver = Some(receipt.receiver());
             entry_state.phase = EntryPhase::Transferred;
         }
         Ok(())

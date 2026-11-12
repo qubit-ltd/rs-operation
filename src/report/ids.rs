@@ -88,15 +88,17 @@ impl<R> core::fmt::Debug for RecoveryKey<R> {
 pub struct TransferReceipt {
     resource: ResourceId,
     generation: u32,
+    receiver: ResourceId,
 }
 
 impl TransferReceipt {
     /// Create a receipt only after the receiving registry accepted responsibility.
     #[allow(dead_code)] // Called by the recovery registry after accepting an owner.
-    pub(crate) const fn accepted_by_registry(resource: ResourceId) -> Self {
+    pub(crate) const fn accepted_by_registry(resource: ResourceId, receiver: ResourceId) -> Self {
         Self {
             resource,
             generation: resource.generation,
+            receiver,
         }
     }
 
@@ -108,5 +110,33 @@ impl TransferReceipt {
     /// Return the accepted resource generation.
     pub const fn generation(self) -> u32 {
         self.generation
+    }
+
+    /// Resource identity assigned by the registry that accepted responsibility.
+    pub const fn receiver(self) -> ResourceId {
+        self.receiver
+    }
+}
+
+/// Receiver-issued evidence that an accepted transferred resource was released.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ReleaseReceipt {
+    source: ResourceId,
+    receiver: ResourceId,
+}
+
+impl ReleaseReceipt {
+    pub(crate) const fn confirmed(source: ResourceId, receiver: ResourceId) -> Self {
+        Self { source, receiver }
+    }
+
+    /// Original resource identity whose transferred tombstone can be settled.
+    pub const fn source(self) -> ResourceId {
+        self.source
+    }
+
+    /// Receiver resource identity whose release was confirmed.
+    pub const fn receiver(self) -> ResourceId {
+        self.receiver
     }
 }
