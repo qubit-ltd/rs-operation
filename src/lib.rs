@@ -17,7 +17,9 @@ mod internal;
 
 pub mod context;
 pub mod driver;
+pub mod operation;
 pub mod protocol;
 pub mod report;
 pub mod resource;
+pub mod scope;
 pub mod supervisor;
