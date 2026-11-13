@@ -259,6 +259,8 @@ impl CleanupScheduler {
                 polling: false,
                 settled: false,
             }),
+            #[cfg(test)]
+            poll_gate: Mutex::new(None),
         });
         tasks.insert(resource_id, Arc::clone(&state));
         drop(tasks);
@@ -336,5 +338,141 @@ impl CleanupScheduler {
             removed
         };
         drop(removed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Waker;
+
+    use super::CleanupScheduler;
+    use crate::report::CleanupOutcome;
+    use crate::report::ClockDomainId;
+    use crate::report::MonotonicTime;
+    use crate::report::OperationId;
+    use crate::report::ResourceId;
+    use crate::resource::CleanupObservation;
+
+    fn cleanup_future(
+        outcome: CleanupOutcome,
+        drops: Arc<AtomicUsize>,
+    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> {
+        struct Tracked {
+            outcome: Option<CleanupOutcome>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl Future for Tracked {
+            type Output = CleanupOutcome;
+
+            fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(self.outcome.take().expect("future is polled once"))
+            }
+        }
+
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        Box::pin(Tracked {
+            outcome: Some(outcome),
+            drops,
+        })
+    }
+
+    #[test]
+    fn test_duplicate_registration_returns_future_and_releases_reserved_permit() {
+        let scheduler = CleanupScheduler::new(2);
+        let id = ResourceId::new(OperationId::new(731), 0, 0);
+        let retained_drops = Arc::new(AtomicUsize::new(0));
+        let rejected_drops = Arc::new(AtomicUsize::new(0));
+        let mut task =
+            match scheduler.schedule(id, cleanup_future(CleanupOutcome::Cleaned, Arc::clone(&retained_drops))) {
+                Ok(task) => task,
+                Err(_) => panic!("first registration has capacity"),
+            };
+        assert_eq!(scheduler.active(), 1);
+
+        let rejected =
+            match scheduler.schedule(id, cleanup_future(CleanupOutcome::Cleaned, Arc::clone(&rejected_drops))) {
+                Ok(_) => panic!("duplicate resource IDs cannot replace retained tasks"),
+                Err(future) => future,
+            };
+        assert_eq!(scheduler.active(), 1, "duplicate rejection returns its permit");
+        assert_eq!(rejected_drops.load(Ordering::SeqCst), 0);
+        drop(rejected);
+        assert_eq!(rejected_drops.load(Ordering::SeqCst), 1);
+
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            task.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(1), 0)),
+            Poll::Ready(CleanupObservation::Settled(Ok(CleanupOutcome::Cleaned)))
+        ));
+        assert_eq!(scheduler.active(), 0);
+        assert_eq!(retained_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_responsibility_owner_keeps_pending_task_and_permit_after_scheduler_drop() {
+        let scheduler = CleanupScheduler::new(1);
+        let owner = scheduler.responsibility_owner();
+        let id = ResourceId::new(OperationId::new(732), 0, 0);
+        let task = match scheduler.schedule(id, Box::pin(std::future::pending::<CleanupOutcome>())) {
+            Ok(task) => task,
+            Err(_) => panic!("cleanup slot is available"),
+        };
+        drop(task);
+        drop(scheduler);
+
+        assert_eq!(owner.active(), 1);
+        assert!(owner.task(id).is_some(), "owner retains task registration");
+        let mut observer = owner.task(id).expect("task is reacquirable");
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            observer.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(1), 0)),
+            Poll::Ready(CleanupObservation::Pending)
+        ));
+        drop(observer);
+        drop(owner);
+    }
+
+    #[test]
+    fn test_deadline_reports_once_then_observes_actual_cleanup_result() {
+        let scheduler = CleanupScheduler::new(1);
+        let id = ResourceId::new(OperationId::new(733), 0, 0);
+        let task = match scheduler.schedule_until(
+            id,
+            MonotonicTime::new(ClockDomainId(4), 5),
+            Box::pin(async { CleanupOutcome::Cleaned }),
+        ) {
+            Ok(task) => task,
+            Err(_) => panic!("cleanup slot is available"),
+        };
+        let mut observer = task;
+        let mut cx = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            observer.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(9), 4)),
+            Poll::Ready(CleanupObservation::ClockDomainMismatch { resource_id }) if resource_id == id
+        ));
+        assert!(matches!(
+            observer.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(4), 5)),
+            Poll::Ready(CleanupObservation::Unconfirmed { resource_id }) if resource_id == id
+        ));
+        assert!(matches!(
+            observer.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(4), 5)),
+            Poll::Ready(CleanupObservation::Settled(Ok(CleanupOutcome::Cleaned)))
+        ));
+        assert_eq!(scheduler.active(), 0, "settlement releases the permit");
+        assert!(scheduler.task(id).is_none(), "settlement removes the registry entry");
     }
 }

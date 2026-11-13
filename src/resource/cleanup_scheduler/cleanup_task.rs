@@ -70,6 +70,11 @@ impl CleanupTask {
     /// retains both future and permit. A later call continues polling so the
     /// eventual real outcome can still be confirmed.
     ///
+    /// Multiple observers may call this method for the same retained task. If
+    /// another observer is currently polling, this call returns the `Pending`
+    /// observation. That observation does not register this caller's waker;
+    /// callers needing progress should arrange to poll again.
+    ///
     /// # Parameters
     ///
     /// * `cx` — task context used to register for future progress.
@@ -82,8 +87,19 @@ impl CleanupTask {
     /// observation value indicating that the underlying cleanup future remains
     /// active.
     pub fn poll_at(&mut self, cx: &mut Context<'_>, now: MonotonicTime) -> Poll<CleanupObservation> {
-        let deadline = {
-            let task = self.state.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(test)]
+        let gate = self
+            .state
+            .poll_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            gate.wait();
+        }
+        let mut future = {
+            let mut task = self.state.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if task.settled {
                 return Poll::Ready(CleanupObservation::AlreadySettled {
                     resource_id: self.resource_id,
@@ -92,26 +108,22 @@ impl CleanupTask {
             if task.polling {
                 return Poll::Ready(CleanupObservation::Pending);
             }
-            task.deadline
-        };
-        if let Some(deadline) = deadline {
-            if now.domain != deadline.domain {
-                return Poll::Ready(CleanupObservation::ClockDomainMismatch {
-                    resource_id: self.resource_id,
-                });
+            if let Some(deadline) = task.deadline {
+                if now.domain != deadline.domain {
+                    return Poll::Ready(CleanupObservation::ClockDomainMismatch {
+                        resource_id: self.resource_id,
+                    });
+                }
+                if !task.unconfirmed_reported && now.ticks >= deadline.ticks {
+                    task.unconfirmed_reported = true;
+                    return Poll::Ready(CleanupObservation::Unconfirmed {
+                        resource_id: self.resource_id,
+                    });
+                }
             }
-            let mut task = self.state.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !task.unconfirmed_reported && now.ticks >= deadline.ticks {
-                task.unconfirmed_reported = true;
-                return Poll::Ready(CleanupObservation::Unconfirmed {
-                    resource_id: self.resource_id,
-                });
-            }
-        }
-        let mut future = {
-            let mut task = self.state.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let future = task.future.take().expect("cleanup future is retained by its task");
             task.polling = true;
-            task.future.take().expect("cleanup future is retained by its task")
+            future
         };
         let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx)));
         self.finish_poll(future, polled)
@@ -179,5 +191,166 @@ impl CleanupTask {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&self.resource_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Waker;
+
+    use super::super::internal::PollGate;
+    use super::Poll;
+    use crate::report::CleanupOutcome;
+    use crate::report::ClockDomainId;
+    use crate::report::MonotonicTime;
+    use crate::report::OperationId;
+    use crate::report::ResourceId;
+    use crate::resource::CleanupObservation;
+    use crate::resource::CleanupScheduler;
+
+    struct ControlledPending {
+        ready: Arc<AtomicBool>,
+        active_polls: Arc<AtomicUsize>,
+        max_polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Future for ControlledPending {
+        type Output = CleanupOutcome;
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            let active = self.active_polls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_polls.fetch_max(active, Ordering::SeqCst);
+            let ready = self.ready.load(Ordering::SeqCst);
+            self.active_polls.fetch_sub(1, Ordering::SeqCst);
+            if ready {
+                Poll::Ready(CleanupOutcome::Cleaned)
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for ControlledPending {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_observers_prevent_duplicate_cleanup_future_polling() {
+        let scheduler = CleanupScheduler::new(1);
+        let id = ResourceId::new(OperationId::new(721), 0, 0);
+        let ready = Arc::new(AtomicBool::new(false));
+        let active_polls = Arc::new(AtomicUsize::new(0));
+        let max_polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> = Box::pin(ControlledPending {
+            ready: Arc::clone(&ready),
+            active_polls: Arc::clone(&active_polls),
+            max_polls: Arc::clone(&max_polls),
+            drops: Arc::clone(&drops),
+        });
+        let task = scheduler.schedule(id, future).unwrap_or_else(|_| unreachable!());
+        let gate = Arc::new(PollGate::new());
+        *task
+            .state
+            .poll_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&gate));
+        let responsibility = scheduler.responsibility_owner();
+        let mut first = task;
+        let mut second = responsibility.task(id).expect("scheduled task remains registered");
+        let mut final_observer = responsibility.task(id).expect("scheduled task remains registered");
+        let mut settled_observer = responsibility.task(id).expect("scheduled task remains registered");
+        let first_thread = std::thread::spawn(move || {
+            let mut cx = std::task::Context::from_waker(Waker::noop());
+            first.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(1), 0))
+        });
+        let second_thread = std::thread::spawn(move || {
+            let mut cx = std::task::Context::from_waker(Waker::noop());
+            second.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(1), 0))
+        });
+        gate.release_when_ready();
+        let first = first_thread.join().expect("first observer must not panic");
+        let second = second_thread.join().expect("second observer must not panic");
+        assert!(matches!(first, Poll::Ready(CleanupObservation::Pending)));
+        assert!(matches!(second, Poll::Ready(CleanupObservation::Pending)));
+        assert_eq!(max_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        ready.store(true, Ordering::SeqCst);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            final_observer.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(1), 1)),
+            Poll::Ready(CleanupObservation::Settled(Ok(CleanupOutcome::Cleaned)))
+        ));
+        assert!(matches!(
+            settled_observer.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(1), 2)),
+            Poll::Ready(CleanupObservation::AlreadySettled { resource_id }) if resource_id == id
+        ));
+        assert_eq!(scheduler.active(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_deadline_mismatch_and_unconfirmed_observation_preserve_task() {
+        let scheduler = CleanupScheduler::new(1);
+        let id = ResourceId::new(OperationId::new(722), 0, 0);
+        let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> = Box::pin(async { CleanupOutcome::Cleaned });
+        let mut task = scheduler
+            .schedule_until(id, MonotonicTime::new(ClockDomainId(7), 10), future)
+            .unwrap_or_else(|_| unreachable!());
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            task.poll_at(&mut context, MonotonicTime::new(ClockDomainId(8), 10)),
+            Poll::Ready(CleanupObservation::ClockDomainMismatch { resource_id }) if resource_id == id
+        ));
+        assert_eq!(scheduler.active(), 1);
+        assert!(scheduler.task(id).is_some());
+        assert!(matches!(
+            task.poll_at(&mut context, MonotonicTime::new(ClockDomainId(7), 10)),
+            Poll::Ready(CleanupObservation::Unconfirmed { resource_id }) if resource_id == id
+        ));
+        assert_eq!(scheduler.active(), 1);
+        assert!(matches!(
+            task.poll_at(&mut context, MonotonicTime::new(ClockDomainId(7), 11)),
+            Poll::Ready(CleanupObservation::Settled(Ok(CleanupOutcome::Cleaned)))
+        ));
+        assert_eq!(scheduler.active(), 0);
+        assert!(scheduler.task(id).is_none());
+    }
+
+    struct PanickingPoll;
+
+    impl Future for PanickingPoll {
+        type Output = CleanupOutcome;
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            panic!("cleanup poll failed");
+        }
+    }
+
+    #[test]
+    fn test_panicking_cleanup_future_settles_as_cleanup_panic() {
+        let scheduler = CleanupScheduler::new(1);
+        let id = ResourceId::new(OperationId::new(723), 0, 0);
+        let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> = Box::pin(PanickingPoll);
+        let mut task = scheduler.schedule(id, future).unwrap_or_else(|_| unreachable!());
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            task.poll_at(&mut context, MonotonicTime::new(ClockDomainId(7), 0)),
+            Poll::Ready(CleanupObservation::Settled(Err(_)))
+        ));
+        assert_eq!(scheduler.active(), 0);
+        assert!(scheduler.task(id).is_none());
     }
 }

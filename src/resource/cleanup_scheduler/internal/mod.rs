@@ -15,4 +15,6 @@ mod cleanup_task_inner;
 
 pub(super) use self::cleanup_task_inner::CleanupTaskInner;
 pub(super) use self::cleanup_task_state::CleanupTaskState;
+#[cfg(test)]
+pub(super) use self::cleanup_task_state::PollGate;
 pub(super) use self::scheduler_state::SchedulerState;
