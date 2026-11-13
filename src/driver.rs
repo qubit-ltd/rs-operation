@@ -15,7 +15,7 @@ mod external;
 mod internal;
 #[path = "driver/portable.rs"]
 mod portable;
-#[path = "driver/thread_executor.rs"]
+#[path = "driver/thread_executor/mod.rs"]
 mod thread_executor;
 
 pub use external::DriverLease;

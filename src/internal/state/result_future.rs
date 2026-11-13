@@ -12,20 +12,27 @@ use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
 
-use super::notify::Notified;
 use super::StateCell;
+use crate::internal::notify::Notified;
 use crate::report::ObservationError;
 use crate::report::OperationOutcome;
 
 /// Future that takes the result on readiness and unregisters on drop.
+///
+/// # Type Parameters
+///
+/// - `T`: The value type carried by a successful operation outcome.
+/// - `E`: The domain error type carried by a failed operation outcome.
 pub(crate) struct ResultFuture<'a, T, E> {
     /// Shared cell whose result this future may consume once.
-    cell: &'a StateCell<T, E>,
-    /// Current generation waiter, dropped automatically if observation is cancelled.
-    notification: Option<Notified>,
+    pub(super) cell: &'a StateCell<T, E>,
+    /// Current generation waiter, dropped automatically if observation is
+    /// cancelled.
+    pub(super) notification: Option<Notified>,
 }
 
 impl<T, E> Future for ResultFuture<'_, T, E> {
+    /// The consumed operation outcome, or the reason observation failed.
     type Output = Result<OperationOutcome<T, E>, ObservationError>;
 
     /// Takes a ready result or registers this future for the next state change.

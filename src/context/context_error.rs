@@ -36,6 +36,19 @@ pub enum ContextError {
 }
 
 impl fmt::Display for ContextError {
+    /// Writes the human-readable description of this context failure.
+    ///
+    /// # Parameters
+    ///
+    /// * `f` — formatter that receives the error description.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` when the description is written successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatter's error if writing the description fails.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::ClockDomainMismatch => "operation deadlines use different clock domains",

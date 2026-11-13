@@ -7,13 +7,8 @@
 // =============================================================================
 //! Unit tests for crate-internal contracts.
 
-#[path = "internal/notify_tests.rs"]
-mod notify_tests;
-#[path = "internal/state_tests.rs"]
-mod state_tests;
-
-#[path = "scope_tests.rs"]
+mod internal;
+mod report;
+mod scope_concurrency_tests;
 mod scope_tests;
-
-#[path = "supervisor_tests.rs"]
 mod supervisor_tests;

@@ -14,7 +14,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
-use std::task::Wake;
 use std::task::Waker;
 
 use qubit_operation::protocol::CleanupContext;
@@ -35,11 +34,6 @@ use qubit_operation::resource::CleanupResponsibility;
 use qubit_operation::resource::CleanupScheduler;
 use qubit_operation::resource::RecoveryRegistry;
 use qubit_operation::resource::ResourceRegistry;
-
-struct NoopWake;
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
 
 struct ControlledPending {
     ready: Arc<AtomicBool>,
@@ -76,6 +70,16 @@ impl OwnedCleanup for CountCleanup {
 struct FailedCleanup {
     resource_id: ResourceId,
     owner: RecoveryOwner,
+}
+
+struct PanickingCleanupFuture;
+
+impl Future for PanickingCleanupFuture {
+    type Output = CleanupOutcome;
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        panic!("cleanup adapter panicked")
+    }
 }
 impl OwnedCleanup for FailedCleanup {
     fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
@@ -175,8 +179,7 @@ fn test_responsibility_owner_retains_pending_task_after_scheduler_and_observer_d
     let mut observer = scheduler
         .schedule_until(id, MonotonicTime::new(ClockDomainId(3), 5), future)
         .unwrap_or_else(|_| unreachable!());
-    let waker = Waker::from(Arc::new(NoopWake));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     assert!(matches!(
         observer.poll_at(&mut cx, MonotonicTime::new(ClockDomainId(3), 5)),
         Poll::Ready(CleanupObservation::Unconfirmed { resource_id }) if resource_id == id
@@ -209,19 +212,14 @@ fn test_cleanup_panic_is_reported_and_independent_capsule_remains_retrievable() 
     let recovery = RecoveryRegistry::new(1);
     let key = recovery.register(id, String::from("reopen resource")).unwrap();
     let scheduler = CleanupScheduler::new(1);
-    let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> = Box::pin(async {
-        panic!("cleanup adapter panicked");
-        #[allow(unreachable_code)]
-        CleanupOutcome::Cleaned
-    });
+    let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> = Box::pin(PanickingCleanupFuture);
     let scheduled = match scheduler.schedule(id, future) {
         Ok(task) => task,
         Err(_) => panic!("cleanup slot available"),
     };
     let mut task = Box::pin(scheduled);
     assert_eq!(scheduler.active(), 1);
-    let waker = Waker::from(Arc::new(NoopWake));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let Poll::Ready(CleanupObservation::Settled(Err(panic))) = task
         .as_mut()
         .get_mut()
@@ -244,8 +242,7 @@ fn test_expired_deadline_reports_unconfirmed_without_dropping_task_or_permit() {
             .schedule_until(id, MonotonicTime::new(ClockDomainId(9), 5), future)
             .unwrap_or_else(|_| unreachable!()),
     );
-    let waker = Waker::from(Arc::new(NoopWake));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     {
         let task = task_handle.as_mut().get_mut();
         assert!(matches!(
@@ -301,8 +298,7 @@ fn test_failed_prerequisite_blocks_dependent_even_after_capsule_is_taken() {
             .schedule(resource_id, future)
             .unwrap_or_else(|_| unreachable!()),
     );
-    let waker = Waker::from(Arc::new(NoopWake));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let Poll::Ready(CleanupObservation::Settled(Ok(CleanupOutcome::FailedWithRecovery(failure, _owner)))) = task
         .as_mut()
         .get_mut()
@@ -376,8 +372,7 @@ fn test_retry_keeps_capsule_and_dependency_group_transfer_is_atomic() {
         .unwrap_or_else(|_| unreachable!());
     let scheduler = CleanupScheduler::new(1);
     let mut task = Box::pin(scheduler.schedule(id, retry).unwrap_or_else(|_| unreachable!()));
-    let waker = Waker::from(Arc::new(NoopWake));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     assert!(matches!(
         task.as_mut()
             .get_mut()

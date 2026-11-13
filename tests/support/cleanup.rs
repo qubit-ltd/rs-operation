@@ -13,17 +13,13 @@ use std::task::Poll;
 
 use qubit_operation::protocol::CleanupContext;
 use qubit_operation::protocol::OwnedCleanup;
-use qubit_operation::report::CleanupFailure;
 use qubit_operation::report::CleanupOutcome;
-use qubit_operation::report::RecoveryOwner;
 
 use super::Gate;
-use super::GateWait;
+use super::gate::GateWait;
 
 enum CleanupPlan {
     Succeed,
-    #[allow(dead_code)] // Recovery owners are issued by the crate-private registry in later tasks.
-    Recover(CleanupFailure, RecoveryOwner),
     Panic,
     Pending(Gate),
 }
@@ -38,15 +34,6 @@ impl FakeCleanup {
     pub fn success() -> Self {
         Self {
             plan: CleanupPlan::Succeed,
-        }
-    }
-
-    /// Create a cleanup future that returns the supplied failure and recovery
-    /// owner.
-    #[allow(dead_code)] // Later lifecycle tests pass in a real registry-issued owner.
-    pub fn recovery(failure: CleanupFailure, owner: RecoveryOwner) -> Self {
-        Self {
-            plan: CleanupPlan::Recover(failure, owner),
         }
     }
 
@@ -68,7 +55,7 @@ impl FakeCleanup {
     pub fn into_future(self) -> FakeCleanupFuture {
         let gate = match &self.plan {
             CleanupPlan::Pending(gate) => Some(Box::pin(gate.wait())),
-            CleanupPlan::Succeed | CleanupPlan::Recover(_, _) | CleanupPlan::Panic => None,
+            CleanupPlan::Succeed | CleanupPlan::Panic => None,
         };
         FakeCleanupFuture {
             plan: Some(self.plan),
@@ -104,7 +91,6 @@ impl Future for FakeCleanupFuture {
         }
         match self.plan.take().expect("cleanup future polled after completion") {
             CleanupPlan::Succeed | CleanupPlan::Pending(_) => Poll::Ready(CleanupOutcome::Cleaned),
-            CleanupPlan::Recover(failure, owner) => Poll::Ready(CleanupOutcome::FailedWithRecovery(failure, owner)),
             CleanupPlan::Panic => panic!("scripted cleanup panic"),
         }
     }

@@ -37,21 +37,17 @@ mod driver_error;
 // Preserves rejected asynchronous work for its caller.
 mod driver_rejected;
 // Shared generation-based condition variable and async waker notifications.
-mod notify;
+pub(crate) mod notify;
 // Single-consumer result state and repeatable terminal snapshots.
-mod state;
+pub(crate) mod state;
 
 pub(crate) use attach_rejected::AttachRejected;
-pub(crate) use blocking_executor::BlockingExecutor;
 pub(crate) use blocking_rejected::BlockingRejected;
 pub(crate) use box_future::BoxFuture;
 pub(crate) use child_commit::ChildCommit;
 pub(crate) use child_options::ChildOptions;
-pub(crate) use child_registry::ChildRegistry;
 pub(crate) use child_requirement::ChildRequirement;
 pub(crate) use child_reservation::ChildReservation;
-pub(crate) use cleanup_port::CleanupPort;
 pub(crate) use cleanup_rejected::CleanupRejected;
-pub(crate) use driver::Driver;
 pub(crate) use driver_error::DriverError;
 pub(crate) use driver_rejected::DriverRejected;

@@ -17,4 +17,10 @@
 /// assert_eq!(domain.0, 42);
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ClockDomainId(pub u64);
+pub struct ClockDomainId(
+    /// Distinguishes this clock's tick sequence from ticks produced by other
+    /// clocks.
+    ///
+    /// Values from different domains must not be compared as timestamps.
+    pub u64,
+);

@@ -9,30 +9,32 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::Weak;
+use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
 
-use super::Inner;
 use super::ASYNC_WAITER_CAPACITY;
+use super::inner::Inner;
 use super::lock;
 use crate::report::ObservationError;
 
 /// Future that completes after the notification generation changes.
 pub(crate) struct Notified {
     /// Weak ownership avoids keeping its state cell alive.
-    inner: Weak<Inner>,
+    pub(super) inner: Weak<Inner>,
     /// Generation this future waits to advance beyond.
-    generation: u64,
+    pub(super) generation: u64,
     /// Unique registration removed when this future is dropped or completes.
-    waiter_id: Option<u64>,
+    pub(super) waiter_id: Option<u64>,
 }
 
 impl Future for Notified {
+    /// The future reports successful notification or a waiter-capacity error.
     type Output = Result<(), ObservationError>;
 
-    /// Registers this future or completes when its notification generation advances.
+    /// Registers this future or completes when its notification generation
+    /// advances.
     ///
     /// # Parameters
     ///
@@ -45,8 +47,8 @@ impl Future for Notified {
     ///
     /// # Errors
     ///
-    /// Returns `ObservationError::WaiterCapacityExceeded` when no waiter slot is
-    /// available for this future.
+    /// Returns `ObservationError::WaiterCapacityExceeded` when no waiter slot
+    /// is available for this future.
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let Some(inner) = self.inner.upgrade() else {
             self.waiter_id = None;
@@ -90,6 +92,8 @@ impl Future for Notified {
 }
 
 impl Drop for Notified {
+    /// Removes any registered waiter when this future is dropped so an
+    /// abandoned future does not retain a waiter slot.
     fn drop(&mut self) {
         let Some(id) = self.waiter_id.take() else {
             return;

@@ -64,7 +64,6 @@ impl TransferReceipt {
     /// # Returns
     ///
     /// A receipt binding both registrations and the source generation.
-    #[allow(dead_code)] // Called by the recovery registry after accepting an owner.
     #[inline]
     pub(crate) const fn accepted_by_registry(resource: ResourceId, receiver: ResourceId) -> Self {
         Self {

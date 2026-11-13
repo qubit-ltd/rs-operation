@@ -8,12 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::protocol::ClockSource;
-use crate::protocol::StopReason;
-use crate::report::MonotonicTime;
-
 use super::BudgetLease;
-use super::BudgetLeaseError;
 use super::ContextError;
 use super::ContextOptions;
 use super::Deadline;
@@ -21,12 +16,26 @@ use super::DeadlineSignal;
 use super::StopSignal;
 use super::internal::CombinedBudgetLease;
 use super::internal::Node;
+use crate::protocol::ClockSource;
+use crate::protocol::StopReason;
+use crate::report::MonotonicTime;
 
-/// Combines inherited budget checks so both parent and child policies must allow work.
+/// Combines inherited budget checks so both parent and child policies must
+/// allow work.
 ///
 /// When both leases exist, the resulting lease checks the parent before the
 /// child. If only one exists, it is passed through; if neither exists, the
 /// result is `None`.
+///
+/// # Parameters
+///
+/// - `parent`: Lease inherited from the parent context, if present.
+/// - `child`: Lease supplied for the child context, if present.
+///
+/// # Returns
+///
+/// `Some` containing both leases when both are present, the present lease when
+/// only one exists, or `None` when neither lease exists.
 fn inherit_budget(
     parent: Option<Arc<dyn BudgetLease>>,
     child: Option<Arc<dyn BudgetLease>>,
@@ -76,6 +85,7 @@ impl OperationContext {
     /// # Returns
     ///
     /// A new root context with independent cancellation state.
+    #[must_use]
     pub fn new(options: ContextOptions) -> Self {
         Self {
             node: Node::new(),
@@ -104,11 +114,7 @@ impl OperationContext {
     pub fn child(&self, options: ContextOptions) -> Result<Self, ContextError> {
         let clock = options.clock.or_else(|| self.clock.clone());
         let deadline = match (self.deadline, options.deadline) {
-            (Some(parent), Some(child)) => Some(
-                parent
-                    .earliest(child)
-                    .map_err(|_| ContextError::ClockDomainMismatch)?,
-            ),
+            (Some(parent), Some(child)) => Some(parent.earliest(child).map_err(|_| ContextError::ClockDomainMismatch)?),
             (Some(parent), None) => Some(parent),
             (None, child) => child,
         };
@@ -144,6 +150,7 @@ impl OperationContext {
     /// # Returns
     ///
     /// A root context with no cancellation or policy inheritance from `self`.
+    #[must_use]
     #[inline]
     pub fn cleanup_context(options: ContextOptions) -> Self {
         Self::new(options)
@@ -175,12 +182,12 @@ impl OperationContext {
     ///
     /// `true` only when both a clock and deadline exist in the same domain and
     /// the clock has reached or passed the deadline.
+    #[must_use]
     pub fn is_expired(&self) -> bool {
         match (self.deadline, self.clock.as_ref()) {
             (Some(deadline), Some(clock)) => {
                 let now = clock.now();
-                now.domain == deadline.time_point().domain
-                    && now.ticks >= deadline.time_point().ticks
+                now.domain == deadline.time_point().domain && now.ticks >= deadline.time_point().ticks
             }
             _ => false,
         }
@@ -234,9 +241,7 @@ impl OperationContext {
             return Err(ContextError::DeadlineExpired);
         }
         if let Some(budget) = &self.budget {
-            budget
-                .check()
-                .map_err(|_| ContextError::BudgetUnavailable)?;
+            budget.check().map_err(|_| ContextError::BudgetUnavailable)?;
         }
         Ok(())
     }
@@ -253,11 +258,7 @@ impl OperationContext {
         if clock.now().domain != deadline.time_point().domain {
             return None;
         }
-        Some(DeadlineSignal::new(
-            deadline,
-            clock,
-            Arc::downgrade(&self.node),
-        ))
+        Some(DeadlineSignal::new(deadline, clock, Arc::downgrade(&self.node)))
     }
 
     /// Register an observer-only timer in this context's clock domain.
@@ -281,19 +282,22 @@ impl OperationContext {
             return Err(ContextError::ClockDomainMismatch);
         }
         let observer_node = Arc::new(Node::new());
-        Ok(DeadlineSignal::new(
-            deadline,
-            clock,
-            Arc::downgrade(&observer_node),
-        ))
+        Ok(DeadlineSignal::new(deadline, clock, Arc::downgrade(&observer_node)))
     }
 }
 
 /// Ensure a deadline has a clock and that both use the same domain.
-fn validate_clock(
-    clock: Option<&dyn ClockSource>,
-    deadline: Option<Deadline>,
-) -> Result<(), ContextError> {
+///
+/// # Parameters
+///
+/// - `clock`: Clock to validate when a deadline is configured.
+/// - `deadline`: Optional deadline whose clock domain must match `clock`.
+///
+/// # Errors
+///
+/// Returns `ClockUnavailable` when a deadline is supplied without a clock, or
+/// `ClockDomainMismatch` when their domains differ.
+fn validate_clock(clock: Option<&dyn ClockSource>, deadline: Option<Deadline>) -> Result<(), ContextError> {
     if let Some(deadline) = deadline {
         let Some(clock) = clock else {
             return Err(ContextError::ClockUnavailable);
@@ -306,6 +310,17 @@ fn validate_clock(
 }
 
 impl From<MonotonicTime> for Deadline {
+    /// Convert a monotonic time point into an absolute deadline.
+    ///
+    /// The time point's clock domain is preserved unchanged.
+    ///
+    /// # Parameters
+    ///
+    /// - `at`: Monotonic time point that defines the deadline.
+    ///
+    /// # Returns
+    ///
+    /// A deadline at `at`, preserving its clock domain and tick value.
     #[inline]
     fn from(at: MonotonicTime) -> Self {
         Self::at(at)

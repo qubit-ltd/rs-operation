@@ -82,15 +82,9 @@ fn test_rejected_body_is_returned_unchanged_and_reservations_roll_back() {
 fn test_admission_waiter_drop_unregisters_and_close_returns_its_body() {
     use core::future::Future;
     use core::pin::Pin;
-    use std::sync::Arc;
     use std::task::Context;
     use std::task::Poll;
-    use std::task::Wake;
     use std::task::Waker;
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
 
     let supervisor = OperationSupervisor::new(SupervisorLimits {
         active_roots: 0,
@@ -100,8 +94,7 @@ fn test_admission_waiter_drop_unregisters_and_close_returns_its_body() {
         ..SupervisorLimits::default()
     });
     let blocker = supervisor.try_admit().unwrap();
-    let waker = Waker::from(Arc::new(Noop));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let mut dropped = Box::pin(supervisor.start_wait_body(String::from("dropped")).unwrap());
     assert!(matches!(Pin::as_mut(&mut dropped).poll(&mut cx), Poll::Pending));
     assert_eq!(
@@ -198,7 +191,6 @@ fn test_admission_wait_deadline_returns_expired_error_and_unstarted_body() {
     use std::sync::atomic::Ordering;
     use std::task::Context;
     use std::task::Poll;
-    use std::task::Wake;
     use std::task::Waker;
 
     use qubit_operation::context::ContextOptions;
@@ -225,10 +217,6 @@ fn test_admission_wait_deadline_returns_expired_error_and_unstarted_body() {
             Box::new(Registration)
         }
     }
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
 
     let supervisor = OperationSupervisor::new(SupervisorLimits {
         active_roots: 0,
@@ -250,8 +238,7 @@ fn test_admission_wait_deadline_returns_expired_error_and_unstarted_body() {
             .start_wait_body_with_context(String::from("body"), Some(context))
             .unwrap(),
     );
-    let waker = Waker::from(Arc::new(Noop));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     assert!(matches!(Pin::as_mut(&mut waiter).poll(&mut cx), Poll::Pending));
     clock.ticks.store(2, Ordering::SeqCst);
     clock.waker.lock().unwrap().take().unwrap().wake();

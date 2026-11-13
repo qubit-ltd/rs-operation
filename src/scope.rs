@@ -29,5 +29,4 @@ pub use scope_options::ScopeOptions;
 pub use scope_policy::ScopePolicy;
 
 #[cfg(test)]
-#[path = "scope/tests.rs"]
 mod tests;

@@ -13,11 +13,10 @@ use core::task::Poll;
 use std::sync::Arc;
 use std::sync::Weak;
 
+use super::Deadline;
 use crate::protocol::ClockSource;
 use crate::protocol::StopReason;
 use crate::protocol::TimerRegistration;
-
-use super::Deadline;
 
 /// Future that requests timeout when its registered deadline is reached.
 ///
@@ -25,6 +24,10 @@ use super::Deadline;
 /// supplies this future when the context has a clock and deadline.
 ///
 /// # Examples
+///
+/// An [`OperationContext`](super::super::OperationContext) supplies this
+/// signal when its deadline and clock are available; await it to observe the
+/// deadline.
 ///
 /// ```
 /// use qubit_operation::context::DeadlineSignal;
@@ -43,14 +46,22 @@ pub struct DeadlineSignal {
     node: Weak<super::super::internal::Node>,
     /// Active clock registration, canceled on wake or drop.
     registration: Option<Box<dyn TimerRegistration>>,
-    /// Waker used for the current registration so changed wakers can replace it.
+    /// Waker used for the current registration so changed wakers can replace
+    /// it.
     registered_waker: Option<core::task::Waker>,
     /// Whether the deadline has fired and the future is complete.
     fired: bool,
 }
 
 impl DeadlineSignal {
-    /// Create an unregistered future for a deadline and its cancellation target.
+    /// Create an unregistered future for a deadline and its cancellation
+    /// target.
+    ///
+    /// # Parameters
+    ///
+    /// - `deadline`: Absolute time point at which the future completes.
+    /// - `clock`: Source used to read time and register a wake-up.
+    /// - `node`: Weak reference to the context node that receives the timeout.
     pub(in crate::context) fn new(
         deadline: Deadline,
         clock: Arc<dyn ClockSource>,
@@ -68,8 +79,20 @@ impl DeadlineSignal {
 }
 
 impl Future for DeadlineSignal {
+    /// The signal completes without producing a value.
     type Output = ();
 
+    /// Poll the clock and register the current waker until the deadline fires.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Pinned mutable access to this signal's timer state.
+    /// - `cx`: Poll context whose waker is registered with the clock.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ready(())` after the deadline fires or its clock domain no
+    /// longer matches. Otherwise, returns `Pending` and registers `cx`'s waker.
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.fired {
             return Poll::Ready(());
@@ -95,16 +118,14 @@ impl Future for DeadlineSignal {
                 registration.cancel();
             }
             self.registered_waker = Some(cx.waker().clone());
-            self.registration = Some(
-                self.clock
-                    .register_deadline(self.deadline.at, cx.waker().clone()),
-            );
+            self.registration = Some(self.clock.register_deadline(self.deadline.at, cx.waker().clone()));
         }
         Poll::Pending
     }
 }
 
 impl Drop for DeadlineSignal {
+    /// Cancel any outstanding timer registration when the future is dropped.
     fn drop(&mut self) {
         if let Some(registration) = self.registration.take() {
             registration.cancel();

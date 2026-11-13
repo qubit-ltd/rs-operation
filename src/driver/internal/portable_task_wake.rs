@@ -22,11 +22,18 @@ pub struct PortableTaskWake {
 }
 
 impl Wake for PortableTaskWake {
+    /// Schedules the associated task when this owned waker is consumed.
+    ///
+    /// The weak scheduler reference is upgraded by `wake_by_ref`; if the
+    /// portable driver has already been dropped, waking has no effect.
     #[inline]
     fn wake(self: Arc<Self>) {
         self.wake_by_ref();
     }
 
+    /// Schedules the associated task while retaining this shared waker.
+    ///
+    /// Returns without scheduling when the portable driver has been dropped.
     fn wake_by_ref(self: &Arc<Self>) {
         let Some(shared) = self.shared.upgrade() else {
             return;

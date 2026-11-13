@@ -31,9 +31,9 @@ use super::internal::util::lock;
 #[must_use = "dropping the permit immediately releases cleanup capacity"]
 pub struct CleanupPermit {
     /// Supervisor state whose cleanup capacity this permit holds.
-    inner: Arc<Inner>,
+    pub(super) inner: Arc<Inner>,
     /// Tracks whether Drop has already returned the reserved slot.
-    released: bool,
+    pub(super) released: bool,
 }
 
 impl Drop for CleanupPermit {
@@ -46,4 +46,3 @@ impl Drop for CleanupPermit {
         }
     }
 }
-

@@ -7,6 +7,16 @@
 // =============================================================================
 
 /// Why a blocking closure could not be accepted or an executor could not start.
+///
+/// # Examples
+///
+/// ```
+/// use qubit_operation::driver::ExecutorError;
+///
+/// let error = ExecutorError::Capacity;
+/// assert_eq!(error.to_string(), "executor queue capacity is full");
+/// ```
+#[must_use]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutorError {
     /// Worker count and queue capacity must both be positive.
@@ -20,6 +30,15 @@ pub enum ExecutorError {
 }
 
 impl std::fmt::Display for ExecutorError {
+    /// Formats the executor failure as a concise user-facing message.
+    ///
+    /// # Parameters
+    ///
+    /// - `f`: Formatter that receives the error message.
+    ///
+    /// # Returns
+    ///
+    /// The result of writing the message to the formatter.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::InvalidConfiguration => "executor limits must be positive",

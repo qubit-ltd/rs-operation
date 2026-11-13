@@ -15,4 +15,3 @@ pub enum ShutdownMode {
     /// Stop admission and request cancellation of managed work.
     Cancel,
 }
-

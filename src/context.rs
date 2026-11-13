@@ -17,7 +17,6 @@ mod context_error;
 // Options inherited when creating root and child contexts.
 mod context_options;
 // Clock-domain deadlines and their signaling future.
-#[path = "context/deadline.rs"]
 mod deadline;
 // Private cancellation and budget implementation types.
 mod internal;

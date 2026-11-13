@@ -6,53 +6,29 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
-use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::atomic::Ordering;
 use std::task::Context;
+use std::task::Poll;
 use std::thread;
 
-thread_local! { static IN_PORTABLE_WORKER: Cell<bool> = const { Cell::new(false) }; }
-
-pub fn is_portable_worker_thread() -> bool {
-    IN_PORTABLE_WORKER.with(Cell::get)
-}
-
-struct WorkerMarker;
-impl WorkerMarker {
-    fn enter() -> Self {
-        IN_PORTABLE_WORKER.with(|value| value.set(true));
-        Self
-    }
-}
-impl Drop for WorkerMarker {
-    fn drop(&mut self) {
-        IN_PORTABLE_WORKER.with(|value| value.set(false));
-    }
-}
-
-#[cfg(test)]
-struct ActiveWorkerMarker(Arc<PortableShared>);
-#[cfg(test)]
-impl ActiveWorkerMarker {
-    fn enter(shared: Arc<PortableShared>) -> Self {
-        shared.active_workers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        Self(shared)
-    }
-}
-#[cfg(test)]
-impl Drop for ActiveWorkerMarker {
-    fn drop(&mut self) {
-        self.0.active_workers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
-}
-
 use super::PortableShared;
+#[cfg(test)]
+use super::active_worker_marker::ActiveWorkerMarker;
+use super::worker_marker::WorkerMarker;
 
 /// Poll portable tasks in bounded FIFO turns without holding the scheduler
 /// lock.
+///
+/// # Parameters
+///
+/// * `shared` — shared queue and task state for this worker.
+///
+/// The worker owns this `Arc` for its lifetime.
 pub fn portable_worker_loop(shared: Arc<PortableShared>) {
     let _worker_marker = WorkerMarker::enter();
     #[cfg(test)]
@@ -68,7 +44,7 @@ pub fn portable_worker_loop(shared: Arc<PortableShared>) {
                     }
                     if let Some(id) = state.ready.pop_front() {
                         if let Some(task) = state.tasks.get(&id).cloned() {
-                            task.queued.store(false, std::sync::atomic::Ordering::Release);
+                            task.queued.store(false, Ordering::Release);
                             break (id, task);
                         }
                         continue;
@@ -84,7 +60,7 @@ pub fn portable_worker_loop(shared: Arc<PortableShared>) {
             let poll = catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(&mut context)));
             completed_this_turn += 1;
             match poll {
-                Ok(std::task::Poll::Ready(())) => {
+                Ok(Poll::Ready(())) => {
                     let removed = lock(&shared.state).tasks.remove(&id);
                     drop(removed);
                     // A user future destructor can also panic. Isolate that panic so one
@@ -97,7 +73,7 @@ pub fn portable_worker_loop(shared: Arc<PortableShared>) {
                     let _ = catch_unwind(AssertUnwindSafe(|| drop(future)));
                     let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
                 }
-                Ok(std::task::Poll::Pending) => {
+                Ok(Poll::Pending) => {
                     *lock(&task.future) = Some(future);
                 }
             }
@@ -107,13 +83,19 @@ pub fn portable_worker_loop(shared: Arc<PortableShared>) {
 }
 
 /// Insert a task into the ready queue once while preserving the capacity bound.
+///
+/// # Parameters
+///
+/// * `shared` — scheduler state receiving the task notification.
+/// * `id` — identifier of the task to schedule; missing or closed tasks are
+///   ignored.
 pub fn schedule_portable_task(shared: &PortableShared, id: u64) {
     let mut state = lock(&shared.state);
     if state.closed {
         return;
     }
     if let Some(task) = state.tasks.get(&id)
-        && !task.queued.swap(true, std::sync::atomic::Ordering::AcqRel)
+        && !task.queued.swap(true, Ordering::AcqRel)
     {
         state.ready.push_back(id);
         shared.ready.notify_one();
@@ -121,12 +103,29 @@ pub fn schedule_portable_task(shared: &PortableShared, id: u64) {
 }
 
 /// Stop worker loops; task owners are drained after workers join.
+///
+/// # Parameters
+///
+/// * `shared` — scheduler state whose workers should be stopped.
 pub fn close_portable(shared: &PortableShared) {
     let mut state = lock(&shared.state);
     state.closed = true;
     shared.ready.notify_all();
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+/// Locks scheduler state, recovering the contained value after a prior panic.
+///
+/// # Type Parameters
+///
+/// * `T` — the value protected by the mutex.
+///
+/// # Parameters
+///
+/// * `mutex` — synchronization primitive to acquire.
+///
+/// # Returns
+///
+/// A guard that releases the mutex when dropped.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }

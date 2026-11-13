@@ -28,7 +28,8 @@ pub(crate) trait CleanupPort: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns the rejected cleanup and admission failure if registration fails.
+    /// Returns the rejected cleanup and admission failure if registration
+    /// fails.
     fn begin_cleanup(&self, operation: OperationId, cleanup: Box<dyn OwnedCleanup>) -> Result<(), CleanupRejected>;
 
     /// Records the outcome produced by a completed cleanup operation.

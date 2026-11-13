@@ -11,6 +11,10 @@ use super::ResultLease;
 use super::TaskLease;
 
 /// Body transferred to a driver with separately owned lifecycle leases.
+///
+/// # Type Parameters
+///
+/// - `F`: the work item transferred unchanged to the operation coordinator.
 pub(crate) struct AdmittedTask<F> {
     /// Work item that the driver will execute after admission succeeds.
     pub(in crate::supervisor) body: F,
@@ -25,7 +29,8 @@ impl<F> AdmittedTask<F> {
     ///
     /// # Returns
     ///
-    /// Returns the body, execution lease, and result lease as one ownership handoff.
+    /// Returns the body, execution lease, and result lease as one ownership
+    /// handoff.
     ///
     /// # Panics
     ///
@@ -38,4 +43,3 @@ impl<F> AdmittedTask<F> {
         )
     }
 }
-

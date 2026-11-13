@@ -6,8 +6,8 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
-use super::DiagnosticSummary;
-use super::OperationId;
+use crate::report::DiagnosticSummary;
+use crate::report::OperationId;
 
 /// Sanitized panic diagnostic without arbitrary panic payload disclosure.
 ///

@@ -9,8 +9,19 @@
 
 use crate::context::OperationContext;
 
-pub(super) enum ServiceRequestEntry {
+/// Tracks whether a service-group request is standalone or supervises an
+/// operation.
+///
+/// Managed requests retain their cancellation context after startup so a
+/// canceling group shutdown can stop active operations. Standalone requests
+/// have no operation context to retain.
+pub(in crate::supervisor) enum ServiceRequestEntry {
+    /// A request lease admitted without starting a supervised operation.
     Standalone,
-    Managed(Option<OperationContext>),
+    /// A supervised request and its context, once the operation has started.
+    Managed(
+        /// The operation context after startup; `None` while startup is
+        /// pending.
+        Option<OperationContext>,
+    ),
 }
-

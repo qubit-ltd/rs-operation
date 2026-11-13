@@ -10,7 +10,8 @@
 use crate::report::ChildBusinessSummary;
 use crate::report::ChildSettlement;
 
-/// Aggregate of committed child operations after business and release observation.
+/// Aggregate of committed child operations after business and release
+/// observation.
 #[derive(Clone, Debug, Default)]
 pub struct ScopeJoinReport {
     /// Settlement records for children whose resources have been released.

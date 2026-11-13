@@ -9,9 +9,8 @@
 use std::sync::Weak;
 use std::task::Waker;
 
-use crate::protocol::StopReason;
-
 use super::Node;
+use crate::protocol::StopReason;
 
 /// Mutable cancellation data protected by a node's mutex.
 pub(in crate::context) struct NodeState {

@@ -9,9 +9,10 @@
 
 use std::task::Waker;
 
-/// Tracks one lease's queue membership, active capacity, and result reservation.
+/// Tracks one lease's queue membership, active capacity, and result
+/// reservation.
 #[derive(Default)]
-pub(super) struct LeaseState {
+pub(in crate::supervisor) struct LeaseState {
     /// Whether this lease is waiting in the bounded root-admission queue.
     pub(in crate::supervisor) queued: bool,
     /// Whether this lease currently occupies an active root slot.
@@ -23,4 +24,3 @@ pub(super) struct LeaseState {
     /// Wakers waiting for a capacity change associated with this lease.
     pub(in crate::supervisor) active_waiters: Vec<Waker>,
 }
-

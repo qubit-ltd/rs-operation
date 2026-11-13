@@ -6,17 +6,29 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
+use std::error::Error;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::fmt::Result;
+
 /// Invalid transition while reporting external driver lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use = "external driver errors should be handled"]
 pub enum ExternalDriverError {
     /// The lease has already been marked lost or released.
     AlreadySettled,
 }
 
-impl std::fmt::Display for ExternalDriverError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for ExternalDriverError {
+    /// Writes the fixed message describing an already-settled external lease.
+    ///
+    /// # Parameters
+    ///
+    /// * `f` is the formatter that receives the message; formatting errors are
+    ///   returned to the caller.
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.write_str("external driver lease has already been settled")
     }
 }
 
-impl std::error::Error for ExternalDriverError {}
+impl Error for ExternalDriverError {}

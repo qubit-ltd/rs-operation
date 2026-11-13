@@ -10,11 +10,11 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use super::lock;
-use super::notify::Notify;
 use super::ResultFuture;
 use super::ResultSlot;
 use super::State;
+use super::lock;
+use crate::internal::notify::Notify;
 use crate::report::MonotonicTime;
 use crate::report::ObservationError;
 use crate::report::OperationOutcome;
@@ -23,6 +23,11 @@ use crate::report::StopReason;
 use crate::report::StopReport;
 
 /// Shares a single-consumer business result and repeatable settlement snapshot.
+///
+/// # Type Parameters
+///
+/// - `T`: The value type carried by a successful business outcome.
+/// - `E`: The error type carried by a failed business outcome.
 pub(crate) struct StateCell<T, E> {
     /// Serializes all business, stop, and settlement facts.
     state: Mutex<State<T, E>>,
@@ -46,6 +51,34 @@ impl<T, E> StateCell<T, E> {
                 settlement: None,
             }),
             changed: Notify::new(),
+        }
+    }
+
+    /// Takes a ready result or reports the terminal state that prevents access.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Some` with the consumed result, or `None` while it is pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AlreadyTaken` or `ResultDiscarded` for those terminal states.
+    pub(super) fn take_if_ready(&self) -> Result<Option<OperationOutcome<T, E>>, ObservationError> {
+        let mut state = lock(&self.state);
+        match std::mem::replace(&mut state.result, ResultSlot::Taken) {
+            ResultSlot::Pending => {
+                state.result = ResultSlot::Pending;
+                Ok(None)
+            }
+            ResultSlot::Ready(result) => Ok(Some(result)),
+            ResultSlot::Taken => {
+                state.result = ResultSlot::Taken;
+                Err(ObservationError::AlreadyTaken)
+            }
+            ResultSlot::Discarded => {
+                state.result = ResultSlot::Discarded;
+                Err(ObservationError::ResultDiscarded)
+            }
         }
     }
 
@@ -81,12 +114,14 @@ impl<T, E> StateCell<T, E> {
         Ok(())
     }
 
-    /// Accepts the first stop reason if no successful outcome has been published.
+    /// Accepts the first stop reason if no successful outcome has been
+    /// published.
     ///
     /// # Parameters
     ///
     /// - `reason`: The stop reason to record.
-    /// - `accepted_at`: The monotonic time at which the stop was accepted, if known.
+    /// - `accepted_at`: The monotonic time at which the stop was accepted, if
+    ///   known.
     ///
     /// # Returns
     ///
@@ -96,9 +131,7 @@ impl<T, E> StateCell<T, E> {
     pub(crate) fn request_stop(&self, reason: StopReason, accepted_at: Option<MonotonicTime>) -> bool {
         let accepted = {
             let mut state = lock(&self.state);
-            if state.success_published {
-                false
-            } else if state.stop.is_some() {
+            if state.success_published || state.stop.is_some() {
                 false
             } else {
                 let report = StopReport { reason, accepted_at };
@@ -148,7 +181,8 @@ impl<T, E> StateCell<T, E> {
         }
     }
 
-    /// Discards an available result without dropping its user value under the state lock.
+    /// Discards an available result without dropping its user value under the
+    /// state lock.
     ///
     /// # Returns
     ///
@@ -221,7 +255,8 @@ impl<T, E> StateCell<T, E> {
         lock(&self.state).settlement.as_ref().map(Arc::clone)
     }
 
-    /// Returns the first accepted stop fact without consuming the business result.
+    /// Returns the first accepted stop fact without consuming the business
+    /// result.
     ///
     /// # Returns
     ///
@@ -230,33 +265,5 @@ impl<T, E> StateCell<T, E> {
     #[inline]
     pub(crate) fn stop_report(&self) -> Option<StopReport> {
         lock(&self.state).stop.clone()
-    }
-
-    /// Takes a ready result or reports the terminal state that prevents access.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Some` with the consumed result, or `None` while it is pending.
-    ///
-    /// # Errors
-    ///
-    /// Returns `AlreadyTaken` or `ResultDiscarded` for those terminal states.
-    pub(super) fn take_if_ready(&self) -> Result<Option<OperationOutcome<T, E>>, ObservationError> {
-        let mut state = lock(&self.state);
-        match std::mem::replace(&mut state.result, ResultSlot::Taken) {
-            ResultSlot::Pending => {
-                state.result = ResultSlot::Pending;
-                Ok(None)
-            }
-            ResultSlot::Ready(result) => Ok(Some(result)),
-            ResultSlot::Taken => {
-                state.result = ResultSlot::Taken;
-                Err(ObservationError::AlreadyTaken)
-            }
-            ResultSlot::Discarded => {
-                state.result = ResultSlot::Discarded;
-                Err(ObservationError::ResultDiscarded)
-            }
-        }
     }
 }

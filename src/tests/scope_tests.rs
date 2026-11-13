@@ -5,11 +5,18 @@
 //
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
-//! Public scope resource transfer contracts.
+//! Scope tests for resource-use waiter notifications.
 
 use std::future::Future;
+use std::future::ready;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
 
 use crate::context::ContextOptions;
 use crate::context::OperationContext;
@@ -25,16 +32,57 @@ use crate::scope::ScopePolicy;
 struct ReadyCleanup;
 
 impl OwnedCleanup for ReadyCleanup {
-    fn begin(
-        self: Box<Self>,
-        _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
-        Box::pin(std::future::ready(CleanupOutcome::Cleaned))
+    fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+        Box::pin(ready(CleanupOutcome::Cleaned))
+    }
+}
+
+struct WakeCount(AtomicUsize);
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 #[test]
-fn opposing_scope_resource_transfers_do_not_invert_handle_locks() {
+fn test_dropping_last_resource_use_wakes_registered_scope_waiter() {
+    let scope = OperationScope::new(
+        OperationId::new(1),
+        ScopeLimits::default(),
+        ScopePolicy::FailFast,
+        CleanupScheduler::new(1),
+        OperationContext::new(ContextOptions::default()),
+    );
+    let id = scope.register_resource(ReadyCleanup).unwrap();
+    let use_lease = scope.acquire_use(id).unwrap();
+    scope.close_for_use(id).unwrap();
+    let seen = scope.resource_epoch();
+    let mut wait = Box::pin(scope.wait_for_resource_change(seen));
+    let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wake_count));
+    let mut cx = Context::from_waker(&waker);
+    assert!(
+        wait.as_mut().poll(&mut cx).is_pending(),
+        "the waiter should remain pending while the resource use is active"
+    );
+    drop(use_lease);
+    assert!(
+        wake_count.0.load(Ordering::SeqCst) > 0,
+        "dropping the final use should wake the registered waiter"
+    );
+    assert!(
+        matches!(wait.as_mut().poll(&mut cx), Poll::Ready(())),
+        "the waiter should complete after the final resource use is dropped"
+    );
+}
+
+#[test]
+fn test_opposing_scope_resource_transfers_do_not_invert_handle_locks() {
     let make_scope = |id| {
         OperationScope::new(
             OperationId::new(id),
@@ -74,14 +122,8 @@ fn opposing_scope_resource_transfers_do_not_invert_handle_locks() {
     barrier.wait();
     let first_result = rx.recv_timeout(std::time::Duration::from_secs(1));
     let second_result = rx.recv_timeout(std::time::Duration::from_secs(1));
-    assert!(
-        first_result.is_ok(),
-        "first opposing transfer must complete"
-    );
-    assert!(
-        second_result.is_ok(),
-        "second opposing transfer must complete"
-    );
+    assert!(first_result.is_ok(), "first opposing transfer must complete");
+    assert!(second_result.is_ok(), "second opposing transfer must complete");
     assert!(first_result.unwrap().is_ok());
     assert!(second_result.unwrap().is_ok());
 }

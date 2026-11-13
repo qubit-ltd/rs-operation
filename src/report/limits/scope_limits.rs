@@ -37,6 +37,11 @@ pub struct ScopeLimits {
 }
 
 impl Default for ScopeLimits {
+    /// Creates the standard registration capacities for one root operation.
+    ///
+    /// These defaults reserve capacity for 64 child operations, 128 resources,
+    /// and 64 caller-declared side-effect records. They bound registrations
+    /// without changing the limits explicitly chosen by callers.
     #[inline]
     fn default() -> Self {
         Self {

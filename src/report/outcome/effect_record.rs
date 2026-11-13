@@ -6,10 +6,10 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
-use super::DiagnosticSummary;
 use super::EffectFact;
-use super::OperationId;
-use super::ResourceId;
+use crate::report::DiagnosticSummary;
+use crate::report::OperationId;
+use crate::report::ResourceId;
 
 /// Caller-declared side-effect fact; the framework does not independently
 /// verify it.

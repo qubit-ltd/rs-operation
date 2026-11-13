@@ -43,16 +43,38 @@ pub struct ReleaseReceipt {
 
 impl ReleaseReceipt {
     /// Create proof after the receiver registry has confirmed resource release.
+    ///
+    /// # Parameters
+    ///
+    /// - `source`: source registration whose transferred tombstone will be
+    ///   settled.
+    /// - `receiver`: receiver registration whose release was confirmed.
+    ///
+    /// # Returns
+    ///
+    /// A receipt binding the source tombstone to the receiver's release
+    /// confirmation.
+    #[inline]
     pub(crate) const fn confirmed(source: ResourceId, receiver: ResourceId) -> Self {
         Self { source, receiver }
     }
 
     /// Original resource identity whose transferred tombstone can be settled.
+    ///
+    /// # Returns
+    ///
+    /// The source registration represented by this receipt.
+    #[inline]
     pub const fn source(self) -> ResourceId {
         self.source
     }
 
     /// Receiver resource identity whose release was confirmed.
+    ///
+    /// # Returns
+    ///
+    /// The receiver registration represented by this receipt.
+    #[inline]
     pub const fn receiver(self) -> ResourceId {
         self.receiver
     }

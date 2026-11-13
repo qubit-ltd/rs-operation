@@ -39,13 +39,32 @@ use super::StopReport;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OperationOutcome<T, E> {
     /// The body and required children completed successfully.
-    Succeeded(T),
+    Succeeded(
+        /// The value produced by the operation body after required children
+        /// have completed successfully.
+        T,
+    ),
     /// Preserve the original domain error without requiring `Clone`.
-    Failed(E),
+    Failed(
+        /// The original domain error returned by the operation body, preserved
+        /// without requiring the error type to implement `Clone`.
+        E,
+    ),
     /// An unhandled required child failed with a different error type.
-    ChildFailed(ChildFailureSummary),
+    ChildFailed(
+        /// Bounded identity and diagnostic summary for the required child that
+        /// failed without being handled by its parent.
+        ChildFailureSummary,
+    ),
     /// Delivery stopped before a business result was determined.
-    Stopped(StopReport),
+    Stopped(
+        /// The accepted stop reason and optional acceptance timestamp.
+        StopReport,
+    ),
     /// The body panicked; payload details are deliberately omitted.
-    Panicked(PanicSummary),
+    Panicked(
+        /// Sanitized operation and lifecycle-phase details, excluding the
+        /// arbitrary panic payload.
+        PanicSummary,
+    ),
 }

@@ -43,7 +43,8 @@ impl ResourceId {
     ///
     /// # Returns
     ///
-    /// The resource identity formed from the operation and registry coordinates.
+    /// The resource identity formed from the operation and registry
+    /// coordinates.
     #[inline]
     pub const fn new(operation: OperationId, slot: u32, generation: u32) -> Self {
         Self {

@@ -7,11 +7,11 @@
 // =============================================================================
 //! Shared synchronization backing one notification source.
 
-use std::sync::atomic::AtomicU64;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 
-use super::WaitState;
+use super::wait_state::WaitState;
 
 /// Holds the generation, waiter list, and blocking notification primitive.
 #[derive(Default)]

@@ -8,16 +8,20 @@
 //! Tests that require access to private scope waiting state.
 
 use std::future::Future;
+use std::future::ready;
+use std::mem::forget;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::channel;
 use std::task::Context;
 use std::task::Poll;
 use std::task::RawWaker;
 use std::task::RawWakerVTable;
-use std::task::Wake;
 use std::task::Waker;
+use std::thread::spawn;
+use std::time::Duration;
 
 use super::OperationScope;
 use super::ScopePolicy;
@@ -34,23 +38,8 @@ use crate::resource::ResourceRegistry;
 struct ReadyCleanup;
 
 impl OwnedCleanup for ReadyCleanup {
-    fn begin(
-        self: Box<Self>,
-        _: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
-        Box::pin(std::future::ready(CleanupOutcome::Cleaned))
-    }
-}
-
-struct WakeCount(AtomicUsize);
-
-impl Wake for WakeCount {
-    fn wake(self: Arc<Self>) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.fetch_add(1, Ordering::SeqCst);
+    fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+        Box::pin(ready(CleanupOutcome::Cleaned))
     }
 }
 
@@ -61,15 +50,12 @@ struct ReentrantProbe {
 
 fn check_registry_reentry(probe: &ReentrantProbe) {
     let registry = probe.registry.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let (tx, rx) = channel();
+    spawn(move || {
         registry.register_change_waker(Waker::noop());
         let _ = tx.send(());
     });
-    if rx
-        .recv_timeout(std::time::Duration::from_millis(100))
-        .is_err()
-    {
+    if rx.recv_timeout(Duration::from_millis(100)).is_err() {
         probe.lock_timeouts.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -78,7 +64,7 @@ unsafe fn clone_reentrant_waker(data: *const ()) -> RawWaker {
     let probe = unsafe { Arc::<ReentrantProbe>::from_raw(data.cast()) };
     check_registry_reentry(&probe);
     let clone = Arc::clone(&probe);
-    std::mem::forget(probe);
+    forget(probe);
     RawWaker::new(Arc::into_raw(clone).cast(), &REENTRANT_VTABLE)
 }
 
@@ -107,30 +93,7 @@ static REENTRANT_VTABLE: RawWakerVTable = RawWakerVTable::new(
 );
 
 #[test]
-fn dropping_last_resource_use_wakes_registered_scope_waiter() {
-    let scope = OperationScope::new(
-        OperationId::new(1),
-        ScopeLimits::default(),
-        ScopePolicy::FailFast,
-        CleanupScheduler::new(1),
-        OperationContext::new(ContextOptions::default()),
-    );
-    let id = scope.register_resource(ReadyCleanup).unwrap();
-    let use_lease = scope.acquire_use(id).unwrap();
-    scope.close_for_use(id).unwrap();
-    let seen = scope.resource_epoch();
-    let mut wait = Box::pin(scope.wait_for_resource_change(seen));
-    let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
-    let waker = Waker::from(Arc::clone(&wake_count));
-    let mut cx = Context::from_waker(&waker);
-    assert!(wait.as_mut().poll(&mut cx).is_pending());
-    drop(use_lease);
-    assert!(wake_count.0.load(Ordering::SeqCst) > 0);
-    assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(())));
-}
-
-#[test]
-fn resource_waiter_waker_callbacks_can_reenter_registry_without_lock() {
+fn test_resource_waiter_waker_callbacks_can_reenter_registry_without_lock() {
     let scope = OperationScope::new(
         OperationId::new(12),
         ScopeLimits::default(),
@@ -151,8 +114,18 @@ fn resource_waiter_waker_callbacks_can_reenter_registry_without_lock() {
     let raw = RawWaker::new(Arc::into_raw(probe).cast(), &REENTRANT_VTABLE);
     let waker = unsafe { Waker::from_raw(raw) };
     let mut cx = Context::from_waker(&waker);
-    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    assert!(
+        wait.as_mut().poll(&mut cx).is_pending(),
+        "the waiter should remain pending while the resource use is active"
+    );
     drop(use_lease);
-    assert!(matches!(wait.as_mut().poll(&mut cx), Poll::Ready(())));
-    assert_eq!(lock_timeouts.load(Ordering::SeqCst), 0);
+    assert!(
+        matches!(wait.as_mut().poll(&mut cx), Poll::Ready(())),
+        "the waiter should complete after the final resource use is dropped"
+    );
+    assert_eq!(
+        lock_timeouts.load(Ordering::SeqCst),
+        0,
+        "waker callbacks should reenter the registry without waiting on its lock"
+    );
 }

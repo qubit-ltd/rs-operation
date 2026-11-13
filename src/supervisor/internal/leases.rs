@@ -20,6 +20,15 @@ use super::util::take_waiter_wakers;
 use super::util::wake;
 use super::util::wake_shutdown;
 
+/// Releases a lease's active execution slot and promotes any queued root.
+///
+/// The transition is idempotent, removes a queued lease when necessary, and
+/// wakes capacity and shutdown waiters after releasing the supervisor lock.
+///
+/// # Parameters
+///
+/// - `inner`: Shared supervisor state whose execution capacity is updated.
+/// - `lease`: The reservation whose execution capacity is released.
 pub(in crate::supervisor) fn release_execution(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
     let (waiters, shutdown_waiters) = {
         let mut state = lock(&inner.state);
@@ -49,6 +58,16 @@ pub(in crate::supervisor) fn release_execution(inner: &Arc<Inner>, lease: &Arc<M
     retry_service_cleanups_after_capacity_change(inner);
 }
 
+/// Releases a lease's reserved result capacity after its result is observed or
+/// discarded.
+///
+/// Does nothing when the result slot was already released; otherwise it updates
+/// the shared count and wakes waiters that may now reserve result capacity.
+///
+/// # Parameters
+///
+/// - `inner`: Shared supervisor state whose result capacity is updated.
+/// - `lease`: The reservation whose result slot is released.
 pub(in crate::supervisor) fn release_result(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
     let waiters = {
         let mut state = lock(&inner.state);
@@ -63,6 +82,16 @@ pub(in crate::supervisor) fn release_result(inner: &Arc<Inner>, lease: &Arc<Mute
     wake(waiters);
 }
 
+/// Releases all execution and result capacity held by an untransferred lease.
+///
+/// Each reservation is cleared at most once. The operation wakes capacity and
+/// shutdown waiters and retries service cleanups after execution capacity
+/// changes.
+///
+/// # Parameters
+///
+/// - `inner`: Shared supervisor state whose reservations are updated.
+/// - `lease`: The reservation whose execution and result capacity are released.
 pub(in crate::supervisor) fn release_all(inner: &Arc<Inner>, lease: &Arc<Mutex<LeaseState>>) {
     let (waiters, shutdown_waiters) = {
         let mut state = lock(&inner.state);
@@ -94,4 +123,3 @@ pub(in crate::supervisor) fn release_all(inner: &Arc<Inner>, lease: &Arc<Mutex<L
     inner.changed.notify_all();
     retry_service_cleanups_after_capacity_change(inner);
 }
-

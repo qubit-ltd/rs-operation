@@ -16,13 +16,15 @@ use super::ResourceId;
 /// It intentionally exposes no `Any` or downcast operation.
 /// A key is issued by one recovery registry and is not `Clone`.
 ///
-/// A key is issued by [`crate::resource::RecoveryRegistry::register`] and can be
-/// inspected or consumed by [`crate::resource::RecoveryRegistry::take_recovery`].
+/// A key is issued by [`crate::resource::RecoveryRegistry::register`] and can
+/// be inspected or consumed by
+/// [`crate::resource::RecoveryRegistry::take_recovery`].
 ///
 /// # Type Parameters
 ///
 /// `R` is the type of the recovery owner retained by the registry and recovered
-/// with this key. It must be `'static` so the owner can be retained independently.
+/// with this key. It must be `'static` so the owner can be retained
+/// independently.
 ///
 /// # Examples
 ///
@@ -47,14 +49,24 @@ pub struct RecoveryKey<R: 'static> {
     pub(crate) resource: ResourceId,
     /// One-time issuance number used to reject stale or repeated keys.
     pub(crate) nonce: u64,
-    /// Associates the key with its resource type without storing a value of `R`.
+    /// Associates the key with its resource type without storing a value of
+    /// `R`.
     pub(crate) marker: PhantomData<fn() -> R>,
 }
 
 impl<R> RecoveryKey<R> {
     /// Bind one recovery registry, resource registration, and issuance nonce
     /// into the opaque key returned by the registry's public registration flow.
-    #[allow(dead_code)] // Issued by the recovery registry.
+    ///
+    /// # Parameters
+    ///
+    /// - `registry_id` identifies the registry that issued the key.
+    /// - `resource` is the registration associated with the recovery owner.
+    /// - `nonce` distinguishes this issuance from stale or repeated keys.
+    ///
+    /// # Returns
+    ///
+    /// An opaque key bound to the supplied registry, resource, and nonce.
     pub(crate) const fn new(registry_id: u64, resource: ResourceId, nonce: u64) -> Self {
         Self {
             registry_id,
@@ -65,12 +77,31 @@ impl<R> RecoveryKey<R> {
     }
 
     /// Return the exact resource registration bound to this key.
+    ///
+    /// # Returns
+    ///
+    /// The resource identity associated with this recovery key.
+    #[must_use]
+    #[inline]
     pub const fn resource_id(&self) -> ResourceId {
         self.resource
     }
 }
 
 impl<R> fmt::Debug for RecoveryKey<R> {
+    /// Formats the key's resource identity without exposing registry internals.
+    ///
+    /// # Parameters
+    ///
+    /// - `f` is the formatter that receives the debug representation.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when formatting succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatter's error if writing the debug representation fails.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecoveryKey")
             .field("resource", &self.resource)

@@ -9,23 +9,13 @@
 
 use core::task::Context;
 use core::task::Poll;
-use core::task::RawWaker;
-use core::task::RawWakerVTable;
-use core::task::Waker;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::task::Wake;
 
-use qubit_operation::context::ContextOptions;
-use qubit_operation::context::Deadline;
 use qubit_operation::context::OperationContext;
-use qubit_operation::protocol::ClockSource;
-use qubit_operation::protocol::TimerRegistration;
 use qubit_operation::report::AdmissionError;
-use qubit_operation::report::ClockDomainId;
-use qubit_operation::report::MonotonicTime;
 use qubit_operation::report::SupervisorLimits;
 use qubit_operation::supervisor::OperationSupervisor;
 
@@ -40,7 +30,7 @@ fn limits(active_roots: usize, queued_roots: usize, unobserved_results: usize) -
 }
 
 #[test]
-fn root_and_result_capacity_are_reserved_and_released_separately() {
+fn test_root_and_result_capacity_are_reserved_and_released_separately() {
     let supervisor = OperationSupervisor::new(limits(1, 1, 2));
     let active = supervisor.try_admit().unwrap();
     let queued = supervisor.try_admit().unwrap();
@@ -62,9 +52,8 @@ fn root_and_result_capacity_are_reserved_and_released_separately() {
     assert!(supervisor.try_admit().is_ok());
 }
 
-
 #[test]
-fn dropping_queued_admission_rolls_back_without_calling_its_body() {
+fn test_dropping_queued_admission_rolls_back_without_calling_its_body() {
     let supervisor = OperationSupervisor::new(limits(0, 1, 1));
     let count = Arc::new(AtomicUsize::new(0));
     let captured = Arc::clone(&count);
@@ -78,20 +67,13 @@ fn dropping_queued_admission_rolls_back_without_calling_its_body() {
     assert_eq!(supervisor.reserved_results(), 0);
 }
 
-
 #[test]
-fn close_wakes_waiters_and_they_recover_their_input() {
-    use std::task::Wake;
+fn test_close_wakes_waiters_and_they_recover_their_input() {
     use std::task::Waker;
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
     let supervisor = OperationSupervisor::new(limits(0, 1, 2));
     let _accepted = supervisor.try_admit().unwrap();
     let mut waiting = Box::pin(supervisor.start_wait_body(String::from("body")).unwrap());
-    let waker = Waker::from(Arc::new(Noop));
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(Waker::noop());
     assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
     supervisor.close();
     match waiting.as_mut().poll(&mut context) {
@@ -103,9 +85,8 @@ fn close_wakes_waiters_and_they_recover_their_input() {
     }
 }
 
-
 #[test]
-fn cleanup_capacity_remains_available_when_business_admission_is_full() {
+fn test_cleanup_capacity_remains_available_when_business_admission_is_full() {
     let supervisor = OperationSupervisor::new(limits(1, 0, 1));
     let _root = supervisor.try_admit().unwrap();
     assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Busy);
@@ -113,9 +94,8 @@ fn cleanup_capacity_remains_available_when_business_admission_is_full() {
     assert_eq!(supervisor.cleanup_active(), 1);
 }
 
-
 #[test]
-fn expired_context_rejects_and_returns_the_original_body() {
+fn test_expired_context_rejects_and_returns_the_original_body() {
     use std::task::Waker;
 
     use qubit_operation::context::ContextOptions;
@@ -154,9 +134,8 @@ fn expired_context_rejects_and_returns_the_original_body() {
     assert_eq!(supervisor.reserved_results(), 0);
 }
 
-
 #[test]
-fn close_rejects_new_work() {
+fn test_close_rejects_new_work() {
     let supervisor = OperationSupervisor::new(limits(0, 1, 1));
     supervisor.close();
     assert_eq!(supervisor.try_admit().unwrap_err(), AdmissionError::Closed);
@@ -167,12 +146,16 @@ mod reentrant_waker_regression {
     use core::task::RawWaker;
     use core::task::RawWakerVTable;
     use core::task::Waker;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::*;
+    use super::Arc;
+    use super::AtomicUsize;
+    use super::Future;
+    use super::OperationSupervisor;
+    use super::Ordering;
+    use super::Poll;
+    use super::SupervisorLimits;
 
     struct Probe {
         supervisor: OperationSupervisor,
@@ -226,7 +209,7 @@ mod reentrant_waker_regression {
     }
 
     #[test]
-    fn raw_waker_clone_replacement_and_removal_can_reenter_without_lock() {
+    fn test_raw_waker_clone_replacement_and_removal_can_reenter_without_lock() {
         let supervisor = OperationSupervisor::new(SupervisorLimits {
             active_roots: 0,
             queued_roots: 0,

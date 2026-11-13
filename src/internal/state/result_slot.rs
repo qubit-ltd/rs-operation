@@ -10,11 +10,16 @@
 use crate::report::OperationOutcome;
 
 /// Tracks whether a result is pending, available, consumed, or discarded.
+///
+/// # Type Parameters
+///
+/// - `T` is the successful result payload type.
+/// - `E` is the failure payload type.
 pub(super) enum ResultSlot<T, E> {
     /// No result or accepted stop has been published.
     Pending,
     /// A stable outcome is available to one consumer.
-    Ready(OperationOutcome<T, E>),
+    Ready(#[doc = "The typed outcome published for consumption."] OperationOutcome<T, E>),
     /// The consumer has already taken the outcome.
     Taken,
     /// The supervisor discarded the typed outcome but retains lifecycle state.

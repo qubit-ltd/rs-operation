@@ -26,7 +26,7 @@ fn limits(active_roots: usize, queued_roots: usize, unobserved_results: usize) -
 }
 
 #[test]
-fn result_slot_limit_is_one_shot_and_released_separately() {
+fn test_result_slot_limit_is_one_shot_and_released_separately() {
     let supervisor = OperationSupervisor::new(limits(1, 0, 1));
     let mut first = supervisor.try_admit_body(String::from("body")).unwrap();
     let work = first.transfer().unwrap();
@@ -48,7 +48,7 @@ fn result_slot_limit_is_one_shot_and_released_separately() {
 }
 
 #[test]
-fn dropping_admission_handle_does_not_release_transferred_running_body_quota() {
+fn test_dropping_admission_handle_does_not_release_transferred_running_body_quota() {
     let supervisor = OperationSupervisor::new(SupervisorLimits {
         active_roots: 1,
         queued_roots: 0,

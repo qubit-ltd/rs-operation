@@ -9,6 +9,25 @@
 use super::ExecutorError;
 
 /// Rejected submission that retains the original, unstarted closure.
+///
+/// # Type Parameters
+///
+/// * `F` — the original closure, retained without requiring this container
+///   itself to impose any trait bounds.
+///
+/// # Examples
+///
+/// When [`BlockingExecutor::execute`](super::BlockingExecutor::execute)
+/// rejects a closure, recover it from the returned value:
+///
+/// ```
+/// use qubit_operation::driver::RejectedJob;
+///
+/// fn recover<F>(rejected: RejectedJob<F>) -> F {
+///     let _reason = rejected.error;
+///     rejected.job
+/// }
+/// ```
 pub struct RejectedJob<F> {
     /// Rejection reason.
     pub error: ExecutorError,

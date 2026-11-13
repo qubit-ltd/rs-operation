@@ -9,14 +9,13 @@
 
 use std::sync::Arc;
 
+use super::super::ChildRequirement;
 use crate::protocol::ManagedOperationControl;
 use crate::report::OperationId;
 use crate::resource::ResourceUse;
 
-use super::super::ChildRequirement;
-
 /// Registration and settlement state retained for a child operation.
-pub(super) struct Child {
+pub(in crate::scope) struct Child {
     /// Identity captured from the managed child control.
     pub(in crate::scope) id: OperationId,
     /// Control used to request stop and observe business/release completion.

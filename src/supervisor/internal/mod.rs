@@ -21,13 +21,13 @@ pub(super) mod state;
 pub(super) mod task_lease;
 pub(super) mod util;
 
-pub(super) use admitted_task::AdmittedTask;
+pub(crate) use admitted_task::AdmittedTask;
 pub(super) use inner::Inner;
 pub(super) use lease_state::LeaseState;
-pub(super) use result_lease::ResultLease;
+pub(crate) use result_lease::ResultLease;
 pub(super) use service_group_state::ServiceGroupState;
 pub(super) use service_request_entry::ServiceRequestEntry;
 pub(super) use shared_service_group_state::SharedServiceGroupState;
 pub(super) use shutdown_source::ShutdownSource;
 pub(super) use state::State;
-pub(super) use task_lease::TaskLease;
+pub(crate) use task_lease::TaskLease;

@@ -43,6 +43,14 @@ pub struct SupervisorLimits {
 }
 
 impl Default for SupervisorLimits {
+    /// Creates the baseline supervisor capacities used by a new report.
+    ///
+    /// The limits bound active and queued roots, admission waiters, cleanup
+    /// work, retained diagnostics, and unconsumed results independently.
+    ///
+    /// # Returns
+    ///
+    /// A supervisor configuration with the baseline capacities.
     #[inline]
     fn default() -> Self {
         Self {

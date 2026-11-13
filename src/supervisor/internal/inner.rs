@@ -11,19 +11,17 @@ use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
-use std::task::Waker;
 
+use super::SharedServiceGroupState;
+use super::State;
 use crate::driver::PortableDriver;
 use crate::report::SupervisorLimits;
 use crate::resource::CleanupResponsibility;
 use crate::resource::CleanupScheduler;
 use crate::resource::RecoveryRegistry;
 
-use super::SharedServiceGroupState;
-use super::State;
-
 /// Shared mutable state retained by public and internal supervisor handles.
-pub(super) struct Inner {
+pub(in crate::supervisor) struct Inner {
     /// Immutable root, waiter, result, and cleanup reservation limits.
     pub(in crate::supervisor) limits: SupervisorLimits,
     /// Counters, queues, and shutdown registrations protected by one mutex.
@@ -43,4 +41,3 @@ pub(super) struct Inner {
     /// Service groups whose admission and cleanup lifecycles remain active.
     pub(in crate::supervisor) service_groups: Mutex<Vec<SharedServiceGroupState>>,
 }
-

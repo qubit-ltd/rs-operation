@@ -7,13 +7,12 @@
 // =============================================================================
 //! Mutable registration state shared by cloned operation scopes.
 
-use crate::report::StopReason;
-
 use super::super::OperationScope;
 use super::Child;
+use crate::report::StopReason;
 
 /// Registration gate, cancellation state, and accepted child work.
-pub(super) struct State {
+pub(in crate::scope) struct State {
     /// Whether new child reservations and child scopes are accepted.
     pub(in crate::scope) accepting: bool,
     /// First cancellation reason observed by the scope.

@@ -17,15 +17,22 @@
 /// assert_eq!(operation.get(), 7);
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct OperationId(pub u128);
+pub struct OperationId(#[doc = "The numeric value assigned by the owning supervisor."] pub u128);
 
 impl OperationId {
     /// Construct an ID assigned by an owning supervisor or test fixture.
+    ///
+    /// # Parameters
+    ///
+    /// * `value` — Numeric identifier assigned by the owner; uniqueness is the
+    ///   responsibility of that owner.
+    #[inline]
     pub const fn new(value: u128) -> Self {
         Self(value)
     }
 
     /// Return the numeric representation without changing ownership.
+    #[inline]
     pub const fn get(self) -> u128 {
         self.0
     }

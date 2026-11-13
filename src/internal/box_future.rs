@@ -14,4 +14,8 @@ use core::pin::Pin;
 ///
 /// Boxing keeps internal port signatures independent of each submitted
 /// future's concrete type and permits the future to move between threads.
+///
+/// # Type Parameters
+///
+/// * `T` - The value produced when the future completes.
 pub(crate) type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;

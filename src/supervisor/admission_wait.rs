@@ -14,16 +14,15 @@ use core::task::Poll;
 use core::task::Waker;
 use std::fmt;
 
+use super::OperationSupervisor;
+use super::RootAdmission;
+use super::internal::util::lock;
 use crate::context::ContextError;
 use crate::context::DeadlineSignal;
 use crate::context::OperationContext;
 use crate::context::StopSignal;
 use crate::report::AdmissionError;
 use crate::report::StartError;
-
-use super::OperationSupervisor;
-use super::RootAdmission;
-use super::internal::util::lock;
 
 /// A bounded waiter for root admission. Dropping it removes its registration;
 /// after admission, dropping the returned reservation follows the ordinary root
@@ -45,24 +44,26 @@ use super::internal::util::lock;
 /// }
 /// ```
 pub struct AdmissionWait<F> {
-    /// Internal supervisor handle used to retry admission and remove the waiter.
-    supervisor: OperationSupervisor,
+    /// Internal supervisor handle used to retry admission and remove the
+    /// waiter.
+    pub(super) supervisor: OperationSupervisor,
     /// Registration key identifying this waiter's slot in the supervisor.
-    waiter_id: u64,
+    pub(super) waiter_id: u64,
     /// Body returned to the caller if admission fails before it is reserved.
-    body: Option<F>,
+    pub(super) body: Option<F>,
     /// Optional context whose stop state is checked while waiting.
-    context: Option<OperationContext>,
+    pub(super) context: Option<OperationContext>,
     /// Optional deadline notification registered for the context.
-    deadline_signal: Option<DeadlineSignal>,
+    pub(super) deadline_signal: Option<DeadlineSignal>,
     /// Optional stop notification registered for the context.
-    stop_signal: Option<StopSignal>,
+    pub(super) stop_signal: Option<StopSignal>,
     /// Prevents reuse and makes cleanup idempotent after completion.
-    done: bool,
+    pub(super) done: bool,
 }
 
 impl<F> fmt::Debug for AdmissionWait<F> {
-    /// Formats the registration identity without exposing the stored body or context.
+    /// Formats the registration identity without exposing the stored body or
+    /// context.
     ///
     /// # Parameters
     ///
@@ -70,7 +71,8 @@ impl<F> fmt::Debug for AdmissionWait<F> {
     ///
     /// # Returns
     ///
-    /// Returns the formatter's result so formatting failures propagate to the caller.
+    /// Returns the formatter's result so formatting failures propagate to the
+    /// caller.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AdmissionWait")
             .field("waiter_id", &self.waiter_id)
@@ -81,10 +83,12 @@ impl<F> fmt::Debug for AdmissionWait<F> {
 impl<F> Unpin for AdmissionWait<F> {}
 
 impl<F> Future for AdmissionWait<F> {
-    /// Returns the body reservation once capacity is available or a start error.
+    /// Returns the body reservation once capacity is available or a start
+    /// error.
     type Output = Result<RootAdmission<F>, StartError<F>>;
 
-    /// Rechecks stop/deadline state, attempts admission, and parks on the bounded waiter slot.
+    /// Rechecks stop/deadline state, attempts admission, and parks on the
+    /// bounded waiter slot.
     ///
     /// # Parameters
     ///
@@ -93,8 +97,9 @@ impl<F> Future for AdmissionWait<F> {
     ///
     /// # Returns
     ///
-    /// Returns `Pending` while capacity is unavailable, or `Ready` with an admission
-    /// reservation or a `StartError` that preserves the original body.
+    /// Returns `Pending` while capacity is unavailable, or `Ready` with an
+    /// admission reservation or a `StartError` that preserves the original
+    /// body.
     ///
     /// # Panics
     ///
@@ -233,14 +238,16 @@ impl<F> Drop for AdmissionWait<F> {
     }
 }
 
-/// Converts a context failure into the admission error exposed by supervisor APIs.
+/// Converts a context failure into the admission error exposed by supervisor
+/// APIs.
 ///
 /// Timeout stops remain deadline errors, budget exhaustion maps to reservation
 /// capacity, and unavailable clocks prevent safe admission.
 ///
 /// # Parameters
 ///
-/// - `context`: Context whose stop reason disambiguates timeout from cancellation.
+/// - `context`: Context whose stop reason disambiguates timeout from
+///   cancellation.
 /// - `error`: Context failure to translate.
 ///
 /// # Returns
@@ -258,4 +265,3 @@ pub(super) fn context_admission_error(context: &OperationContext, error: Context
         ContextError::ClockUnavailable | ContextError::ClockDomainMismatch => AdmissionError::DriverUnavailable,
     }
 }
-

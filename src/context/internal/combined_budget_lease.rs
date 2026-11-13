@@ -12,7 +12,7 @@ use super::super::BudgetLease;
 use super::super::BudgetLeaseError;
 
 /// Requires both inherited caller-owned budget policies to permit work.
-pub(super) struct CombinedBudgetLease {
+pub(in crate::context) struct CombinedBudgetLease {
     /// Parent policy that was inherited by the child operation.
     pub(in crate::context) parent: Arc<dyn BudgetLease>,
     /// Additional policy supplied by the child operation.
@@ -20,6 +20,13 @@ pub(super) struct CombinedBudgetLease {
 }
 
 impl BudgetLease for CombinedBudgetLease {
+    /// Checks the inherited parent policy before the child policy.
+    ///
+    /// The child policy is checked only when the parent still permits work.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`BudgetLeaseError`] reported by either policy.
     fn check(&self) -> Result<(), BudgetLeaseError> {
         self.parent.check()?;
         self.child.check()

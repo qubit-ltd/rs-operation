@@ -10,13 +10,13 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
 
-use crate::protocol::StopReason;
-
 use super::NodeState;
+use crate::protocol::StopReason;
 
 /// Shared cancellation state for a context and its descendants.
 pub(in crate::context) struct Node {
-    /// Mutex protecting the first stop cause, child links, and registered waiters.
+    /// Mutex protecting the first stop cause, child links, and registered
+    /// waiters.
     pub(in crate::context) state: Mutex<NodeState>,
 }
 
@@ -44,6 +44,11 @@ impl Node {
     ///
     /// Returns `true` only when this call records the cause. Returns `false`
     /// when a cause already exists or the mutex is poisoned.
+    ///
+    /// # Parameters
+    ///
+    /// - `reason`: Cause recorded for this node and propagated to its
+    ///   descendants.
     pub(in crate::context) fn request_stop(&self, reason: StopReason) -> bool {
         let (children, waiters) = {
             let Ok(mut state) = self.state.lock() else {
@@ -54,11 +59,7 @@ impl Node {
             }
             state.stop_reason = Some(reason);
             state.children.retain(|child| child.strong_count() > 0);
-            let children = state
-                .children
-                .iter()
-                .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>();
+            let children = state.children.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
             (children, std::mem::take(&mut state.stop_waiters))
         };
         for waker in waiters.into_iter().map(|(_, waker)| waker) {

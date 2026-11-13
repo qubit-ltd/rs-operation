@@ -9,11 +9,16 @@
 
 use std::sync::Arc;
 
+use super::ResultSlot;
 use crate::report::SettlementReport;
 use crate::report::StopReport;
-use super::ResultSlot;
 
 /// Stores the business result and independently observed lifecycle facts.
+///
+/// # Type Parameters
+///
+/// - `T`: The value type stored in the one-shot business result.
+/// - `E`: The error type stored in the one-shot business result.
 pub(super) struct State<T, E> {
     /// The one-shot typed result slot.
     pub(super) result: ResultSlot<T, E>,

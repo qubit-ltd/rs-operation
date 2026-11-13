@@ -8,9 +8,8 @@
 
 use core::cmp::Ordering;
 
-use crate::report::MonotonicTime;
-
 use super::ClockDomainMismatch;
+use crate::report::MonotonicTime;
 
 /// Absolute deadline in one monotonic clock domain.
 ///
@@ -28,23 +27,50 @@ use super::ClockDomainMismatch;
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Deadline {
+    /// Absolute monotonic instant that bounds the operation.
     pub(super) at: MonotonicTime,
 }
 
 impl Deadline {
-    /// Construct a deadline at a domain-local monotonic instant.
+    /// Constructs a deadline at a domain-local monotonic instant.
+    ///
+    /// # Parameters
+    ///
+    /// * `at` - Monotonic instant that defines the deadline and its clock
+    ///   domain.
+    ///
+    /// # Returns
+    ///
+    /// A deadline at `at`.
+    #[must_use]
     #[inline]
     pub const fn at(at: MonotonicTime) -> Self {
         Self { at }
     }
 
-    /// Return the absolute time point and its clock domain.
+    /// Returns the absolute time point and its clock domain.
+    ///
+    /// # Returns
+    ///
+    /// The monotonic instant that defines this deadline.
     #[inline]
     pub const fn time_point(self) -> MonotonicTime {
         self.at
     }
 
-    /// Compare deadlines; cross-domain comparisons are rejected.
+    /// Compares deadlines, rejecting instants from different clock domains.
+    ///
+    /// # Parameters
+    ///
+    /// * `other` - Deadline to compare with this one.
+    ///
+    /// # Returns
+    ///
+    /// Their ordering when both deadlines use the same clock domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClockDomainMismatch`] when the deadlines use different clocks.
     pub fn compare(self, other: Self) -> Result<Ordering, ClockDomainMismatch> {
         if self.at.domain != other.at.domain {
             return Err(ClockDomainMismatch {
@@ -55,7 +81,19 @@ impl Deadline {
         Ok(self.at.ticks.cmp(&other.at.ticks))
     }
 
-    /// Return the earlier of two deadlines in the same clock domain.
+    /// Returns the earlier deadline when both use the same clock domain.
+    ///
+    /// # Parameters
+    ///
+    /// * `other` - Deadline to compare with this one.
+    ///
+    /// # Returns
+    ///
+    /// The deadline with the smaller monotonic tick value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClockDomainMismatch`] when the deadlines use different clocks.
     pub fn earliest(self, other: Self) -> Result<Self, ClockDomainMismatch> {
         if self.compare(other)? == Ordering::Greater {
             Ok(other)

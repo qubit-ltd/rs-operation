@@ -11,7 +11,8 @@ use super::BlockingRejected;
 
 /// Submits a one-shot blocking task to an application or domain executor.
 pub(crate) trait BlockingExecutor: Send + Sync {
-    /// Runs or schedules the owned task, returning it with an error on rejection.
+    /// Runs or schedules the owned task, returning it with an error on
+    /// rejection.
     ///
     /// # Parameters
     ///

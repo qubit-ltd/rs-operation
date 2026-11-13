@@ -24,7 +24,6 @@ pub use driver::ManualDriver;
 pub use driver::TaskId;
 pub use driver::recording_step;
 pub use gate::Gate;
-pub use gate::GateWait;
 pub use probe::DropProbe;
 pub use probe::DropProbeCounter;
 pub use waker::CountingWaker;

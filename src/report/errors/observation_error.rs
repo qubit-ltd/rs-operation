@@ -41,6 +41,15 @@ pub enum ObservationError {
 }
 
 impl fmt::Display for ObservationError {
+    /// Formats the observation failure as a concise, stable message.
+    ///
+    /// # Parameters
+    ///
+    /// * `f` is the formatter that receives the error message.
+    ///
+    /// # Returns
+    ///
+    /// Returns the formatter's result, including any formatting failure.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::AlreadyTaken => "operation result was already taken",

@@ -68,7 +68,7 @@ fn test_manual_clock_wakes_only_deadlines_crossed_by_advance() {
     let before = clock.register_deadline(MonotonicTime::new(ClockDomainId(9), 4), waker.waker());
     let after = clock.register_deadline(MonotonicTime::new(ClockDomainId(9), 8), waker.waker());
 
-    clock.advance_by(5);
+    let _ = clock.advance_by(5);
 
     assert_eq!(waker.wake_count(), 1);
     assert_eq!(clock.pending_timers(), 1);

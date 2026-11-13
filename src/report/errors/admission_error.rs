@@ -39,6 +39,16 @@ pub enum AdmissionError {
 }
 
 impl fmt::Display for AdmissionError {
+    /// Writes the human-readable description of this admission failure.
+    ///
+    /// # Parameters
+    ///
+    /// * `f` is the formatter that receives the description.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` when the description is written, or the formatting
+    /// error returned by the formatter.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Busy => "operation capacity is busy",

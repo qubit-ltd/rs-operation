@@ -11,7 +11,7 @@ use crate::report::EffectRecord;
 
 /// Effect records shared by scopes in one operation tree.
 #[derive(Default)]
-pub(super) struct EffectState {
+pub(in crate::scope) struct EffectState {
     /// Maximum number of records retained.
     pub(in crate::scope) limit: usize,
     /// Caller-declared effects retained within the configured limit.

@@ -7,12 +7,25 @@
 // =============================================================================
 //! Configuration accepted when a root or child scope is created.
 
+use super::ScopePolicy;
 use crate::context::ContextOptions;
 use crate::report::ScopeLimits;
 
-use super::ScopePolicy;
-
 /// Options fixed when a root or child scope is created.
+///
+/// # Examples
+///
+/// ```
+/// use qubit_operation::scope::{ScopeOptions, ScopePolicy};
+///
+/// let mut options = ScopeOptions::default();
+/// options.limits.resources = 32;
+/// options.policy = ScopePolicy::Collect;
+///
+/// assert_eq!(options.limits.resources, 32);
+/// assert_eq!(options.policy, ScopePolicy::Collect);
+/// assert!(options.context.clock.is_none());
+/// ```
 #[derive(Clone, Default)]
 pub struct ScopeOptions {
     /// Upper bounds for children, resources, and retained effect records.

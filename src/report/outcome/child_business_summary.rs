@@ -7,8 +7,8 @@
 // =============================================================================
 
 use super::ChildBusinessOutcome;
-use super::DiagnosticSummary;
-use super::OperationId;
+use crate::report::DiagnosticSummary;
+use crate::report::OperationId;
 
 /// Repeatable child business fact that does not consume its typed result.
 ///

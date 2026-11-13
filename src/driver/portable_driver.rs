@@ -30,8 +30,26 @@ use super::TaskHandle;
 /// futures on the dropping thread. Poll implementations and future destructors
 /// must therefore be non-blocking; the owner must retain the driver until its
 /// tasks no longer carry resource-release responsibility.
+///
+/// # Examples
+///
+/// ```
+/// use qubit_operation::driver::{PortableDriver, PortableDriverConfig};
+///
+/// let driver = PortableDriver::new(PortableDriverConfig {
+///     worker_count: 1,
+///     task_capacity: 8,
+///     polls_per_turn: 4,
+/// })?;
+/// let task = driver.spawn(async {})?;
+/// assert_eq!(driver.task_count(), 1);
+/// assert_ne!(task.as_u64(), 0);
+/// # Ok::<(), qubit_operation::driver::PortableDriverError>(())
+/// ```
 pub struct PortableDriver {
+    /// Shared task state and the condition variable used to wake workers.
     shared: Arc<PortableShared>,
+    /// Worker threads owned by this driver and joined during shutdown.
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -41,6 +59,19 @@ impl PortableDriver {
     /// Returns [`PortableDriverError::InvalidConfiguration`] if any configured
     /// limit is zero, or [`PortableDriverError::WorkerSpawn`] if a thread
     /// cannot be created.
+    ///
+    /// # Parameters
+    ///
+    /// * `config` — positive worker, task-capacity, and polling limits.
+    ///
+    /// # Returns
+    ///
+    /// A driver that owns its worker threads and bounded task queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableDriverError::InvalidConfiguration`] for a zero limit
+    /// or [`PortableDriverError::WorkerSpawn`] if a worker thread cannot start.
     pub fn new(config: PortableDriverConfig) -> Result<Self, PortableDriverError> {
         if config.worker_count == 0 || config.task_capacity == 0 || config.polls_per_turn == 0 {
             return Err(PortableDriverError::InvalidConfiguration);
@@ -82,6 +113,23 @@ impl PortableDriver {
     /// The driver does not inspect or replace runtime-bound futures. Only
     /// submit futures that can progress on its worker threads; use an
     /// adapter attached to the owning runtime for reactor-bound futures.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `F` — a sendable, static future that resolves to `()`.
+    ///
+    /// # Parameters
+    ///
+    /// * `future` — the task future to enqueue without polling on this call.
+    ///
+    /// # Returns
+    ///
+    /// A handle for the accepted task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PortableDriverError::Capacity`] if the queue is full or
+    /// [`PortableDriverError::Closed`] after shutdown begins.
     pub fn spawn<F>(&self, future: F) -> Result<TaskHandle, PortableDriverError>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -111,17 +159,24 @@ impl PortableDriver {
     }
 
     /// Return the configured worker count.
+    #[must_use]
+    #[inline]
     pub fn worker_count(&self) -> usize {
         self.workers.len()
     }
 
     /// Return the number of accepted tasks that have not completed.
+    #[must_use]
     pub fn task_count(&self) -> usize {
         lock(&self.shared.state).tasks.len()
     }
 }
 
 impl Drop for PortableDriver {
+    /// Stops worker polling, joins other workers, and drops unfinished futures.
+    ///
+    /// The current worker is detached when it drops its own driver to avoid
+    /// joining itself; that worker exits after observing the closed state.
     fn drop(&mut self) {
         close_portable(&self.shared);
         let current_thread = thread::current().id();
@@ -147,6 +202,19 @@ impl Drop for PortableDriver {
     }
 }
 
+/// Acquires a mutex, recovering its protected value if a prior holder panicked.
+///
+/// # Type Parameters
+///
+/// * `T` — the type protected by the mutex.
+///
+/// # Parameters
+///
+/// * `mutex` — the mutex whose guard is requested.
+///
+/// # Returns
+///
+/// A guard that keeps the mutex locked for the lifetime of its borrow.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
@@ -177,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_driver_on_its_own_worker_detaches_self_and_drains_workers() {
+    fn test_dropping_driver_on_its_own_worker_detaches_self_and_drains_workers() {
         let driver = PortableDriver::new(PortableDriverConfig {
             worker_count: 2,
             task_capacity: 1,

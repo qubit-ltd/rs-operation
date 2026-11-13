@@ -11,25 +11,42 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 
+use super::ShutdownObservation;
+use super::ShutdownReport;
+use super::internal::ShutdownSource;
+use super::internal::service_group_lifecycle::retry_closed_service_group_cleanups;
+use super::internal::service_group_lifecycle::start_service_resource_cleanup;
+use super::internal::util::lock;
+use super::shutdown_wait_registration::ShutdownWaitRegistration;
 use crate::context::ContextError;
-use crate::context::ContextOptions;
 use crate::context::Deadline;
 use crate::context::OperationContext;
 use crate::protocol::ClockSource;
 
-use super::OperationSupervisor;
-use super::ShutdownMode;
-use super::ShutdownObservation;
-use super::ShutdownReport;
-use super::internal::ShutdownSource;
-use super::internal::service_group_lifecycle::{retry_closed_service_group_cleanups, start_service_resource_cleanup};
-use super::internal::util::lock;
-use super::shutdown_wait_registration::ShutdownWaitRegistration;
-
 /// Reusable observer for a supervisor or service-group shutdown.
-pub struct ShutdownObserver(pub(super) ShutdownSource);
+///
+/// Obtain an observer from [`OperationSupervisor::shutdown_observer`] or from
+/// the public service-group shutdown flow, then wait for outstanding work.
+///
+/// # Examples
+///
+/// ```
+/// use qubit_operation::supervisor::OperationSupervisor;
+/// use std::time::Duration;
+///
+/// fn inspect_shutdown(supervisor: &OperationSupervisor) {
+///     let observer = supervisor.shutdown_observer();
+///     let observation = observer.wait_blocking(Duration::ZERO);
+///     assert!(observation.report.pending_requests <= usize::MAX);
+/// }
+/// ```
+pub struct ShutdownObserver(
+    /// Internal shared state used to produce fresh shutdown snapshots.
+    pub(super) ShutdownSource,
+);
 
 impl Clone for ShutdownObserver {
+    /// Clones the observer while retaining the shared supervisor state.
     fn clone(&self) -> Self {
         Self(match &self.0 {
             ShutdownSource::Supervisor(supervisor) => ShutdownSource::Supervisor(supervisor.internal_handle()),
@@ -43,6 +60,21 @@ impl Clone for ShutdownObserver {
 impl ShutdownObserver {
     /// Wait again for active work to settle, or return a fresh pending snapshot
     /// at deadline.
+    ///
+    /// # Parameters
+    ///
+    /// - `deadline`: Absolute deadline at which the current pending snapshot is
+    ///   returned if work has not settled.
+    /// - `clock`: Shared clock used to observe the deadline.
+    ///
+    /// # Returns
+    ///
+    /// The latest shutdown report and a cloneable observer for subsequent
+    /// waits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the context error if creating the deadline signal fails.
     pub async fn wait_async(
         &self,
         deadline: Deadline,
@@ -90,6 +122,16 @@ impl ShutdownObserver {
     }
 
     /// Wait synchronously for active work to settle or timeout.
+    ///
+    /// # Parameters
+    ///
+    /// - `timeout`: Maximum duration to wait before returning the current
+    ///   pending snapshot.
+    ///
+    /// # Returns
+    ///
+    /// The latest shutdown report and a cloneable observer for subsequent
+    /// waits.
     pub fn wait_blocking(&self, timeout: std::time::Duration) -> ShutdownObservation {
         match &self.0 {
             ShutdownSource::Service(state, supervisor) => {
@@ -137,6 +179,7 @@ impl ShutdownObserver {
         }
     }
 
+    /// Reads current pending-work counters without waiting for further changes.
     fn snapshot(&self) -> ShutdownReport {
         match &self.0 {
             ShutdownSource::Supervisor(supervisor) => {
@@ -158,4 +201,3 @@ impl ShutdownObserver {
         }
     }
 }
-

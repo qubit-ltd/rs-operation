@@ -6,8 +6,8 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
-use super::MonotonicTime;
 use super::StopReason;
+use crate::report::MonotonicTime;
 
 /// Immutable stop fact attached to a business result.
 #[derive(Clone, Debug, Eq, PartialEq)]

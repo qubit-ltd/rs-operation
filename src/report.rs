@@ -8,14 +8,15 @@
 
 //! Immutable lifecycle facts and typed outcomes.
 
+mod diagnostic_summary;
 mod errors;
 mod ids;
 mod limits;
 mod outcome;
 mod settlement;
 mod state;
-mod summary;
 
+pub use diagnostic_summary::DiagnosticSummary;
 pub use errors::AdmissionError;
 pub use errors::ObservationError;
 pub use errors::StartError;
@@ -48,4 +49,3 @@ pub use state::ChildSnapshot;
 pub use state::MonotonicTime;
 pub use state::OperationPhase;
 pub use state::ResourcePhase;
-pub use summary::DiagnosticSummary;
