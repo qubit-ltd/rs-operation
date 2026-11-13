@@ -320,3 +320,40 @@ impl Drop for ServiceGroup {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::OperationSupervisor;
+    use super::ShutdownMode;
+    use crate::report::AdmissionError;
+    use crate::report::SupervisorLimits;
+
+    #[test]
+    fn test_drain_closes_admission_and_waits_for_existing_request_lease() {
+        let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+        let group = supervisor.service_group(1).unwrap();
+        let request = group.try_admit().unwrap();
+
+        let pending = group.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::ZERO);
+        assert_eq!(pending.pending_requests, 1);
+        assert!(matches!(group.try_admit(), Err(AdmissionError::Closed)));
+
+        drop(request);
+        let settled = group.shutdown_blocking(ShutdownMode::Drain, std::time::Duration::ZERO);
+        assert_eq!(settled.pending_requests, 0);
+        assert_eq!(group.active_requests(), 0);
+    }
+
+    #[test]
+    fn test_dropping_last_group_owner_closes_admission_but_lease_can_release() {
+        let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+        let group = supervisor.service_group(1).unwrap();
+        let request = group.try_admit().unwrap();
+        drop(group);
+
+        drop(request);
+        let observation = supervisor.shutdown_observer().wait_blocking(std::time::Duration::ZERO);
+        assert_eq!(observation.report.pending_requests, 0);
+        assert_eq!(observation.report.pending_resources, 0);
+    }
+}

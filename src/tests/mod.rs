@@ -7,6 +7,8 @@
 // =============================================================================
 //! Unit tests for crate-internal contracts.
 
+mod context_driver_operation_tests;
+mod error_type_tests;
 mod internal;
 mod report;
 mod scope_concurrency_tests;

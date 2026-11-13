@@ -48,3 +48,54 @@ impl Drop for CleanupPermit {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Wake;
+    use std::task::Waker;
+
+    use super::CleanupPermit;
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_dropping_permit_releases_slot_and_wakes_waiters() {
+        let active = Arc::new(AtomicUsize::new(1));
+        let waiters = Arc::new(Mutex::new(Vec::new()));
+        let wake_counter = Arc::new(WakeCounter::default());
+        waiters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Waker::from(Arc::clone(&wake_counter)));
+        let permit = CleanupPermit {
+            active: Arc::clone(&active),
+            capacity_waiters: Arc::clone(&waiters),
+        };
+
+        drop(permit);
+
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(wake_counter.0.load(Ordering::SeqCst), 1);
+        assert!(
+            waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
+    }
+}

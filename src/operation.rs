@@ -373,6 +373,22 @@ mod tests {
     }
 
     #[test]
+    fn test_result_poll_returns_published_outcome_only_once() {
+        let shared = shared();
+        let mut cx = Context::from_waker(Waker::noop());
+        publish_result(&shared, OperationOutcome::Succeeded(()));
+
+        assert!(matches!(
+            poll_result(&shared, &mut cx),
+            Poll::Ready(Ok(OperationOutcome::Succeeded(())))
+        ));
+        assert!(matches!(
+            poll_result(&shared, &mut cx),
+            Poll::Ready(Err(crate::report::ObservationError::AlreadyTaken))
+        ));
+    }
+
+    #[test]
     fn test_result_and_released_wakers_reenter_only_after_state_unlocks() {
         let shared = shared();
         let lock_reentries = Arc::new(AtomicUsize::new(0));

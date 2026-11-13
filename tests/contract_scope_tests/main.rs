@@ -1661,6 +1661,7 @@ fn test_start_wait_blocking_waits_for_capacity_then_submits() {
         );
         release_gate.release();
         let _ = block_on(first.result());
+        let _ = block_on(first.released());
     });
     let mut second = supervisor
         .start_wait_blocking(ScopeOptions::default(), move |_| async move {

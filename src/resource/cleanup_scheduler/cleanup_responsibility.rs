@@ -83,3 +83,52 @@ impl CleanupResponsibility {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Waker;
+
+    use crate::report::CleanupOutcome;
+    use crate::report::ClockDomainId;
+    use crate::report::MonotonicTime;
+    use crate::report::OperationId;
+    use crate::report::ResourceId;
+    use crate::resource::CleanupObservation;
+    use crate::resource::CleanupScheduler;
+
+    #[test]
+    fn test_responsibility_reacquires_task_after_scheduler_drop() {
+        let resource_id = ResourceId::new(OperationId::new(991), 2, 3);
+        let responsibility = {
+            let scheduler = CleanupScheduler::new(1);
+            let future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send>> =
+                Box::pin(async { CleanupOutcome::Cleaned });
+            let task = scheduler
+                .schedule(resource_id, future)
+                .unwrap_or_else(|_| unreachable!());
+            drop(task);
+            scheduler.responsibility_owner()
+        };
+
+        assert_eq!(responsibility.limit(), 1);
+        assert_eq!(responsibility.active(), 1);
+        assert!(
+            responsibility
+                .task(ResourceId::new(OperationId::new(992), 0, 0))
+                .is_none()
+        );
+
+        let mut observer = responsibility.task(resource_id).expect("owner retains scheduled task");
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            observer.poll_at(&mut context, MonotonicTime::new(ClockDomainId(1), 0)),
+            Poll::Ready(CleanupObservation::Settled(Ok(CleanupOutcome::Cleaned)))
+        ));
+        assert_eq!(responsibility.active(), 0);
+        assert!(responsibility.task(resource_id).is_none());
+    }
+}

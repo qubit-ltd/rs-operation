@@ -212,3 +212,76 @@ impl Drop for ThreadExecutor {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::ThreadExecutor;
+    use crate::driver::BlockingExecutor;
+    use crate::driver::ExecutorError;
+    use crate::driver::thread_executor::is_thread_executor_worker;
+
+    #[test]
+    fn test_executor_rejects_full_queue_without_running_rejected_job() {
+        let executor = ThreadExecutor::new(1, 1).expect("executor starts");
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let (queued_sender, queued_receiver) = mpsc::sync_channel(1);
+
+        executor
+            .execute(move || {
+                started_sender.send(()).expect("test is waiting");
+                release_receiver.recv().expect("test releases worker");
+            })
+            .unwrap_or_else(|_| panic!("first job is accepted"));
+        started_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker started first job");
+        executor
+            .execute(move || queued_sender.send(()).expect("test receives queued job"))
+            .unwrap_or_else(|_| panic!("one job fits the pending queue"));
+
+        let (rejected_sender, rejected_receiver) = mpsc::sync_channel(1);
+        let rejected = executor
+            .execute(move || rejected_sender.send(()).expect("rejected job can be recovered"))
+            .expect_err("pending queue is full");
+        assert_eq!(rejected.error, ExecutorError::Capacity);
+        assert!(rejected_receiver.try_recv().is_err());
+
+        release_sender.send(()).expect("release first job");
+        queued_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("queued job runs after first job returns");
+        (rejected.job)();
+        rejected_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("rejected job remains callable by its owner");
+    }
+
+    #[test]
+    fn test_worker_identity_is_specific_to_each_executor() {
+        let first = ThreadExecutor::new(1, 1).expect("first executor starts");
+        let second = ThreadExecutor::new(1, 1).expect("second executor starts");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let first_id = first.shared.executor_id;
+        let second_id = second.shared.executor_id;
+
+        first
+            .execute(move || {
+                sender
+                    .send((
+                        is_thread_executor_worker(),
+                        crate::driver::internal::current_thread_executor_id() == first_id,
+                        crate::driver::internal::current_thread_executor_id() == second_id,
+                    ))
+                    .expect("test receives worker identity");
+            })
+            .unwrap_or_else(|_| panic!("job is accepted"));
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)).expect("worker runs job"),
+            (true, true, false)
+        );
+    }
+}

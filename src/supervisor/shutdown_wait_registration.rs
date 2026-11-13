@@ -282,3 +282,54 @@ impl Drop for ShutdownWaitRegistration {
         self.unregister();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::OperationSupervisor;
+    use super::ShutdownSource;
+    use super::ShutdownWaitRegistration;
+    use super::lock;
+    use crate::context::ContextError;
+    use crate::report::SupervisorLimits;
+
+    #[test]
+    fn test_service_waiter_registration_is_bounded_and_releases_capacity() {
+        let supervisor = OperationSupervisor::new(SupervisorLimits {
+            admission_waiters: 1,
+            ..SupervisorLimits::default()
+        });
+        let group = supervisor.service_group(1).unwrap();
+        let source = ShutdownSource::Service(Arc::clone(&group.state), supervisor.internal_handle());
+        let waker = std::task::Waker::noop();
+        let mut first = ShutdownWaitRegistration::new(source.clone());
+        let mut rejected = ShutdownWaitRegistration::new(source);
+
+        first.register(waker).unwrap();
+        assert_eq!(lock(&group.state.0).shutdown_waiters.len(), 1);
+        assert_eq!(rejected.register(waker), Err(ContextError::WaiterCapacityExceeded));
+
+        // An existing registration can refresh while the registry is full.
+        first.register(waker).unwrap();
+        first.unregister();
+        first.unregister();
+        assert!(lock(&group.state.0).shutdown_waiters.is_empty());
+        rejected.register(waker).unwrap();
+        drop(rejected);
+        assert!(lock(&group.state.0).shutdown_waiters.is_empty());
+    }
+
+    #[test]
+    fn test_supervisor_waiter_registration_is_removed_on_drop() {
+        let supervisor = OperationSupervisor::new(SupervisorLimits {
+            admission_waiters: 1,
+            ..SupervisorLimits::default()
+        });
+        let mut registration = ShutdownWaitRegistration::new(ShutdownSource::Supervisor(supervisor.internal_handle()));
+        registration.register(std::task::Waker::noop()).unwrap();
+        assert_eq!(lock(&supervisor.inner.state).shutdown_waiters.len(), 1);
+        drop(registration);
+        assert!(lock(&supervisor.inner.state).shutdown_waiters.is_empty());
+    }
+}

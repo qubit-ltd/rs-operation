@@ -108,3 +108,84 @@ impl RegistryInner {
         drop(removed);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Wake;
+    use std::task::Waker;
+
+    use super::RegistryInner;
+    use crate::report::OperationId;
+    use crate::resource::internal::RegistryState;
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_registry_change_wakers_deduplicate_remove_and_wake_on_change() {
+        let registry = RegistryInner {
+            id: 1,
+            operation_id: OperationId::new(1),
+            state: Mutex::new(RegistryState {
+                slots: Vec::new(),
+                dependencies: BTreeMap::new(),
+            }),
+            change_epoch: AtomicU64::new(0),
+            change_wakers: Mutex::new(Vec::new()),
+        };
+        let removed_counter = Arc::new(WakeCounter::default());
+        let notified_counter = Arc::new(WakeCounter::default());
+        let removed_waker = Waker::from(Arc::clone(&removed_counter));
+        let notified_waker = Waker::from(Arc::clone(&notified_counter));
+
+        registry.register_change_waker(&removed_waker);
+        registry.register_change_waker(&removed_waker);
+        registry.register_change_waker(&notified_waker);
+        assert_eq!(
+            registry
+                .change_wakers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            2
+        );
+
+        registry.remove_change_waker(&removed_waker);
+        assert_eq!(
+            registry
+                .change_wakers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1
+        );
+        registry.notify_change();
+
+        assert_eq!(registry.change_epoch(), 1);
+        assert_eq!(removed_counter.0.load(Ordering::SeqCst), 0);
+        assert_eq!(notified_counter.0.load(Ordering::SeqCst), 1);
+        assert!(
+            registry
+                .change_wakers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+        );
+    }
+}

@@ -80,3 +80,57 @@ impl ServiceResourceError {
         self.owner
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use core::future::Future;
+    use core::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use crate::protocol::CleanupContext;
+    use crate::protocol::OwnedCleanup;
+    use crate::report::AdmissionError;
+    use crate::report::CleanupOutcome;
+    use crate::report::SupervisorLimits;
+    use crate::supervisor::OperationSupervisor;
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl OwnedCleanup for DropProbe {
+        fn begin(
+            self: Box<Self>,
+            _context: CleanupContext,
+        ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+            Box::pin(async { CleanupOutcome::Cleaned })
+        }
+    }
+
+    #[test]
+    fn test_rejected_service_resource_error_preserves_owner_until_recovered() {
+        let supervisor = OperationSupervisor::new(SupervisorLimits::default());
+        let group = supervisor.service_group(1).unwrap();
+        let scope = group.resource_scope(1).unwrap();
+        scope.close();
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        let error = scope
+            .register_resource(DropProbe(Arc::clone(&dropped)))
+            .expect_err("closed scope rejects resource registration");
+        assert_eq!(error.reason, AdmissionError::Closed);
+        let debug = format!("{error:?}");
+        assert!(debug.contains("Closed"));
+        assert!(!debug.contains("DropProbe"));
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        drop(error.into_owner());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+}

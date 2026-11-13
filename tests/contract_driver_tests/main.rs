@@ -231,11 +231,19 @@ fn test_thread_executor_has_fixed_workers_and_returns_rejected_closure() {
     gate.wait();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let held_rx = release_rx;
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
     executor
         .execute(move || {
+            second_started_tx.send(()).unwrap();
             held_rx.recv().unwrap();
         })
         .unwrap_or_else(|_| panic!("job should be accepted"));
+    second_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("second job must occupy the sole worker before testing queue capacity");
+    executor
+        .execute(|| {})
+        .unwrap_or_else(|_| panic!("the sole queue slot should be available"));
     let rejected_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let marker = Arc::clone(&rejected_called);
     let rejected = executor.execute(move || marker.store(true, Ordering::SeqCst));
