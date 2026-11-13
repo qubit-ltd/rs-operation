@@ -21,7 +21,7 @@ use super::internal::util::lock;
 /// # Examples
 ///
 /// ```
-/// use qubit_operation::CleanupPermit;
+/// use qubit_operation::supervisor::CleanupPermit;
 ///
 /// fn finish_cleanup(permit: CleanupPermit) {
 ///     // The permit is supplied by OperationSupervisor::try_reserve_cleanup.

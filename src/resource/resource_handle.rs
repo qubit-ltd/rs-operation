@@ -27,9 +27,9 @@ use crate::report::ResourceId;
 /// use core::future::Future;
 /// use core::pin::Pin;
 /// use qubit_operation::protocol::CleanupContext;
-/// use qubit_operation::protocol::CleanupOutcome;
 /// use qubit_operation::protocol::OwnedCleanup;
 /// use qubit_operation::report::OperationId;
+/// use qubit_operation::report::CleanupOutcome;
 /// use qubit_operation::resource::ResourceRegistry;
 ///
 /// struct Cleanup;

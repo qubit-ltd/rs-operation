@@ -31,7 +31,7 @@ use crate::report::ResourceId;
 /// fn report_effect(scope: &OperationScope) -> Result<(), ScopeError> {
 ///     let effect = EffectRecord {
 ///         operation_id: OperationId::new(7),
-///         resource_id: Some(ResourceId::new(12)),
+///         resource_id: Some(ResourceId::new(OperationId::new(7), 0, 0)),
 ///         description: DiagnosticSummary::new("checkpoint persisted"),
 ///         fact: EffectFact::Known,
 ///     };

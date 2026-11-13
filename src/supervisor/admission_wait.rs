@@ -35,7 +35,7 @@ use crate::report::StartError;
 /// # Examples
 ///
 /// ```
-/// use qubit_operation::OperationSupervisor;
+/// use qubit_operation::supervisor::OperationSupervisor;
 ///
 /// async fn reserve(supervisor: &OperationSupervisor) {
 ///     let waiter = supervisor.start_wait_body("request").expect("waiter capacity");

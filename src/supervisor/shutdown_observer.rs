@@ -25,7 +25,8 @@ use crate::protocol::ClockSource;
 
 /// Reusable observer for a supervisor or service-group shutdown.
 ///
-/// Obtain an observer from [`OperationSupervisor::shutdown_observer`] or from
+/// Obtain an observer from
+/// [`crate::supervisor::OperationSupervisor::shutdown_observer`] or from
 /// the public service-group shutdown flow, then wait for outstanding work.
 ///
 /// # Examples

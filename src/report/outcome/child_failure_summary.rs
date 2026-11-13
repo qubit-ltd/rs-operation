@@ -11,8 +11,8 @@ use crate::report::OperationId;
 
 /// Bounded identity and summary for an unhandled child failure.
 ///
-/// This value is provided by [`OperationOutcome::ChildFailed`] when a required
-/// child failure is not handled by its parent operation.
+/// This value is provided by [`crate::report::OperationOutcome::ChildFailed`]
+/// when a required child failure is not handled by its parent operation.
 ///
 /// # Examples
 ///

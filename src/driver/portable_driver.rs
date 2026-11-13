@@ -42,7 +42,7 @@ use super::TaskHandle;
 ///     polls_per_turn: 4,
 /// })?;
 /// let task = driver.spawn(async {})?;
-/// assert_eq!(driver.task_count(), 1);
+/// // The worker may finish immediately; task_count is only a snapshot.
 /// assert_ne!(task.as_u64(), 0);
 /// # Ok::<(), qubit_operation::driver::PortableDriverError>(())
 /// ```
@@ -230,6 +230,7 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
+    use super::super::PortableDriverError;
     use super::PortableDriver;
     use super::PortableDriverConfig;
 
@@ -283,6 +284,51 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while shared.active_workers.load(Ordering::Acquire) != 0 {
             assert!(Instant::now() < deadline, "closing workers exit within watchdog");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn test_spawn_rejects_task_when_capacity_is_full() {
+        let driver = PortableDriver::new(PortableDriverConfig {
+            worker_count: 1,
+            task_capacity: 1,
+            polls_per_turn: 1,
+        })
+        .expect("driver starts");
+        let _accepted = driver.spawn(std::future::pending::<()>()).expect("first task fits");
+
+        assert_eq!(driver.task_count(), 1);
+        assert_eq!(driver.spawn(async {}).unwrap_err(), PortableDriverError::Capacity);
+        assert_eq!(driver.task_count(), 1);
+    }
+
+    #[test]
+    fn test_panicking_task_does_not_stop_portable_worker() {
+        let driver = PortableDriver::new(PortableDriverConfig {
+            worker_count: 1,
+            task_capacity: 2,
+            polls_per_turn: 1,
+        })
+        .expect("driver starts");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let _panicking = driver
+            .spawn(async {
+                panic!("task poll failed");
+            })
+            .expect("panicking task is accepted");
+        let _following = driver
+            .spawn(async move {
+                sender.send(()).expect("receiver is still alive");
+            })
+            .expect("following task is accepted");
+
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker continues after isolating the panic");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while driver.task_count() != 0 {
+            assert!(Instant::now() < deadline, "completed tasks leave the registry");
             thread::yield_now();
         }
     }
