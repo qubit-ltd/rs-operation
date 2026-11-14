@@ -7,4 +7,5 @@ pub mod context;
 pub mod executor;
 pub mod internal;
 pub mod manager;
+pub mod scope;
 pub mod operation;
