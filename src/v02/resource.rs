@@ -1,6 +1,10 @@
 //! Typed resources whose lifetime is bounded by an operation scope.
 
 mod core;
+pub(crate) mod cleanup;
+pub(crate) mod dependency;
+pub(crate) mod recovery;
+pub(crate) mod transfer;
 mod resource_error;
 mod resource_key;
 mod resource_ref;
