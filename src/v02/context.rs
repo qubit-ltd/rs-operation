@@ -251,57 +251,78 @@ impl Future for StopSignal {
         let this = self.as_mut().get_mut();
         assert!(!this.completed, "stop signal polled after completion");
         let node = Arc::clone(&this.node);
-        let mut state = lock(&node.state);
-        if let Some(reason) = state.reason {
-            if let Some(id) = this.waiter.take() {
-                if let Some(index) = state
-                    .waiters
-                    .iter()
-                    .position(|(candidate, _)| *candidate == id)
+        let mut replacement = Some(cx.waker().clone());
+        let mut removed = None;
+        let mut result = None;
+        {
+            let mut state = lock(&node.state);
+            if let Some(reason) = state.reason {
+                if let Some(id) = this.waiter.take()
+                    && let Some(index) = state
+                        .waiters
+                        .iter()
+                        .position(|(candidate, _)| *candidate == id)
                 {
-                    state.waiters.swap_remove(index);
+                    let (_, waker) = state.waiters.swap_remove(index);
+                    removed = Some(waker);
                 }
-            }
-            drop(state);
-            this.completed = true;
-            return Poll::Ready(reason);
-        }
-        if let Some(id) = this.waiter {
-            if let Some((_, waker)) = state
-                .waiters
-                .iter_mut()
-                .find(|(candidate, _)| *candidate == id)
-            {
-                if !waker.will_wake(cx.waker()) {
-                    *waker = cx.waker().clone();
+                result = Some(reason);
+            } else if let Some(id) = this.waiter {
+                if let Some((_, registered)) = state
+                    .waiters
+                    .iter_mut()
+                    .find(|(candidate, _)| *candidate == id)
+                {
+                    if !registered.will_wake(replacement.as_ref().expect("replacement is present"))
+                    {
+                        removed = Some(std::mem::replace(
+                            registered,
+                            replacement.take().expect("replacement is present"),
+                        ));
+                    }
+                } else {
+                    result = Some(StopReason::ParentStopped);
                 }
             } else {
-                drop(state);
-                this.completed = true;
-                return Poll::Ready(StopReason::ParentStopped);
+                let id = state.next_waiter;
+                state.next_waiter = state.next_waiter.wrapping_add(1).max(1);
+                state
+                    .waiters
+                    .push((id, replacement.take().expect("replacement is present")));
+                this.waiter = Some(id);
             }
-        } else {
-            let id = state.next_waiter;
-            state.next_waiter = state.next_waiter.wrapping_add(1).max(1);
-            state.waiters.push((id, cx.waker().clone()));
-            this.waiter = Some(id);
         }
-        Poll::Pending
+        // A user-provided RawWaker can run arbitrary code in clone/drop. Keep
+        // both callbacks outside the context state lock.
+        drop(replacement);
+        drop(removed);
+        if let Some(reason) = result {
+            this.completed = true;
+            Poll::Ready(reason)
+        } else {
+            Poll::Pending
+        }
     }
 }
 
 impl Drop for StopSignal {
     fn drop(&mut self) {
-        if let Some(id) = self.waiter.take() {
+        let removed = if let Some(id) = self.waiter.take() {
             let mut state = lock(&self.node.state);
             if let Some(index) = state
                 .waiters
                 .iter()
                 .position(|(candidate, _)| *candidate == id)
             {
-                state.waiters.swap_remove(index);
+                let (_, waker) = state.waiters.swap_remove(index);
+                Some(waker)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
+        drop(removed);
     }
 }
 
@@ -405,8 +426,10 @@ mod tests {
     use crate::v02::report::{ContextError, ContextOptions, DiagnosticSummary, StopReason};
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Wake, Waker};
+    use std::task::{RawWaker, RawWakerVTable, Wake, Waker};
+    use std::thread::JoinHandle;
 
     struct ManualClock {
         domain: ClockDomainId,
@@ -465,6 +488,70 @@ mod tests {
         reject: bool,
     }
 
+    struct ReentrantWakerProbe {
+        context: Arc<OperationContext>,
+        clone_lock_violations: AtomicUsize,
+        drop_lock_violations: AtomicUsize,
+        reentries: Mutex<Vec<JoinHandle<Option<StopReason>>>>,
+    }
+
+    impl ReentrantWakerProbe {
+        fn callback(&self, is_clone: bool) {
+            if self.context.node.state.try_lock().is_err() {
+                let counter = if is_clone {
+                    &self.clone_lock_violations
+                } else {
+                    &self.drop_lock_violations
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            let context = Arc::clone(&self.context);
+            let reentry = std::thread::spawn(move || context.stop_reason());
+            self.reentries.lock().unwrap().push(reentry);
+        }
+
+        fn join_reentries(&self) {
+            for reentry in self.reentries.lock().unwrap().drain(..) {
+                reentry.join().unwrap();
+            }
+        }
+    }
+
+    unsafe fn clone_reentrant_waker(data: *const ()) -> RawWaker {
+        let probe = unsafe { Arc::from_raw(data.cast::<ReentrantWakerProbe>()) };
+        unsafe { Arc::increment_strong_count(Arc::as_ptr(&probe)) };
+        probe.callback(true);
+        RawWaker::new(Arc::into_raw(probe).cast(), &REENTRANT_WAKER_VTABLE)
+    }
+
+    unsafe fn drop_reentrant_waker(data: *const ()) {
+        let probe = unsafe { Arc::from_raw(data.cast::<ReentrantWakerProbe>()) };
+        probe.callback(false);
+    }
+
+    unsafe fn wake_reentrant_waker(data: *const ()) {
+        unsafe { drop_reentrant_waker(data) };
+    }
+
+    unsafe fn wake_reentrant_waker_by_ref(data: *const ()) {
+        let probe = std::mem::ManuallyDrop::new(unsafe {
+            Arc::from_raw(data.cast::<ReentrantWakerProbe>())
+        });
+        probe.callback(false);
+    }
+
+    static REENTRANT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_reentrant_waker,
+        wake_reentrant_waker,
+        wake_reentrant_waker_by_ref,
+        drop_reentrant_waker,
+    );
+
+    fn reentrant_waker(probe: Arc<ReentrantWakerProbe>) -> Waker {
+        let raw = RawWaker::new(Arc::into_raw(probe).cast(), &REENTRANT_WAKER_VTABLE);
+        unsafe { Waker::from_raw(raw) }
+    }
+
     impl BudgetPolicy for Policy {
         fn check(&self) -> Result<(), BudgetError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -517,6 +604,33 @@ mod tests {
         assert!(context.request_stop(StopReason::UserCancelled));
         assert!(!context.request_stop(StopReason::ManagerShutdown));
         assert_eq!(context.stop_reason(), Some(StopReason::UserCancelled));
+    }
+
+    #[test]
+    fn stop_signal_waker_callbacks_run_outside_context_lock() {
+        let context = Arc::new(OperationContext::new(ContextOptions::default()).unwrap());
+        let probe = Arc::new(ReentrantWakerProbe {
+            context: Arc::clone(&context),
+            clone_lock_violations: AtomicUsize::new(0),
+            drop_lock_violations: AtomicUsize::new(0),
+            reentries: Mutex::new(Vec::new()),
+        });
+        let waker = reentrant_waker(Arc::clone(&probe));
+        let mut task = std::task::Context::from_waker(&waker);
+        let mut signal = Box::pin(context.stop_requested());
+        use std::future::Future;
+        use std::task::Poll;
+
+        assert!(matches!(
+            Pin::as_mut(&mut signal).poll(&mut task),
+            Poll::Pending
+        ));
+        drop(signal);
+        drop(waker);
+        probe.join_reentries();
+
+        assert_eq!(probe.clone_lock_violations.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.drop_lock_violations.load(Ordering::SeqCst), 0);
     }
 
     #[test]
