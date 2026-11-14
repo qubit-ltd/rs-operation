@@ -13,8 +13,12 @@ mod resource_scope;
 pub mod service;
 pub(crate) mod transfer;
 
+pub use crate::v02::report::RecoveryStoreOptions;
 pub use cleanup::{AsyncCleanup, CleanupFuture, CleanupOutcome};
-pub use recovery::{RecoveryHandle, RecoveryStore, RecoveryStoreOptions};
+pub use recovery::{
+    AsyncRecoveryAttempt, RecoveryAttempt, RecoveryHandle, RecoveryStore,
+    RecoveryStoreShutdownError, RecoveryStoreShutdownHandle,
+};
 pub use resource_error::{ManageResourceError, ResourceCapacityError, ResourceCommitError};
 pub use resource_key::ResourceKey;
 pub use resource_ref::ResourceRef;

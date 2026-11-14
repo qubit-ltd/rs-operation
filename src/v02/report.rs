@@ -799,6 +799,24 @@ impl fmt::Display for RecoveryStoreCreateError {
 }
 impl Error for RecoveryStoreCreateError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryStoreOptions {
+    pub group_capacity: usize,
+    pub resource_capacity: usize,
+    pub cleanup_concurrency: usize,
+    pub cleanup_executor: ThreadPoolExecutorOptions,
+}
+impl Default for RecoveryStoreOptions {
+    fn default() -> Self {
+        Self {
+            group_capacity: 64,
+            resource_capacity: 128,
+            cleanup_concurrency: 4,
+            cleanup_executor: ThreadPoolExecutorOptions::default(),
+        }
+    }
+}
+
 /// Type and manager credential for reacquiring a resource from its owning scope.
 pub struct ResourceKey<T: Send + Sync + 'static> {
     manager: ManagerId,
