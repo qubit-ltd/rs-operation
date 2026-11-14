@@ -1,7 +1,6 @@
 include!("../doc/examples-0.2.0/inference.rs");
 
-use qubit_operation::{AsyncOperationManager, ManagerOptions, ShutdownMode};
-use std::sync::Arc;
+use qubit_operation::{ManagerOptions, ShutdownMode};
 
 struct DemoModel;
 
