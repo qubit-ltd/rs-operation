@@ -12,7 +12,7 @@ mod resource_ref;
 mod resource_reservation;
 mod resource_scope;
 
-pub use resource_error::{ResourceAccessError, ResourceCapacityError, ResourceCommitError};
+pub use resource_error::{ManageResourceError, ResourceCapacityError, ResourceCommitError};
 pub use resource_key::ResourceKey;
 pub use resource_ref::ResourceRef;
 pub use resource_reservation::ResourceReservation;

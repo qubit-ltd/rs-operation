@@ -1,209 +1,238 @@
-use super::core::Owner;
-use super::resource_error::{ResourceAccessError, ResourceCapacityError, ResourceCommitError};
+use super::core::ScopeState;
+use super::resource_error::{ManageResourceError, ResourceCapacityError};
 use super::{ResourceKey, ResourceRef, ResourceReservation};
 use crate::v02::manager::capacity::ScopeCapacity;
-use crate::v02::report::{ManagerId, ResourceScopeId};
-use std::any::Any;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use crate::v02::report::{
+    ManagerId, ResourceLookupError, ResourceManageErrorKind, ResourceScopeId,
+};
+use crate::v02::resource::cleanup_port::CleanupDispatch;
+use std::sync::Arc;
 
-trait ErasedOwner: Any + Send + Sync {
-    fn end(&self);
-    fn as_any(&self) -> &dyn Any;
-}
-impl<T: Send + Sync + 'static> ErasedOwner for Arc<Owner<T>> {
-    fn end(&self) {
-        Owner::end(self);
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-struct Entry {
-    owner: Box<dyn ErasedOwner>,
-}
-struct State {
-    open: bool,
-    next_slot: u64,
-    generation: u64,
-    slots: HashMap<u64, Entry>,
-}
 /// Independently endable heterogeneous resource scope.
 pub struct ResourceScope {
-    manager: ManagerId,
-    id: ResourceScopeId,
-    capacity: Arc<ScopeCapacity>,
-    state: Mutex<State>,
+    state: Arc<ScopeState>,
 }
 impl ResourceScope {
     pub(crate) fn new(
         manager: ManagerId,
         id: ResourceScopeId,
         capacity: Arc<ScopeCapacity>,
+        cleanup: Arc<dyn CleanupDispatch>,
     ) -> Self {
         Self {
-            manager,
-            id,
-            capacity,
-            state: Mutex::new(State {
-                open: true,
-                next_slot: 1,
-                generation: 1,
-                slots: HashMap::new(),
-            }),
+            state: ScopeState::new(manager, id, capacity, cleanup),
         }
     }
-    pub fn reserve(&self) -> Result<ResourceReservation, ResourceCapacityError> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.open {
-            return Err(ResourceCapacityError::ScopeEnded);
-        }
-        self.capacity
-            .resource_registration()
-            .map(ResourceReservation::new)
-            .map_err(|_| ResourceCapacityError::Exhausted)
+    pub(crate) fn reserve(&self) -> Result<ResourceReservation, ResourceCapacityError> {
+        self.state.core.reserve()
     }
     pub fn manage<T: Send + Sync + 'static>(
         &self,
         value: T,
-    ) -> Result<ResourceRef<T>, (ResourceCapacityError, T)> {
+    ) -> Result<ResourceRef<T>, ManageResourceError<T>> {
         let reservation = match self.reserve() {
-            Ok(r) => r,
-            Err(e) => return Err((e, value)),
+            Ok(reservation) => reservation,
+            Err(error) => return Err(ManageResourceError::new(manage_kind(error), value)),
         };
-        self.manage_reserved(value, reservation).map_err(|error| {
+        reservation.commit(value).map_err(|error| {
             let (reason, value, reservation) = error.into_parts();
             drop(reservation);
-            (reason, value)
-        })
-    }
-    pub fn manage_reserved<T: Send + Sync + 'static>(
-        &self,
-        value: T,
-        mut reservation: ResourceReservation,
-    ) -> Result<ResourceRef<T>, ResourceCommitError<T>> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.open {
-            return Err(ResourceCommitError::new(
-                ResourceCapacityError::ScopeEnded,
-                value,
-                reservation,
-            ));
-        }
-        let slot = state.next_slot;
-        state.next_slot = state.next_slot.wrapping_add(1);
-        let generation = state.generation;
-        let registration = reservation
-            .take()
-            .expect("reservation contains capacity permit");
-        let owner = Owner::new(value, generation, Some(registration));
-        let value = owner.value_arc().expect("new owner contains its resource");
-        let owner_ref = owner.acquire(generation).expect("new owner is open");
-        state.slots.insert(
-            slot,
-            Entry {
-                owner: Box::new(owner),
-            },
-        );
-        Ok(ResourceRef {
-            owner: owner_ref,
-            value: Some(value),
-            generation,
-            manager: self.manager,
-            scope: self.id,
-            slot,
+            ManageResourceError::new(reason, value)
         })
     }
     pub fn get_resource<T: Send + Sync + 'static>(
         &self,
         key: ResourceKey<T>,
-    ) -> Result<ResourceRef<T>, ResourceAccessError> {
-        if key.manager != self.manager {
-            return Err(ResourceAccessError::WrongManager);
-        }
-        if key.scope != self.id {
-            return Err(ResourceAccessError::WrongScope);
+    ) -> Result<ResourceRef<T>, ResourceLookupError> {
+        let core = &self.state.core;
+        if key.manager != core.manager || key.scope != core.id {
+            return Err(ResourceLookupError::WrongScope);
         }
         if key.type_id != std::any::TypeId::of::<T>() {
-            return Err(ResourceAccessError::WrongType);
+            return Err(ResourceLookupError::StaleKey);
         }
-        let state = self
+        let state = core
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !state.open {
-            return Err(ResourceAccessError::ScopeEnded);
+            return Err(ResourceLookupError::ScopeEnded);
         }
         let entry = state
             .slots
             .get(&key.slot)
-            .ok_or(ResourceAccessError::StaleKey)?;
+            .ok_or(ResourceLookupError::StaleKey)?;
         let owner = entry
             .owner
             .as_any()
-            .downcast_ref::<Arc<Owner<T>>>()
-            .ok_or(ResourceAccessError::WrongType)?;
+            .downcast_ref::<Arc<super::core::Owner<T>>>()
+            .ok_or(ResourceLookupError::StaleKey)?;
         let owner_ref = owner.acquire(key.generation)?;
-        let value = owner.value_arc().ok_or(ResourceAccessError::StaleKey)?;
+        let value = owner.value_arc().ok_or(ResourceLookupError::StaleKey)?;
         Ok(ResourceRef {
             owner: owner_ref,
             value: Some(value),
             generation: key.generation,
-            manager: self.manager,
-            scope: self.id,
+            manager: core.manager,
+            scope: core.id,
             slot: key.slot,
         })
     }
     pub fn end(&self) {
-        let slots = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !state.open {
-                return;
-            }
-            state.open = false;
-            state.generation = state.generation.wrapping_add(1);
-            std::mem::take(&mut state.slots)
-        };
-        for (_, entry) in slots {
-            entry.owner.end();
-        }
+        self.state.end();
     }
 }
-
 impl Drop for ResourceScope {
     fn drop(&mut self) {
         self.end();
     }
 }
 
+fn manage_kind(error: ResourceCapacityError) -> ResourceManageErrorKind {
+    match error {
+        ResourceCapacityError::ScopeEnded => ResourceManageErrorKind::ScopeEnded,
+        ResourceCapacityError::Exhausted
+        | ResourceCapacityError::CleanupQueueFull
+        | ResourceCapacityError::CleanupQueueClosed => ResourceManageErrorKind::CapacityExceeded,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ResourceScope;
+    use crate::v02::executor::CleanupExecutor;
     use crate::v02::manager::capacity::{ManagerCapacityPools, ScopeCapacity};
-    use crate::v02::report::{ManagerId, ManagerLimits, ResourceScopeId, ScopeLimits};
-    use std::sync::Arc;
+    use crate::v02::report::{
+        ManagerId, ManagerLimits, PortableExecutorOptions, ResourceManageErrorKind,
+        ResourceScopeId, ScopeLimits, ThreadPoolExecutorOptions,
+    };
+    use crate::v02::resource::cleanup_port::{
+        CleanupDispatch, CleanupDispatchPermit, CleanupJob, CleanupQueueError,
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    fn scope() -> ResourceScope {
+    struct QueueSlot {
+        reserved: bool,
+        job: Option<Box<dyn CleanupJob>>,
+    }
+    struct ManualCleanup {
+        slots: Arc<Mutex<Vec<QueueSlot>>>,
+    }
+    impl ManualCleanup {
+        fn new(limit: usize) -> Arc<Self> {
+            Arc::new(Self {
+                slots: Arc::new(Mutex::new(
+                    (0..limit)
+                        .map(|_| QueueSlot {
+                            reserved: false,
+                            job: None,
+                        })
+                        .collect(),
+                )),
+            })
+        }
+        fn run_all(&self, executor: &Arc<CleanupExecutor>) {
+            let slot_count = self.slots.lock().unwrap().len();
+            for index in 0..slot_count {
+                let job = { self.slots.lock().unwrap()[index].job.take() };
+                let Some(job) = job else { continue };
+                match job.schedule(Arc::clone(executor)) {
+                    Ok(()) => self.slots.lock().unwrap()[index].reserved = false,
+                    Err(job) => {
+                        self.slots.lock().unwrap()[index].job = Some(job);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    impl CleanupDispatch for ManualCleanup {
+        fn reserve(&self) -> Result<Box<dyn CleanupDispatchPermit>, CleanupQueueError> {
+            let mut slots = self.slots.lock().unwrap();
+            let (index, slot) = slots
+                .iter_mut()
+                .enumerate()
+                .find(|(_, slot)| !slot.reserved)
+                .ok_or(CleanupQueueError::Full)?;
+            slot.reserved = true;
+            Ok(Box::new(ManualPermit {
+                slots: Arc::clone(&self.slots),
+                index,
+            }))
+        }
+    }
+    struct ManualPermit {
+        slots: Arc<Mutex<Vec<QueueSlot>>>,
+        index: usize,
+    }
+    impl CleanupDispatchPermit for ManualPermit {
+        fn enqueue(self: Box<Self>, job: Box<dyn CleanupJob>) {
+            let mut slots = self.slots.lock().unwrap();
+            let slot = &mut slots[self.index];
+            assert!(slot.reserved && slot.job.is_none());
+            slot.job = Some(job);
+        }
+    }
+    impl Drop for ManualPermit {
+        fn drop(&mut self) {
+            let mut slots = self.slots.lock().unwrap();
+            let slot = &mut slots[self.index];
+            if slot.job.is_none() {
+                slot.reserved = false;
+            }
+        }
+    }
+
+    fn scope() -> (ResourceScope, Arc<ManualCleanup>) {
         let manager = ManagerCapacityPools::new(ManagerLimits::default());
-        ResourceScope::new(
+        let cleanup = ManualCleanup::new(16);
+        let scope = ResourceScope::new(
             ManagerId::new_unique(),
             ResourceScopeId::new_unique(),
             Arc::new(ScopeCapacity::root(&manager, 42, ScopeLimits::default())),
+            cleanup.clone(),
+        );
+        (scope, cleanup)
+    }
+    fn executor() -> Arc<CleanupExecutor> {
+        Arc::new(
+            CleanupExecutor::new(
+                ThreadPoolExecutorOptions {
+                    worker_count: 1,
+                    queue_capacity: 16,
+                },
+                PortableExecutorOptions::default(),
+            )
+            .unwrap(),
         )
     }
 
     #[test]
+    fn resource_drop_waits_for_manual_cleanup_dispatch() {
+        struct DropCount(Arc<AtomicUsize>);
+        impl Drop for DropCount {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (scope, cleanup) = scope();
+        let executor = executor();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let resource = scope.manage(DropCount(Arc::clone(&drops))).unwrap();
+        drop(resource);
+        scope.end();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        cleanup.run_all(&executor);
+        executor.shutdown().wait().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn open_scope_reacquires_resource_by_typed_key() {
-        let scope = scope();
+        let (scope, _) = scope();
         let first = scope.manage(String::from("ready")).unwrap();
         let key = first.key();
         let second = scope.get_resource(key).unwrap();
@@ -213,28 +242,28 @@ mod tests {
 
     #[test]
     fn ended_scope_keeps_live_reference_readable_and_disallows_get() {
-        let scope = scope();
+        let (scope, _) = scope();
         let resource = scope.manage(18_u32).unwrap();
         let key = resource.key();
         scope.end();
         assert_eq!(*resource, 18);
-        assert!(scope.get_resource(key).is_err());
+        assert!(matches!(
+            scope.get_resource(key),
+            Err(crate::v02::report::ResourceLookupError::ScopeEnded)
+        ));
     }
 
     #[test]
-    fn ended_commit_returns_resource_and_reservation() {
-        let scope = scope();
+    fn ended_reservation_commit_returns_resource_and_bound_reservation() {
+        let (scope, _) = scope();
         let reservation = scope.reserve().unwrap();
         scope.end();
-        let error = match scope.manage_reserved(String::from("owner"), reservation) {
-            Ok(_) => panic!("ended scope accepted resource"),
+        let error = match reservation.commit(String::from("owner")) {
+            Ok(_) => panic!("ended scope accepted commit"),
             Err(error) => error,
         };
         let (reason, resource, reservation) = error.into_parts();
-        assert_eq!(
-            reason,
-            crate::v02::resource::ResourceCapacityError::ScopeEnded
-        );
+        assert_eq!(reason, ResourceManageErrorKind::ScopeEnded);
         assert_eq!(resource, "owner");
         drop(reservation);
     }
