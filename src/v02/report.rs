@@ -597,6 +597,9 @@ pub struct ResourceScopeReport {
     pub resources: Arc<[ResourceCleanupReport]>,
     pub failures: Arc<[CleanupFailure]>,
     pub recoveries: Arc<[RecoveryHandle]>,
+    pub transfers: Arc<[TransferReceipt]>,
+    pub transfers_total: usize,
+    pub transfers_truncated: bool,
 }
 
 /// A read/retry capability; ownership of recovery payload remains in its registry.
@@ -615,7 +618,7 @@ impl RecoveryHandle {
 }
 
 /// Receipt fields remain private; only a receiving protocol may mint one.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferReceipt {
     resource: ResourceId,
     source_scope: ResourceScopeId,

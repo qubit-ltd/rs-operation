@@ -1,7 +1,8 @@
 //! Synchronization primitives shared by typed resource handles.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use super::ResourceRef;
@@ -9,7 +10,11 @@ use super::resource_error::{ResourceCapacityError, ResourceCommitError};
 use super::resource_reservation::ResourceReservation;
 use crate::v02::executor::CleanupExecutor;
 use crate::v02::manager::capacity::{ResourceRegistration, ScopeCapacity};
-use crate::v02::report::{ManagerId, ResourceManageErrorKind, ResourceScopeId};
+use crate::v02::report::{
+    CleanupEvidence, CleanupFailure, CleanupStage, DiagnosticSummary, ManagerId,
+    ResourceCleanupReport, ResourceId, ResourceManageErrorKind, ResourceScopeId,
+    ResourceScopeReport, TransferReceipt,
+};
 use crate::v02::resource::cleanup_port::{
     CleanupDispatch, CleanupDispatchPermit, CleanupJob, CleanupQueueError,
 };
@@ -21,6 +26,8 @@ pub(super) struct Slot<T> {
     open: bool,
     registration: Option<ResourceRegistration>,
     cleanup_permit: Option<Box<dyn CleanupDispatchPermit>>,
+    resource_id: ResourceId,
+    completion: Arc<ScopeCompletion>,
 }
 
 pub(super) struct Owner<T> {
@@ -32,6 +39,8 @@ impl<T: Send + Sync + 'static> Owner<T> {
         generation: u64,
         registration: ResourceRegistration,
         cleanup_permit: Box<dyn CleanupDispatchPermit>,
+        resource_id: ResourceId,
+        completion: Arc<ScopeCompletion>,
     ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(Slot {
@@ -41,6 +50,8 @@ impl<T: Send + Sync + 'static> Owner<T> {
                 open: true,
                 registration: Some(registration),
                 cleanup_permit: Some(cleanup_permit),
+                resource_id,
+                completion,
             }),
         })
     }
@@ -93,7 +104,13 @@ impl<T: Send + Sync + 'static> Owner<T> {
     }
     fn take_if_ready(
         state: &mut Slot<T>,
-    ) -> Option<(T, ResourceRegistration, Box<dyn CleanupDispatchPermit>)> {
+    ) -> Option<(
+        T,
+        ResourceRegistration,
+        Box<dyn CleanupDispatchPermit>,
+        ResourceId,
+        Arc<ScopeCompletion>,
+    )> {
         if state.open || state.users != 0 {
             return None;
         }
@@ -109,14 +126,161 @@ impl<T: Send + Sync + 'static> Owner<T> {
                 .cleanup_permit
                 .take()
                 .expect("owner holds cleanup dispatch permit"),
+            state.resource_id,
+            Arc::clone(&state.completion),
         ))
     }
-    fn dispatch(ready: Option<(T, ResourceRegistration, Box<dyn CleanupDispatchPermit>)>) {
-        if let Some((value, registration, permit)) = ready {
+    fn dispatch(
+        ready: Option<(
+            T,
+            ResourceRegistration,
+            Box<dyn CleanupDispatchPermit>,
+            ResourceId,
+            Arc<ScopeCompletion>,
+        )>,
+    ) {
+        if let Some((value, registration, permit, resource_id, completion)) = ready {
             permit.enqueue(Box::new(DefaultDropJob {
                 value: Some(value),
                 registration: Some(registration),
+                resource_id,
+                completion,
             }));
+        }
+    }
+}
+
+/// Settles a resource scope only after every handed-off resource owner reports.
+pub(super) struct ScopeCompletion {
+    state: Mutex<ScopeCompletionState>,
+}
+
+struct ScopeCompletionState {
+    expected: Option<usize>,
+    completed: usize,
+    seen: HashSet<ResourceId>,
+    resources: Vec<ResourceCleanupReport>,
+    failures: Vec<CleanupFailure>,
+    recoveries: Vec<crate::v02::report::RecoveryHandle>,
+    transfers: Vec<TransferReceipt>,
+    transfers_total: usize,
+    transfers_truncated: bool,
+    callback: Option<Box<dyn FnOnce(ResourceScopeReport) + Send + 'static>>,
+}
+
+impl ScopeCompletion {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ScopeCompletionState {
+                expected: None,
+                completed: 0,
+                seen: HashSet::new(),
+                resources: Vec::new(),
+                failures: Vec::new(),
+                recoveries: Vec::new(),
+                transfers: Vec::new(),
+                transfers_total: 0,
+                transfers_truncated: false,
+                callback: None,
+            }),
+        })
+    }
+
+    pub(super) fn set_callback(
+        &self,
+        callback: Box<dyn FnOnce(ResourceScopeReport) + Send + 'static>,
+    ) {
+        let (callback, report) = {
+            let mut state = lock(&self.state);
+            assert!(
+                state.callback.is_none(),
+                "resource scope callback is one-shot"
+            );
+            if Self::ready(&state) {
+                (Some(callback), Some(Self::report(&state)))
+            } else {
+                state.callback = Some(callback);
+                (None, None)
+            }
+        };
+        if let (Some(callback), Some(report)) = (callback, report) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| callback(report)));
+        }
+    }
+
+    pub(super) fn record_transfer(&self, receipt: TransferReceipt) -> bool {
+        let mut state = lock(&self.state);
+        if state.expected.is_some() {
+            return false;
+        }
+        state.transfers_total = state.transfers_total.saturating_add(1);
+        if state.transfers.len() < 256 {
+            state.transfers.push(receipt);
+        } else {
+            state.transfers_truncated = true;
+        }
+        true
+    }
+
+    fn seal(&self, expected: usize) {
+        let (callback, report) = {
+            let mut state = lock(&self.state);
+            state.expected = Some(expected);
+            if Self::ready(&state) {
+                (state.callback.take(), Some(Self::report(&state)))
+            } else {
+                (None, None)
+            }
+        };
+        if let (Some(callback), Some(report)) = (callback, report) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| callback(report)));
+        }
+    }
+
+    fn complete(
+        &self,
+        resource_id: ResourceId,
+        evidence: CleanupEvidence,
+        failure: Option<CleanupFailure>,
+    ) {
+        let (callback, report) = {
+            let mut state = lock(&self.state);
+            if !state.seen.insert(resource_id) {
+                return;
+            }
+            state.completed = state.completed.saturating_add(1);
+            state.resources.push(ResourceCleanupReport {
+                resource_id,
+                evidence,
+            });
+            if let Some(failure) = failure {
+                state.failures.push(failure);
+            }
+            if Self::ready(&state) {
+                (state.callback.take(), Some(Self::report(&state)))
+            } else {
+                (None, None)
+            }
+        };
+        if let (Some(callback), Some(report)) = (callback, report) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| callback(report)));
+        }
+    }
+
+    fn ready(state: &ScopeCompletionState) -> bool {
+        state
+            .expected
+            .is_some_and(|expected| state.completed >= expected)
+    }
+
+    fn report(state: &ScopeCompletionState) -> ResourceScopeReport {
+        ResourceScopeReport {
+            resources: Arc::from(state.resources.clone()),
+            failures: Arc::from(state.failures.clone()),
+            recoveries: Arc::from(state.recoveries.clone()),
+            transfers: Arc::from(state.transfers.clone()),
+            transfers_total: state.transfers_total,
+            transfers_truncated: state.transfers_truncated,
         }
     }
 }
@@ -124,6 +288,8 @@ impl<T: Send + Sync + 'static> Owner<T> {
 struct DefaultDropJob<T> {
     value: Option<T>,
     registration: Option<ResourceRegistration>,
+    resource_id: ResourceId,
+    completion: Arc<ScopeCompletion>,
 }
 impl<T> Drop for DefaultDropJob<T> {
     fn drop(&mut self) {
@@ -136,6 +302,8 @@ impl<T> Drop for DefaultDropJob<T> {
         if let Some(registration) = self.registration.take() {
             std::mem::forget(registration);
         }
+        // Keep the settlement pending when an accepted cleanup job itself is
+        // abandoned. No Released fact is synthesized after losing its owner.
     }
 }
 impl<T: Send + 'static> CleanupJob for DefaultDropJob<T> {
@@ -152,8 +320,46 @@ impl<T: Send + 'static> CleanupJob for DefaultDropJob<T> {
             .registration
             .take()
             .expect("cleanup job owns registration");
-        permit.drop_value((value, registration));
+        let scheduled = ScheduledDrop {
+            value: Some(value),
+            registration: Some(registration),
+            resource_id: self.resource_id,
+            completion: Arc::clone(&self.completion),
+        };
+        permit.drop_value(scheduled);
         Ok(())
+    }
+}
+
+struct ScheduledDrop<T> {
+    value: Option<T>,
+    registration: Option<ResourceRegistration>,
+    resource_id: ResourceId,
+    completion: Arc<ScopeCompletion>,
+}
+
+impl<T> Drop for ScheduledDrop<T> {
+    fn drop(&mut self) {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| drop(self.value.take())));
+        drop(self.registration.take());
+        let failure = result.err().map(|payload| CleanupFailure {
+            resource_id: self.resource_id,
+            stage: CleanupStage::Drop,
+            summary: DiagnosticSummary::new(&panic_summary(payload.as_ref())),
+            source: None,
+        });
+        self.completion
+            .complete(self.resource_id, CleanupEvidence::DropCompleted, failure);
+    }
+}
+
+fn panic_summary(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        format!("resource destructor panicked: {message}")
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        format!("resource destructor panicked: {message}")
+    } else {
+        "resource destructor panicked with a non-string payload".to_owned()
     }
 }
 
@@ -184,6 +390,7 @@ pub(super) struct ScopeCore {
     pub(super) id: ResourceScopeId,
     capacity: Arc<ScopeCapacity>,
     cleanup: Arc<dyn CleanupDispatch>,
+    completion: Arc<ScopeCompletion>,
     pub(super) state: Mutex<State>,
 }
 impl ScopeCore {
@@ -254,7 +461,15 @@ impl ScopeCore {
             .cleanup_permit
             .take()
             .expect("reservation has cleanup slot");
-        let owner = Owner::new(value, generation, registration, cleanup_permit);
+        let resource_id = ResourceId::new(self.manager, slot, generation);
+        let owner = Owner::new(
+            value,
+            generation,
+            registration,
+            cleanup_permit,
+            resource_id,
+            Arc::clone(&self.completion),
+        );
         let value = owner.value_arc().expect("new owner contains value");
         let owner_ref = owner.acquire(generation).expect("new owner is open");
         state.slots.insert(
@@ -277,6 +492,7 @@ impl ScopeCore {
 /// Synchronization and ownership state for one independently endable scope.
 pub(super) struct ScopeState {
     pub(super) core: Arc<ScopeCore>,
+    completion: Arc<ScopeCompletion>,
 }
 impl ScopeState {
     pub(super) fn new(
@@ -285,12 +501,14 @@ impl ScopeState {
         capacity: Arc<ScopeCapacity>,
         cleanup: Arc<dyn CleanupDispatch>,
     ) -> Arc<Self> {
+        let completion = ScopeCompletion::new();
         Arc::new(Self {
             core: Arc::new(ScopeCore {
                 manager,
                 id,
                 capacity,
                 cleanup,
+                completion: Arc::clone(&completion),
                 state: Mutex::new(State {
                     open: true,
                     next_slot: 1,
@@ -298,8 +516,21 @@ impl ScopeState {
                     slots: HashMap::new(),
                 }),
             }),
+            completion,
         })
     }
+
+    pub(super) fn set_settlement_callback(
+        &self,
+        callback: Box<dyn FnOnce(ResourceScopeReport) + Send + 'static>,
+    ) {
+        self.completion.set_callback(callback);
+    }
+
+    pub(super) fn record_transfer(&self, receipt: TransferReceipt) -> bool {
+        self.completion.record_transfer(receipt)
+    }
+
     pub(super) fn end(&self) {
         let slots = {
             let mut state = lock(&self.core.state);
@@ -310,6 +541,7 @@ impl ScopeState {
             state.generation = state.generation.wrapping_add(1);
             std::mem::take(&mut state.slots)
         };
+        self.completion.seal(slots.len());
         for entry in slots.into_values() {
             entry.owner.end();
         }
@@ -328,7 +560,7 @@ mod tests {
     use crate::v02::manager::capacity::ResourceRegistration;
     use crate::v02::manager::capacity::{ManagerCapacityPools, ScopeCapacity};
     use crate::v02::report::{
-        ManagerLimits, PortableExecutorOptions, ScopeLimits, ThreadPoolExecutorOptions,
+        ManagerLimits, PortableExecutorOptions, ResourceId, ScopeLimits, ThreadPoolExecutorOptions,
     };
     use crate::v02::resource::cleanup_port::{
         CleanupDispatch, CleanupDispatchPermit, CleanupJob, CleanupQueueError,
@@ -452,7 +684,18 @@ mod tests {
         generation: u64,
         dispatch: &ManualDispatch,
     ) -> Arc<Owner<T>> {
-        Owner::new(value, generation, registration(), dispatch.reserve_permit())
+        Owner::new(
+            value,
+            generation,
+            registration(),
+            dispatch.reserve_permit(),
+            ResourceId::new(
+                crate::v02::report::ManagerId::new_unique(),
+                generation,
+                generation,
+            ),
+            super::ScopeCompletion::new(),
+        )
     }
 
     #[test]

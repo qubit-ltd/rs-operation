@@ -289,3 +289,33 @@ fn async_settlement_deadline_only_limits_observation() {
         Poll::Ready(Ok(SettlementWait::Pending(snapshot))) if snapshot.stop.is_none()
     ));
 }
+
+#[test]
+fn outcome_delivery_hook_notifies_take_and_discard_once() {
+    let core = OperationCore::new(OperationId::new_unique());
+    let slot = OutcomeSlot::<u8, ()>::new(Arc::clone(&core));
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&deliveries);
+    slot.set_delivery_hook(move |delivery| observed.lock().unwrap().push(delivery));
+    slot.publish(OperationOutcome::Succeeded(7)).unwrap();
+    assert!(matches!(
+        slot.take_if_ready(),
+        Ok(Some(OperationOutcome::Succeeded(7)))
+    ));
+    slot.discard();
+    assert_eq!(
+        *deliveries.lock().unwrap(),
+        vec![OutcomeDelivery::Delivered]
+    );
+
+    let discarded = OutcomeSlot::<u8, ()>::new(OperationCore::new(OperationId::new_unique()));
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    discarded.set_delivery_hook(move |delivery| observed.lock().unwrap().push(delivery));
+    discarded.discard();
+    let rejected = discarded
+        .publish(OperationOutcome::Succeeded(9))
+        .expect_err("discarded result remains unavailable");
+    assert!(matches!(rejected, OperationOutcome::Succeeded(9)));
+    assert_eq!(*events.lock().unwrap(), vec![OutcomeDelivery::Discarded]);
+}

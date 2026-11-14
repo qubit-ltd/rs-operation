@@ -3,7 +3,8 @@ use super::resource_error::{ManageResourceError, ResourceCapacityError};
 use super::{ResourceKey, ResourceRef, ResourceReservation};
 use crate::v02::manager::capacity::ScopeCapacity;
 use crate::v02::report::{
-    ManagerId, ResourceLookupError, ResourceManageErrorKind, ResourceScopeId,
+    ManagerId, ResourceLookupError, ResourceManageErrorKind, ResourceScopeId, ResourceScopeReport,
+    TransferReceipt,
 };
 use crate::v02::resource::cleanup_port::CleanupDispatch;
 use std::sync::Arc;
@@ -25,6 +26,23 @@ impl ResourceScope {
     }
     pub(crate) fn reserve(&self) -> Result<ResourceReservation, ResourceCapacityError> {
         self.state.core.reserve()
+    }
+
+    pub(crate) fn internal_clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    pub(crate) fn set_settlement_callback(
+        &self,
+        callback: Box<dyn FnOnce(ResourceScopeReport) + Send + 'static>,
+    ) {
+        self.state.set_settlement_callback(callback);
+    }
+
+    pub(crate) fn record_transfer_receipt(&self, receipt: TransferReceipt) -> bool {
+        self.state.record_transfer(receipt)
     }
     pub fn manage<T: Send + Sync + 'static>(
         &self,
@@ -84,7 +102,9 @@ impl ResourceScope {
 }
 impl Drop for ResourceScope {
     fn drop(&mut self) {
-        self.end();
+        if Arc::strong_count(&self.state) == 1 {
+            self.end();
+        }
     }
 }
 
@@ -266,5 +286,39 @@ mod tests {
         assert_eq!(reason, ResourceManageErrorKind::ScopeEnded);
         assert_eq!(resource, "owner");
         drop(reservation);
+    }
+
+    #[test]
+    fn settlement_callback_waits_for_real_cleanup_completion() {
+        struct Probe(Arc<AtomicUsize>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (scope, cleanup) = scope();
+        let executor = executor();
+        let resource_drops = Arc::new(AtomicUsize::new(0));
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&reports);
+        scope.set_settlement_callback(Box::new(move |report| {
+            observed.lock().unwrap().push(report);
+        }));
+        let resource = scope.manage(Probe(Arc::clone(&resource_drops))).unwrap();
+        scope.end();
+        assert!(reports.lock().unwrap().is_empty());
+
+        drop(resource);
+        assert_eq!(resource_drops.load(Ordering::SeqCst), 0);
+        assert!(reports.lock().unwrap().is_empty());
+        cleanup.run_all(&executor);
+        executor.shutdown().wait().unwrap();
+
+        assert_eq!(resource_drops.load(Ordering::SeqCst), 1);
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].resources.len(), 1);
+        assert_eq!(reports[0].failures.len(), 0);
     }
 }

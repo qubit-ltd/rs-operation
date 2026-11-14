@@ -19,6 +19,16 @@ const AVAILABILITY_PENDING: u8 = 0;
 const AVAILABILITY_AVAILABLE: u8 = 1;
 const AVAILABILITY_TAKEN: u8 = 2;
 const AVAILABILITY_DISCARDED: u8 = 3;
+const DELIVERY_PENDING: u8 = 0;
+const DELIVERY_TAKEN: u8 = 1;
+const DELIVERY_DISCARDED: u8 = 2;
+
+/// A one-shot notification that an outcome was consumed or abandoned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutcomeDelivery {
+    Delivered,
+    Discarded,
+}
 
 /// Untyped lifecycle facts shared with read-only observers.
 ///
@@ -238,6 +248,8 @@ impl OperationCore {
 pub(crate) struct OutcomeSlot<T, E> {
     core: Arc<OperationCore>,
     cell: StateCell<T, E>,
+    delivery: AtomicU8,
+    delivery_hook: Mutex<Option<Box<dyn FnOnce(OutcomeDelivery) + Send + 'static>>>,
 }
 
 impl<T, E> OutcomeSlot<T, E> {
@@ -245,6 +257,43 @@ impl<T, E> OutcomeSlot<T, E> {
         Self {
             core,
             cell: StateCell::new(),
+            delivery: AtomicU8::new(DELIVERY_PENDING),
+            delivery_hook: Mutex::new(None),
+        }
+    }
+
+    /// Installs the internal, identity-capturing permit handoff callback.
+    pub(crate) fn set_delivery_hook(&self, hook: impl FnOnce(OutcomeDelivery) + Send + 'static) {
+        let (hook, delivery) = {
+            let mut slot = lock(&self.delivery_hook);
+            assert!(slot.is_none(), "outcome delivery hook is one-shot");
+            *slot = Some(Box::new(hook));
+            match self.delivery.load(Ordering::Acquire) {
+                DELIVERY_TAKEN => (slot.take(), Some(OutcomeDelivery::Delivered)),
+                DELIVERY_DISCARDED => (slot.take(), Some(OutcomeDelivery::Discarded)),
+                _ => (None, None),
+            }
+        };
+        if let (Some(hook), Some(delivery)) = (hook, delivery) {
+            hook(delivery);
+        }
+    }
+
+    fn notify_delivery(&self, delivery: OutcomeDelivery) {
+        let next = match delivery {
+            OutcomeDelivery::Delivered => DELIVERY_TAKEN,
+            OutcomeDelivery::Discarded => DELIVERY_DISCARDED,
+        };
+        if self
+            .delivery
+            .compare_exchange(DELIVERY_PENDING, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let hook = lock(&self.delivery_hook).take();
+        if let Some(hook) = hook {
+            hook(delivery);
         }
     }
 
@@ -277,6 +326,7 @@ impl<T, E> OutcomeSlot<T, E> {
         let result = self.cell.take_if_ready()?;
         if result.is_some() {
             self.core.mark_taken();
+            self.notify_delivery(OutcomeDelivery::Delivered);
         }
         Ok(result)
     }
@@ -287,18 +337,21 @@ impl<T, E> OutcomeSlot<T, E> {
         }
         let outcome = self.cell.take_result_blocking()?;
         self.core.mark_taken();
+        self.notify_delivery(OutcomeDelivery::Delivered);
         Ok(outcome)
     }
 
     async fn take_async(&self) -> Result<OperationOutcome<T, E>, OutcomeError> {
         let outcome = self.cell.result().await?;
         self.core.mark_taken();
+        self.notify_delivery(OutcomeDelivery::Delivered);
         Ok(outcome)
     }
 
     fn discard(&self) {
         if self.cell.discard_result() {
             self.core.mark_discarded();
+            self.notify_delivery(OutcomeDelivery::Discarded);
         }
     }
 
