@@ -8,10 +8,8 @@
 
 //! # Qubit Operation
 //!
-//! Foundation for managed operation lifecycles and composition.
-//!
-//! The crate exposes lifecycle contracts, portable drivers, resource registry
-//! primitives, and bounded admission for managed operations.
+//! Typed operation lifecycles with bounded admission, scoped resources, and
+//! separate outcome and settlement reporting.
 
 mod internal;
 
@@ -24,6 +22,26 @@ pub mod resource;
 pub mod scope;
 pub mod supervisor;
 pub mod v02;
+
+pub use v02::context::{CleanupContext, DeadlineSignal, OperationContext, StopSignal};
+pub use v02::manager::core::{AsyncOperationManager, OperationManager};
+pub use v02::manager::group::{AsyncOperationGroup, OperationGroup};
+pub use v02::manager::shutdown::{AsyncShutdownHandle, ShutdownHandle};
+pub use v02::operation::{
+    AsyncOperationHandle, AsyncOperationObserver, OperationHandle, OperationObserver,
+};
+pub use v02::protocol::{
+    BudgetError, BudgetPolicy, ClockDomainId, ClockDomainMismatch, ClockSource, Deadline,
+    MonotonicTime, OperationControl, TimerRegistration,
+};
+pub use v02::report::*;
+pub use v02::resource::{
+    AsyncCleanup, AsyncRecoveryAttempt, CleanupFuture, CleanupOutcome, ManageResourceError,
+    RecoveryAttempt, RecoveryStore, RecoveryStoreOptions, RecoveryStoreShutdownHandle,
+    ResourceCapacityError, ResourceCommitError, ResourceKey, ResourceRef, ResourceScope,
+    ServiceResourceScope,
+};
+pub use v02::scope::OperationScope;
 
 #[cfg(test)]
 mod tests;

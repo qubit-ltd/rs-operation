@@ -24,3 +24,4 @@ pub use resource_key::ResourceKey;
 pub use resource_ref::ResourceRef;
 pub use resource_reservation::ResourceReservation;
 pub use resource_scope::ResourceScope;
+pub use service::ServiceResourceScope;
