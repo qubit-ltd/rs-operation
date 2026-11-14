@@ -47,6 +47,13 @@ impl ResourceScope {
         self.state.set_settlement_callback(callback);
     }
 
+    pub(crate) fn set_recovery_callback(
+        &self,
+        callback: Arc<dyn Fn(crate::v02::report::RecoveryHandle, bool) + Send + Sync + 'static>,
+    ) {
+        self.state.set_recovery_callback(callback);
+    }
+
     pub(crate) fn record_transfer_receipt(&self, receipt: TransferReceipt) -> bool {
         self.state.record_transfer(receipt)
     }
@@ -64,6 +71,23 @@ impl ResourceScope {
             ManageResourceError::new(reason, value)
         })
     }
+
+    pub fn manage_with<T: Send + Sync + 'static>(
+        &self,
+        value: T,
+        policy: Arc<dyn super::cleanup::AsyncCleanup<T>>,
+    ) -> Result<ResourceRef<T>, ManageResourceError<T>> {
+        let reservation = match self.reserve() {
+            Ok(reservation) => reservation,
+            Err(error) => return Err(ManageResourceError::new(manage_kind(error), value)),
+        };
+        reservation.commit_with(value, policy).map_err(|error| {
+            let (reason, value, reservation) = error.into_parts();
+            drop(reservation);
+            ManageResourceError::new(reason, value)
+        })
+    }
+
     pub fn get_resource<T: Send + Sync + 'static>(
         &self,
         key: ResourceKey<T>,

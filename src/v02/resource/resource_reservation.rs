@@ -31,4 +31,13 @@ impl ResourceReservation {
         let scope = Arc::clone(&self.scope);
         scope.commit_reserved(value, self)
     }
+
+    pub fn commit_with<T: Send + Sync + 'static>(
+        self,
+        value: T,
+        policy: Arc<dyn super::cleanup::AsyncCleanup<T>>,
+    ) -> Result<ResourceRef<T>, ResourceCommitError<T>> {
+        let scope = Arc::clone(&self.scope);
+        scope.commit_reserved_with(value, self, Some(policy))
+    }
 }

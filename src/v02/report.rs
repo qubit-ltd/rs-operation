@@ -603,20 +603,7 @@ pub struct ResourceScopeReport {
     pub transfers_truncated: bool,
 }
 
-/// A read/retry capability; ownership of recovery payload remains in its registry.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RecoveryHandle {
-    id: RecoveryId,
-}
-impl RecoveryHandle {
-    #[allow(dead_code)]
-    pub(crate) const fn new(id: RecoveryId) -> Self {
-        Self { id }
-    }
-    pub const fn id(&self) -> RecoveryId {
-        self.id
-    }
-}
+pub use crate::v02::resource::recovery::RecoveryHandle;
 
 /// Receipt fields remain private; only a receiving protocol may mint one.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -983,6 +970,20 @@ impl fmt::Display for RetryError {
     }
 }
 impl Error for RetryError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryTransferError {
+    Closed,
+    CapacityExceeded,
+    AlreadyTransferred,
+    InvalidGroup,
+}
+impl fmt::Display for RecoveryTransferError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl Error for RecoveryTransferError {}
 
 #[cfg(test)]
 mod tests {

@@ -18,16 +18,15 @@ use crate::v02::report::{
     CleanupEvidence, CleanupFailure, ManagerId, ResourceId, ResourceScopeId, TransferReceipt,
 };
 
-pub(crate) type CleanupFuture<T> =
-    Pin<Box<dyn Future<Output = CleanupOutcome<T>> + Send + 'static>>;
+pub type CleanupFuture<T> = Pin<Box<dyn Future<Output = CleanupOutcome<T>> + Send + 'static>>;
 
 /// Explicit asynchronous cleanup policy. A failed result returns ownership of
 /// the resource, while the retained `Arc<Self>` remains available for retry.
-pub(crate) trait AsyncCleanup<T: Send + Sync + 'static>: Send + Sync + 'static {
+pub trait AsyncCleanup<T: Send + Sync + 'static>: Send + Sync + 'static {
     fn cleanup(self: Arc<Self>, resource: T, context: CleanupContext) -> CleanupFuture<T>;
 }
 
-pub(crate) enum CleanupOutcome<T> {
+pub enum CleanupOutcome<T> {
     Released,
     Transferred(TransferReceipt),
     Failed {
@@ -56,6 +55,18 @@ pub(crate) struct UnconfirmedCleanup {
 }
 
 impl UnconfirmedCleanup {
+    pub(crate) fn from_panic(
+        registration: Option<ResourceRegistration>,
+        panic: Box<dyn std::any::Any + Send + 'static>,
+    ) -> Self {
+        Self {
+            registration,
+            panic,
+            capsule: None,
+            policy: None,
+        }
+    }
+
     pub(crate) fn panic_payload(&self) -> &(dyn std::any::Any + Send + 'static) {
         self.panic.as_ref()
     }
@@ -148,6 +159,7 @@ pub(crate) struct AsyncCleanupJob<T: Send + Sync + 'static> {
     context: Option<CleanupContext>,
     registration: Option<ResourceRegistration>,
     completion: Arc<Mutex<Option<AsyncCleanupCompletion<T>>>>,
+    callback: Option<Box<dyn FnOnce(AsyncCleanupCompletion<T>) + Send + 'static>>,
 }
 
 impl<T: Send + Sync + 'static> AsyncCleanupJob<T> {
@@ -163,11 +175,20 @@ impl<T: Send + Sync + 'static> AsyncCleanupJob<T> {
             context: Some(context),
             registration: None,
             completion,
+            callback: None,
         }
     }
 
     pub(crate) fn with_registration(mut self, registration: ResourceRegistration) -> Self {
         self.registration = Some(registration);
+        self
+    }
+
+    pub(crate) fn with_callback(
+        mut self,
+        callback: impl FnOnce(AsyncCleanupCompletion<T>) + Send + 'static,
+    ) -> Self {
+        self.callback = Some(Box::new(callback));
         self
     }
 }
@@ -188,6 +209,7 @@ impl<T: Send + Sync + 'static> CleanupJob for AsyncCleanupJob<T> {
             future: None,
             registration: self.registration.take(),
             completion: Arc::clone(&self.completion),
+            callback: self.callback.take(),
             finished: false,
         });
         Ok(())
@@ -202,6 +224,7 @@ struct AsyncCleanupTask<T: Send + Sync + 'static> {
     registration: Option<ResourceRegistration>,
     completion: Arc<Mutex<Option<AsyncCleanupCompletion<T>>>>,
     finished: bool,
+    callback: Option<Box<dyn FnOnce(AsyncCleanupCompletion<T>) + Send + 'static>>,
 }
 
 impl<T: Send + Sync + 'static> Unpin for AsyncCleanupTask<T> {}
@@ -233,13 +256,18 @@ impl<T: Send + Sync + 'static> Future for AsyncCleanupTask<T> {
                 let evidence = matches!(&outcome, CleanupOutcome::Released)
                     .then_some(CleanupEvidence::Confirmed);
                 let policy = this.policy.take().expect("policy is present");
-                *lock(&this.completion) = Some(AsyncCleanupCompletion {
+                let completion = AsyncCleanupCompletion {
                     outcome: Some(outcome),
                     evidence,
                     policy,
                     registration: this.registration.take(),
                     unconfirmed: None,
-                });
+                };
+                if let Some(callback) = this.callback.take() {
+                    callback(completion);
+                } else {
+                    *lock(&this.completion) = Some(completion);
+                }
                 this.future.take();
                 this.finished = true;
                 Poll::Ready(())
@@ -252,7 +280,7 @@ impl<T: Send + Sync + 'static> Future for AsyncCleanupTask<T> {
                 let policy = this.policy.take().expect("policy is present");
                 let policy_capsule: Box<dyn std::any::Any + Send + Sync> =
                     Box::new(Arc::clone(&policy));
-                *lock(&this.completion) = Some(AsyncCleanupCompletion {
+                let completion = AsyncCleanupCompletion {
                     outcome: None,
                     evidence: None,
                     policy,
@@ -263,7 +291,12 @@ impl<T: Send + Sync + 'static> Future for AsyncCleanupTask<T> {
                         capsule,
                         policy: Some(policy_capsule),
                     }),
-                });
+                };
+                if let Some(callback) = this.callback.take() {
+                    callback(completion);
+                } else {
+                    *lock(&this.completion) = Some(completion);
+                }
                 this.finished = true;
                 Poll::Ready(())
             }

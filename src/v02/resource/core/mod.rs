@@ -28,6 +28,7 @@ pub(super) struct Slot<T> {
     cleanup_permit: Option<Box<dyn CleanupDispatchPermit>>,
     resource_id: ResourceId,
     completion: Arc<ScopeCompletion>,
+    policy: Option<Arc<dyn super::cleanup::AsyncCleanup<T>>>,
 }
 
 pub(super) struct Owner<T> {
@@ -41,6 +42,7 @@ impl<T: Send + Sync + 'static> Owner<T> {
         cleanup_permit: Box<dyn CleanupDispatchPermit>,
         resource_id: ResourceId,
         completion: Arc<ScopeCompletion>,
+        policy: Option<Arc<dyn super::cleanup::AsyncCleanup<T>>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(Slot {
@@ -52,6 +54,7 @@ impl<T: Send + Sync + 'static> Owner<T> {
                 cleanup_permit: Some(cleanup_permit),
                 resource_id,
                 completion,
+                policy,
             }),
         })
     }
@@ -110,6 +113,7 @@ impl<T: Send + Sync + 'static> Owner<T> {
         Box<dyn CleanupDispatchPermit>,
         ResourceId,
         Arc<ScopeCompletion>,
+        Option<Arc<dyn super::cleanup::AsyncCleanup<T>>>,
     )> {
         if state.open || state.users != 0 {
             return None;
@@ -128,6 +132,7 @@ impl<T: Send + Sync + 'static> Owner<T> {
                 .expect("owner holds cleanup dispatch permit"),
             state.resource_id,
             Arc::clone(&state.completion),
+            state.policy.take(),
         ))
     }
     fn dispatch(
@@ -137,16 +142,31 @@ impl<T: Send + Sync + 'static> Owner<T> {
             Box<dyn CleanupDispatchPermit>,
             ResourceId,
             Arc<ScopeCompletion>,
+            Option<Arc<dyn super::cleanup::AsyncCleanup<T>>>,
         )>,
     ) {
-        if let Some((value, registration, permit, resource_id, completion)) = ready {
+        if let Some((value, registration, permit, resource_id, completion, policy)) = ready {
             completion.start();
-            permit.enqueue(Box::new(DefaultDropJob {
-                value: Some(value),
-                registration: Some(registration),
-                resource_id,
-                completion,
-            }));
+            if let Some(policy) = policy {
+                let context = crate::v02::context::CleanupContext::new(Default::default())
+                    .expect("empty cleanup context is valid");
+                let result = Arc::new(Mutex::new(None));
+                let completion_for_job = Arc::clone(&completion);
+                permit.enqueue(Box::new(
+                    super::cleanup::AsyncCleanupJob::new(value, policy, context, result)
+                        .with_registration(registration)
+                        .with_callback(move |result| {
+                            finish_async_cleanup(resource_id, completion_for_job, result);
+                        }),
+                ));
+            } else {
+                permit.enqueue(Box::new(DefaultDropJob {
+                    value: Some(value),
+                    registration: Some(registration),
+                    resource_id,
+                    completion,
+                }));
+            }
         }
     }
 }
@@ -164,6 +184,8 @@ struct ScopeCompletionState {
     resources: Vec<ResourceCleanupReport>,
     failures: Vec<CleanupFailure>,
     recoveries: Vec<crate::v02::report::RecoveryHandle>,
+    recovery_callback:
+        Option<Arc<dyn Fn(crate::v02::report::RecoveryHandle, bool) + Send + Sync + 'static>>,
     transfers: Vec<TransferReceipt>,
     transfers_total: usize,
     transfers_truncated: bool,
@@ -181,12 +203,48 @@ impl ScopeCompletion {
                 resources: Vec::new(),
                 failures: Vec::new(),
                 recoveries: Vec::new(),
+                recovery_callback: None,
                 transfers: Vec::new(),
                 transfers_total: 0,
                 transfers_truncated: false,
                 callback: None,
             }),
         })
+    }
+
+    fn set_recovery_callback(
+        &self,
+        callback: Arc<dyn Fn(crate::v02::report::RecoveryHandle, bool) + Send + Sync + 'static>,
+    ) {
+        let existing = {
+            let mut state = lock(&self.state);
+            state.recovery_callback = Some(Arc::clone(&callback));
+            state.recoveries.clone()
+        };
+        for handle in existing {
+            let terminal = Arc::clone(&callback);
+            let terminal_handle = handle.clone();
+            handle.core.set_terminal_callback(Arc::new(move |present| {
+                terminal(terminal_handle.clone(), present);
+            }));
+            callback(handle, true);
+        }
+    }
+
+    pub(super) fn register_recovery(&self, handle: crate::v02::report::RecoveryHandle) {
+        let callback = {
+            let mut state = lock(&self.state);
+            state.recoveries.push(handle.clone());
+            state.recovery_callback.clone()
+        };
+        if let Some(callback) = callback {
+            let terminal = Arc::clone(&callback);
+            let terminal_handle = handle.clone();
+            handle.core.set_terminal_callback(Arc::new(move |present| {
+                terminal(terminal_handle.clone(), present);
+            }));
+            callback(handle, true);
+        }
     }
 
     pub(super) fn set_callback(
@@ -255,8 +313,9 @@ impl ScopeCompletion {
         resource_id: ResourceId,
         evidence: Option<CleanupEvidence>,
         failure: Option<CleanupFailure>,
+        recovery: Option<crate::v02::report::RecoveryHandle>,
     ) {
-        let (callback, report) = {
+        let (callback, report, recovery_callback) = {
             let mut state = lock(&self.state);
             if !state.seen.insert(resource_id) {
                 return;
@@ -271,12 +330,31 @@ impl ScopeCompletion {
             if let Some(failure) = failure {
                 state.failures.push(failure);
             }
+            let recovery_callback = recovery.as_ref().and_then(|handle| {
+                state.recoveries.push(handle.clone());
+                state
+                    .recovery_callback
+                    .clone()
+                    .map(|callback| (callback, handle.clone()))
+            });
             if Self::ready(&state) {
-                (state.callback.take(), Some(Self::report(&state)))
+                (
+                    state.callback.take(),
+                    Some(Self::report(&state)),
+                    recovery_callback,
+                )
             } else {
-                (None, None)
+                (None, None, recovery_callback)
             }
         };
+        if let Some((callback, handle)) = recovery_callback {
+            let terminal = Arc::clone(&callback);
+            let terminal_handle = handle.clone();
+            handle.core.set_terminal_callback(Arc::new(move |present| {
+                terminal(terminal_handle.clone(), present)
+            }));
+            callback(handle, true);
+        }
         if let (Some(callback), Some(report)) = (callback, report) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| callback(report)));
         }
@@ -346,6 +424,60 @@ impl<T: Send + 'static> CleanupJob for DefaultDropJob<T> {
     }
 }
 
+fn finish_async_cleanup<T: Send + Sync + 'static>(
+    resource_id: ResourceId,
+    completion: Arc<ScopeCompletion>,
+    mut result: super::cleanup::AsyncCleanupCompletion<T>,
+) {
+    use super::cleanup::CleanupOutcome;
+    let outcome = result.outcome.take();
+    match outcome {
+        Some(CleanupOutcome::Released) => {
+            drop(result.registration.take());
+            completion.complete(resource_id, Some(CleanupEvidence::Confirmed), None, None);
+        }
+        Some(CleanupOutcome::Transferred(receipt)) => {
+            drop(result.registration.take());
+            let _ = completion.record_transfer(receipt);
+            completion.complete(resource_id, None, None, None);
+        }
+        Some(CleanupOutcome::Failed { failure, resource }) => {
+            let registration = result
+                .registration
+                .take()
+                .expect("failed cleanup retains registration");
+            let (payload, action) =
+                super::recovery::async_owner(resource_id, resource, result.policy, registration);
+            let core = Arc::new(super::recovery::RecoveryCore::new(
+                vec![resource_id],
+                payload,
+                action,
+            ));
+            completion.complete(
+                resource_id,
+                None,
+                Some(failure),
+                Some(crate::v02::report::RecoveryHandle::new(core)),
+            );
+        }
+        None => {
+            if let Some(unconfirmed) = result.unconfirmed.take() {
+                let payload = Arc::new(Mutex::new(Some(unconfirmed))) as Arc<dyn Any + Send + Sync>;
+                let core = Arc::new(super::recovery::RecoveryCore::new_unconfirmed(
+                    vec![resource_id],
+                    payload,
+                ));
+                completion.complete(
+                    resource_id,
+                    None,
+                    None,
+                    Some(crate::v02::report::RecoveryHandle::new(core)),
+                );
+            }
+        }
+    }
+}
+
 struct ScheduledDrop<T> {
     value: Option<T>,
     registration: Option<ResourceRegistration>,
@@ -356,7 +488,6 @@ struct ScheduledDrop<T> {
 impl<T> Drop for ScheduledDrop<T> {
     fn drop(&mut self) {
         let result = panic::catch_unwind(AssertUnwindSafe(|| drop(self.value.take())));
-        drop(self.registration.take());
         let failure = result.as_ref().err().map(|payload| CleanupFailure {
             resource_id: self.resource_id,
             stage: CleanupStage::Drop,
@@ -364,8 +495,19 @@ impl<T> Drop for ScheduledDrop<T> {
             source: None,
         });
         let evidence = result.is_ok().then_some(CleanupEvidence::DropCompleted);
+        let recovery = result.err().map(|panic| {
+            let unconfirmed =
+                super::cleanup::UnconfirmedCleanup::from_panic(self.registration.take(), panic);
+            let payload = Arc::new(Mutex::new(Some(unconfirmed))) as Arc<dyn Any + Send + Sync>;
+            let core =
+                super::recovery::RecoveryCore::new_unconfirmed(vec![self.resource_id], payload);
+            crate::v02::report::RecoveryHandle::new(Arc::new(core))
+        });
+        if evidence.is_some() {
+            drop(self.registration.take());
+        }
         self.completion
-            .complete(self.resource_id, evidence, failure);
+            .complete(self.resource_id, evidence, failure, recovery);
     }
 }
 
@@ -442,7 +584,16 @@ impl ScopeCore {
     pub(super) fn commit_reserved<T: Send + Sync + 'static>(
         self: &Arc<Self>,
         value: T,
+        reservation: ResourceReservation,
+    ) -> Result<ResourceRef<T>, ResourceCommitError<T>> {
+        self.commit_reserved_with(value, reservation, None)
+    }
+
+    pub(super) fn commit_reserved_with<T: Send + Sync + 'static>(
+        self: &Arc<Self>,
+        value: T,
         mut reservation: ResourceReservation,
+        policy: Option<Arc<dyn super::cleanup::AsyncCleanup<T>>>,
     ) -> Result<ResourceRef<T>, ResourceCommitError<T>> {
         if !Arc::ptr_eq(self, &reservation.scope) {
             return Err(ResourceCommitError::new(
@@ -485,6 +636,7 @@ impl ScopeCore {
             cleanup_permit,
             resource_id,
             Arc::clone(&self.completion),
+            policy,
         );
         let value = owner.value_arc().expect("new owner contains value");
         let owner_ref = owner.acquire(generation).expect("new owner is open");
@@ -543,6 +695,13 @@ impl ScopeState {
         self.completion.set_callback(callback);
     }
 
+    pub(super) fn set_recovery_callback(
+        &self,
+        callback: Arc<dyn Fn(crate::v02::report::RecoveryHandle, bool) + Send + Sync + 'static>,
+    ) {
+        self.completion.set_recovery_callback(callback);
+    }
+
     pub(super) fn record_transfer(&self, receipt: TransferReceipt) -> bool {
         self.completion.record_transfer(receipt)
     }
@@ -575,7 +734,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::Owner;
+    use super::{Owner, ScopeCompletion};
     use crate::v02::executor::CleanupExecutor;
     use crate::v02::manager::capacity::ResourceRegistration;
     use crate::v02::manager::capacity::{ManagerCapacityPools, ScopeCapacity};
@@ -715,6 +874,7 @@ mod tests {
                 generation,
             ),
             super::ScopeCompletion::new(),
+            None,
         )
     }
 
@@ -794,6 +954,43 @@ mod tests {
         assert!(owner.acquire(1).is_err());
         owner.end();
         finish(&dispatch, &executor);
+    }
+
+    #[test]
+    fn default_drop_panic_retains_unconfirmed_owner_and_report_handle() {
+        struct Panics;
+        impl Drop for Panics {
+            fn drop(&mut self) {
+                panic!("release uncertain");
+            }
+        }
+        let dispatch = ManualDispatch::new();
+        let executor = executor();
+        let completion = ScopeCompletion::new();
+        let report = Arc::new(Mutex::new(None));
+        let report_slot = Arc::clone(&report);
+        completion.set_callback(Box::new(move |value| {
+            *report_slot.lock().unwrap() = Some(value)
+        }));
+        let owner = Owner::new(
+            Panics,
+            9,
+            registration(),
+            dispatch.reserve_permit(),
+            ResourceId::new(crate::v02::report::ManagerId::new_unique(), 9, 9),
+            Arc::clone(&completion),
+            None,
+        );
+        owner.end();
+        completion.seal(1);
+        finish(&dispatch, &executor);
+        let report = report.lock().unwrap().take().unwrap();
+        assert_eq!(report.recoveries.len(), 1);
+        assert_eq!(
+            report.recoveries[0].snapshot().phase,
+            crate::v02::report::RecoveryPhase::Unconfirmed
+        );
+        assert_eq!(report.failures.len(), 1);
     }
 
     #[test]

@@ -4,7 +4,7 @@ pub(crate) mod cleanup;
 pub(crate) mod cleanup_port;
 mod core;
 pub(crate) mod dependency;
-pub(crate) mod recovery;
+pub mod recovery;
 mod resource_error;
 mod resource_key;
 mod resource_ref;
@@ -13,6 +13,8 @@ mod resource_scope;
 pub mod service;
 pub(crate) mod transfer;
 
+pub use cleanup::{AsyncCleanup, CleanupFuture, CleanupOutcome};
+pub use recovery::{RecoveryHandle, RecoveryStore, RecoveryStoreOptions};
 pub use resource_error::{ManageResourceError, ResourceCapacityError, ResourceCommitError};
 pub use resource_key::ResourceKey;
 pub use resource_ref::ResourceRef;
