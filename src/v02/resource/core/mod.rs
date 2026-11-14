@@ -6,18 +6,16 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use super::ResourceRef;
-use super::resource_error::{ResourceCapacityError, ResourceCommitError};
+use super::resource_error::{ResourceCommitError, ResourceCommitWithError};
 use super::resource_reservation::ResourceReservation;
 use crate::v02::executor::CleanupExecutor;
 use crate::v02::manager::capacity::{ResourceRegistration, ScopeCapacity};
 use crate::v02::report::{
     CleanupEvidence, CleanupFailure, CleanupStage, DiagnosticSummary, ManagerId,
-    ResourceCleanupReport, ResourceId, ResourceManageErrorKind, ResourceScopeId,
-    ResourceScopeReport, TransferReceipt,
+    ResourceCapacityError, ResourceCleanupReport, ResourceId, ResourceManageErrorKind,
+    ResourceProgress, ResourceScopeId, ResourceScopeReport, TransferReceipt,
 };
-use crate::v02::resource::cleanup_port::{
-    CleanupDispatch, CleanupDispatchPermit, CleanupJob, CleanupQueueError,
-};
+use crate::v02::resource::cleanup_port::{CleanupDispatch, CleanupDispatchPermit, CleanupJob};
 
 pub(super) struct Slot<T> {
     key_generation: u64,
@@ -105,6 +103,9 @@ impl<T: Send + Sync + 'static> Owner<T> {
         };
         Self::dispatch(ready);
     }
+    fn has_users(&self) -> bool {
+        lock(&self.state).users != 0
+    }
     fn take_if_ready(
         state: &mut Slot<T>,
     ) -> Option<(
@@ -178,6 +179,7 @@ pub(super) struct ScopeCompletion {
 
 struct ScopeCompletionState {
     expected: Option<usize>,
+    reservations_released_before_seal: usize,
     started: usize,
     completed: usize,
     seen: HashSet<ResourceId>,
@@ -190,6 +192,8 @@ struct ScopeCompletionState {
     transfers_total: usize,
     transfers_truncated: bool,
     callback: Option<Box<dyn FnOnce(ResourceScopeReport) + Send + 'static>>,
+    progress: ResourceProgress,
+    progress_callback: Option<Arc<dyn Fn(ResourceProgress) + Send + Sync + 'static>>,
 }
 
 impl ScopeCompletion {
@@ -197,6 +201,7 @@ impl ScopeCompletion {
         Arc::new(Self {
             state: Mutex::new(ScopeCompletionState {
                 expected: None,
+                reservations_released_before_seal: 0,
                 started: 0,
                 completed: 0,
                 seen: HashSet::new(),
@@ -208,8 +213,38 @@ impl ScopeCompletion {
                 transfers_total: 0,
                 transfers_truncated: false,
                 callback: None,
+                progress: ResourceProgress::ScopeOpen,
+                progress_callback: None,
             }),
         })
+    }
+
+    pub(super) fn set_progress_callback(
+        &self,
+        callback: Arc<dyn Fn(ResourceProgress) + Send + Sync + 'static>,
+    ) {
+        let progress = {
+            let mut state = lock(&self.state);
+            state.progress_callback = Some(Arc::clone(&callback));
+            state.progress
+        };
+        callback(progress);
+    }
+
+    fn advance_progress(&self, progress: ResourceProgress) {
+        let callback = {
+            let mut state = lock(&self.state);
+            if progress_rank(progress) > progress_rank(state.progress) {
+                state.progress = progress;
+            }
+            state
+                .progress_callback
+                .as_ref()
+                .map(|callback| (Arc::clone(callback), state.progress))
+        };
+        if let Some((callback, progress)) = callback {
+            callback(progress);
+        }
     }
 
     fn set_recovery_callback(
@@ -284,8 +319,15 @@ impl ScopeCompletion {
     }
 
     fn start(&self) {
-        let mut state = lock(&self.state);
-        state.started = state.started.saturating_add(1);
+        {
+            let mut state = lock(&self.state);
+            state.started = state.started.saturating_add(1);
+        }
+        self.advance_progress(ResourceProgress::Cleaning);
+    }
+
+    fn waiting_for_users(&self) {
+        self.advance_progress(ResourceProgress::WaitingForUsers);
     }
 
     fn cleaning(&self) -> usize {
@@ -296,7 +338,28 @@ impl ScopeCompletion {
     fn seal(&self, expected: usize) {
         let (callback, report) = {
             let mut state = lock(&self.state);
-            state.expected = Some(expected);
+            state.expected = Some(expected.saturating_sub(state.reservations_released_before_seal));
+            state.reservations_released_before_seal = 0;
+            if Self::ready(&state) {
+                (state.callback.take(), Some(Self::report(&state)))
+            } else {
+                (None, None)
+            }
+        };
+        if let (Some(callback), Some(report)) = (callback, report) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| callback(report)));
+        }
+    }
+
+    fn release_pending_reservation(&self) {
+        let (callback, report) = {
+            let mut state = lock(&self.state);
+            if let Some(expected) = state.expected.as_mut() {
+                *expected = expected.saturating_sub(1);
+            } else {
+                state.reservations_released_before_seal =
+                    state.reservations_released_before_seal.saturating_add(1);
+            }
             if Self::ready(&state) {
                 (state.callback.take(), Some(Self::report(&state)))
             } else {
@@ -354,6 +417,9 @@ impl ScopeCompletion {
                 terminal(terminal_handle.clone(), present)
             }));
             callback(handle, true);
+        }
+        if recovery.is_some() {
+            self.advance_progress(ResourceProgress::Unconfirmed);
         }
         if let (Some(callback), Some(report)) = (callback, report) {
             let _ = panic::catch_unwind(AssertUnwindSafe(|| callback(report)));
@@ -526,11 +592,15 @@ pub(super) struct Entry {
 }
 pub(super) trait ErasedOwner: Any + Send + Sync {
     fn end(&self);
+    fn has_users(&self) -> bool;
     fn as_any(&self) -> &dyn Any;
 }
 impl<T: Send + Sync + 'static> ErasedOwner for Arc<Owner<T>> {
     fn end(&self) {
         Owner::end(self);
+    }
+    fn has_users(&self) -> bool {
+        Owner::has_users(self)
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -540,6 +610,8 @@ pub(super) struct State {
     pub(super) open: bool,
     pub(super) next_slot: u64,
     pub(super) generation: u64,
+    pub(super) reservations: usize,
+    pub(super) retained: usize,
     pub(super) slots: HashMap<u64, Entry>,
 }
 
@@ -562,18 +634,19 @@ impl ScopeCore {
         let registration = self
             .capacity
             .resource_registration()
-            .map_err(|_| ResourceCapacityError::Exhausted)?;
-        let cleanup_permit = self.cleanup.reserve().map_err(|error| match error {
-            CleanupQueueError::Full => ResourceCapacityError::CleanupQueueFull,
-            CleanupQueueError::Closed => ResourceCapacityError::CleanupQueueClosed,
-        })?;
-        let state = lock(&self.state);
+            .map_err(|_| ResourceCapacityError::CapacityExceeded)?;
+        let cleanup_permit = self
+            .cleanup
+            .reserve()
+            .map_err(|_| ResourceCapacityError::CapacityExceeded)?;
+        let mut state = lock(&self.state);
         if !state.open {
             drop(state);
             drop(cleanup_permit);
             drop(registration);
             return Err(ResourceCapacityError::ScopeEnded);
         }
+        state.reservations = state.reservations.saturating_add(1);
         drop(state);
         Ok(ResourceReservation::new(
             Arc::clone(self),
@@ -581,53 +654,29 @@ impl ScopeCore {
             cleanup_permit,
         ))
     }
+
+    pub(super) fn release_reservation(self: &Arc<Self>) {
+        let ended = {
+            let mut state = lock(&self.state);
+            debug_assert!(state.reservations > 0);
+            state.reservations = state.reservations.saturating_sub(1);
+            !state.open
+        };
+        if ended {
+            self.completion.release_pending_reservation();
+        }
+    }
     pub(super) fn commit_reserved<T: Send + Sync + 'static>(
         self: &Arc<Self>,
         value: T,
-        reservation: ResourceReservation,
-    ) -> Result<ResourceRef<T>, ResourceCommitError<T>> {
-        self.commit_reserved_with(value, reservation, None)
-    }
-
-    pub(super) fn commit_reserved_with<T: Send + Sync + 'static>(
-        self: &Arc<Self>,
-        value: T,
         mut reservation: ResourceReservation,
-        policy: Option<Arc<dyn super::cleanup::AsyncCleanup<T>>>,
     ) -> Result<ResourceRef<T>, ResourceCommitError<T>> {
-        if !Arc::ptr_eq(self, &reservation.scope) {
-            return Err(ResourceCommitError::new(
-                ResourceManageErrorKind::ScopeEnded,
-                value,
-                reservation,
-            ));
-        }
         let mut state = lock(&self.state);
-        if !state.open {
-            return Err(ResourceCommitError::new(
-                ResourceManageErrorKind::ScopeEnded,
-                value,
-                reservation,
-            ));
-        }
-        let slot = state.next_slot;
-        let Some(next_slot) = slot.checked_add(1) else {
-            return Err(ResourceCommitError::new(
-                ResourceManageErrorKind::CapacityExceeded,
-                value,
-                reservation,
-            ));
-        };
-        state.next_slot = next_slot;
-        let generation = state.generation;
-        let registration = reservation
-            .registration
-            .take()
-            .expect("reservation has resource permit");
-        let cleanup_permit = reservation
-            .cleanup_permit
-            .take()
-            .expect("reservation has cleanup slot");
+        let (slot, generation, registration, cleanup_permit) =
+            match self.take_commit_parts(&mut state, &mut reservation) {
+                Ok(parts) => parts,
+                Err(reason) => return Err(ResourceCommitError::new(reason, value, reservation)),
+            };
         let resource_id = ResourceId::new(self.manager, slot, generation);
         let owner = Owner::new(
             value,
@@ -636,7 +685,7 @@ impl ScopeCore {
             cleanup_permit,
             resource_id,
             Arc::clone(&self.completion),
-            policy,
+            None,
         );
         let value = owner.value_arc().expect("new owner contains value");
         let owner_ref = owner.acquire(generation).expect("new owner is open");
@@ -654,6 +703,156 @@ impl ScopeCore {
             scope: self.id,
             slot,
         })
+    }
+
+    pub(super) fn commit_reserved_with<T, C>(
+        self: &Arc<Self>,
+        value: T,
+        cleanup: C,
+        mut reservation: ResourceReservation,
+    ) -> Result<ResourceRef<T>, ResourceCommitWithError<T, C>>
+    where
+        T: Send + Sync + 'static,
+        C: super::cleanup::AsyncCleanup<T>,
+    {
+        let mut state = lock(&self.state);
+        let (slot, generation, registration, cleanup_permit) =
+            match self.take_commit_parts(&mut state, &mut reservation) {
+                Ok(parts) => parts,
+                Err(reason) => {
+                    return Err(ResourceCommitWithError::new(
+                        reason,
+                        value,
+                        cleanup,
+                        reservation,
+                    ));
+                }
+            };
+        let resource_id = ResourceId::new(self.manager, slot, generation);
+        let policy: Arc<dyn super::cleanup::AsyncCleanup<T>> = Arc::new(cleanup);
+        let owner = Owner::new(
+            value,
+            generation,
+            registration,
+            cleanup_permit,
+            resource_id,
+            Arc::clone(&self.completion),
+            Some(policy),
+        );
+        let value = owner.value_arc().expect("new owner contains value");
+        let owner_ref = owner.acquire(generation).expect("new owner is open");
+        state.slots.insert(
+            slot,
+            Entry {
+                owner: Box::new(owner),
+            },
+        );
+        Ok(ResourceRef {
+            owner: owner_ref,
+            value: Some(value),
+            generation,
+            manager: self.manager,
+            scope: self.id,
+            slot,
+        })
+    }
+
+    fn take_commit_parts(
+        self: &Arc<Self>,
+        state: &mut State,
+        reservation: &mut ResourceReservation,
+    ) -> Result<
+        (
+            u64,
+            u64,
+            ResourceRegistration,
+            Box<dyn CleanupDispatchPermit>,
+        ),
+        ResourceManageErrorKind,
+    > {
+        if !Arc::ptr_eq(self, &reservation.scope) {
+            return Err(ResourceManageErrorKind::ScopeEnded);
+        }
+        if !state.open || !reservation.tracked {
+            return Err(ResourceManageErrorKind::ScopeEnded);
+        }
+        let slot = state.next_slot;
+        let next_slot = slot
+            .checked_add(1)
+            .ok_or(ResourceManageErrorKind::CapacityExceeded)?;
+        let registration = reservation
+            .registration
+            .take()
+            .expect("reservation has resource permit");
+        let cleanup_permit = reservation
+            .cleanup_permit
+            .take()
+            .expect("reservation has cleanup slot");
+        state.next_slot = next_slot;
+        state.reservations = state.reservations.saturating_sub(1);
+        reservation.tracked = false;
+        Ok((slot, state.generation, registration, cleanup_permit))
+    }
+
+    pub(super) fn retain_reserved<T: Send + Sync + 'static>(
+        self: &Arc<Self>,
+        value: T,
+        reservation: ResourceReservation,
+    ) -> ResourceId {
+        self.retain_reserved_inner(value, None, reservation)
+    }
+
+    pub(super) fn retain_reserved_with<T, C>(
+        self: &Arc<Self>,
+        value: T,
+        cleanup: C,
+        reservation: ResourceReservation,
+    ) -> ResourceId
+    where
+        T: Send + Sync + 'static,
+        C: super::cleanup::AsyncCleanup<T>,
+    {
+        self.retain_reserved_inner(value, Some(Arc::new(cleanup)), reservation)
+    }
+
+    fn retain_reserved_inner<T: Send + Sync + 'static>(
+        self: &Arc<Self>,
+        value: T,
+        policy: Option<Arc<dyn super::cleanup::AsyncCleanup<T>>>,
+        mut reservation: ResourceReservation,
+    ) -> ResourceId {
+        assert!(Arc::ptr_eq(self, &reservation.scope));
+        let (resource_id, registration, cleanup_permit) = {
+            let mut state = lock(&self.state);
+            assert!(reservation.tracked, "reservation is consumed once");
+            let slot = state.next_slot;
+            state.next_slot = slot.checked_add(1).expect("resource slot space exhausted");
+            state.reservations = state.reservations.saturating_sub(1);
+            state.retained = state.retained.saturating_add(1);
+            reservation.tracked = false;
+            (
+                ResourceId::new(self.manager, slot, state.generation),
+                reservation
+                    .registration
+                    .take()
+                    .expect("reservation has resource permit"),
+                reservation
+                    .cleanup_permit
+                    .take()
+                    .expect("reservation has cleanup slot"),
+            )
+        };
+        let owner = Owner::new(
+            value,
+            resource_id.generation(),
+            registration,
+            cleanup_permit,
+            resource_id,
+            Arc::clone(&self.completion),
+            policy,
+        );
+        owner.end();
+        resource_id
     }
 }
 
@@ -681,6 +880,8 @@ impl ScopeState {
                     open: true,
                     next_slot: 1,
                     generation: 1,
+                    reservations: 0,
+                    retained: 0,
                     slots: HashMap::new(),
                 }),
             }),
@@ -693,6 +894,13 @@ impl ScopeState {
         callback: Box<dyn FnOnce(ResourceScopeReport) + Send + 'static>,
     ) {
         self.completion.set_callback(callback);
+    }
+
+    pub(super) fn set_progress_callback(
+        &self,
+        callback: Arc<dyn Fn(ResourceProgress) + Send + Sync + 'static>,
+    ) {
+        self.completion.set_progress_callback(callback);
     }
 
     pub(super) fn set_recovery_callback(
@@ -711,16 +919,30 @@ impl ScopeState {
     }
 
     pub(super) fn end(&self) {
-        let slots = {
+        let (slots, expected, reservations) = {
             let mut state = lock(&self.core.state);
             if !state.open {
                 return;
             }
             state.open = false;
             state.generation = state.generation.wrapping_add(1);
-            std::mem::take(&mut state.slots)
+            let expected = state
+                .slots
+                .len()
+                .saturating_add(state.reservations)
+                .saturating_add(state.retained);
+            (
+                std::mem::take(&mut state.slots),
+                expected,
+                state.reservations,
+            )
         };
-        self.completion.seal(slots.len());
+        let waiting_for_users =
+            reservations > 0 || slots.values().any(|entry| entry.owner.has_users());
+        if waiting_for_users {
+            self.completion.waiting_for_users();
+        }
+        self.completion.seal(expected);
         for entry in slots.into_values() {
             entry.owner.end();
         }
@@ -732,6 +954,15 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+fn progress_rank(progress: ResourceProgress) -> u8 {
+    match progress {
+        ResourceProgress::ScopeOpen => 0,
+        ResourceProgress::WaitingForUsers => 1,
+        ResourceProgress::Cleaning => 2,
+        ResourceProgress::Unconfirmed => 3,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Owner, ScopeCompletion};
@@ -739,7 +970,8 @@ mod tests {
     use crate::v02::manager::capacity::ResourceRegistration;
     use crate::v02::manager::capacity::{ManagerCapacityPools, ScopeCapacity};
     use crate::v02::report::{
-        ManagerLimits, PortableExecutorOptions, ResourceId, ScopeLimits, ThreadPoolExecutorOptions,
+        ManagerLimits, PortableExecutorOptions, ResourceId, ResourceProgress, ScopeLimits,
+        ThreadPoolExecutorOptions,
     };
     use crate::v02::resource::cleanup_port::{
         CleanupDispatch, CleanupDispatchPermit, CleanupJob, CleanupQueueError,
@@ -879,6 +1111,23 @@ mod tests {
     }
 
     #[test]
+    fn reservation_release_before_scope_seal_does_not_strand_settlement() {
+        let completion = ScopeCompletion::new();
+        let report = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&report);
+        completion.set_callback(Box::new(move |value| {
+            *observed.lock().unwrap() = Some(value);
+        }));
+
+        completion.release_pending_reservation();
+        completion.seal(1);
+
+        let report = report.lock().unwrap().take().unwrap();
+        assert!(report.resources.is_empty());
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
     fn open_with_zero_users_keeps_value() {
         let dispatch = ManualDispatch::new();
         let executor = executor();
@@ -967,6 +1216,11 @@ mod tests {
         let dispatch = ManualDispatch::new();
         let executor = executor();
         let completion = ScopeCompletion::new();
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let observed_progress = Arc::clone(&progress);
+        completion.set_progress_callback(Arc::new(move |value| {
+            observed_progress.lock().unwrap().push(value);
+        }));
         let report = Arc::new(Mutex::new(None));
         let report_slot = Arc::clone(&report);
         completion.set_callback(Box::new(move |value| {
@@ -986,6 +1240,14 @@ mod tests {
         finish(&dispatch, &executor);
         let report = report.lock().unwrap().take().unwrap();
         assert_eq!(report.recoveries.len(), 1);
+        assert_eq!(
+            *progress.lock().unwrap(),
+            vec![
+                ResourceProgress::ScopeOpen,
+                ResourceProgress::Cleaning,
+                ResourceProgress::Unconfirmed
+            ]
+        );
         assert_eq!(
             report.recoveries[0].snapshot().phase,
             crate::v02::report::RecoveryPhase::Unconfirmed

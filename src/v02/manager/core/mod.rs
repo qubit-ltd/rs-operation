@@ -1075,6 +1075,7 @@ impl OperationManager {
                 }
             };
         let operation = OperationCore::new(id);
+        scope.bind_operation_core(&operation);
         let slot = Arc::new(OutcomeSlot::new(Arc::clone(&operation)));
         let lease = Arc::clone(&reservation.lifecycle);
         slot.set_delivery_hook({
@@ -1352,6 +1353,7 @@ impl AsyncOperationManager {
                 }
             };
         let operation = OperationCore::new(id);
+        scope.bind_operation_core(&operation);
         let slot = Arc::new(OutcomeSlot::new(Arc::clone(&operation)));
         let lease = Arc::clone(&reservation.lifecycle);
         slot.set_delivery_hook({

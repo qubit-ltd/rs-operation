@@ -26,6 +26,16 @@ pub trait AsyncCleanup<T: Send + Sync + 'static>: Send + Sync + 'static {
     fn cleanup(self: Arc<Self>, resource: T, context: CleanupContext) -> CleanupFuture<T>;
 }
 
+impl<T, C> AsyncCleanup<T> for Arc<C>
+where
+    T: Send + Sync + 'static,
+    C: AsyncCleanup<T> + ?Sized,
+{
+    fn cleanup(self: Arc<Self>, resource: T, context: CleanupContext) -> CleanupFuture<T> {
+        Arc::clone(self.as_ref()).cleanup(resource, context)
+    }
+}
+
 pub enum CleanupOutcome<T> {
     Released,
     Transferred(TransferReceipt),

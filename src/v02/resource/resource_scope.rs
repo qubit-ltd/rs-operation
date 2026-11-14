@@ -1,10 +1,10 @@
 use super::core::ScopeState;
-use super::resource_error::{ManageResourceError, ResourceCapacityError};
+use super::resource_error::{ManageResourceError, ManageWithError};
 use super::{ResourceKey, ResourceRef, ResourceReservation};
 use crate::v02::manager::capacity::ScopeCapacity;
 use crate::v02::report::{
-    ManagerId, ResourceLookupError, ResourceManageErrorKind, ResourceScopeId, ResourceScopeReport,
-    TransferReceipt,
+    ManagerId, ResourceCapacityError, ResourceLookupError, ResourceManageErrorKind,
+    ResourceScopeId, ResourceScopeReport, TransferReceipt,
 };
 use crate::v02::resource::cleanup_port::CleanupDispatch;
 use std::sync::Arc;
@@ -47,6 +47,13 @@ impl ResourceScope {
         self.state.set_settlement_callback(callback);
     }
 
+    pub(crate) fn set_progress_callback(
+        &self,
+        callback: Arc<dyn Fn(crate::v02::report::ResourceProgress) + Send + Sync + 'static>,
+    ) {
+        self.state.set_progress_callback(callback);
+    }
+
     pub(crate) fn set_recovery_callback(
         &self,
         callback: Arc<dyn Fn(crate::v02::report::RecoveryHandle, bool) + Send + Sync + 'static>,
@@ -72,19 +79,25 @@ impl ResourceScope {
         })
     }
 
-    pub fn manage_with<T: Send + Sync + 'static>(
+    pub fn manage_with<T, C>(
         &self,
         value: T,
-        policy: Arc<dyn super::cleanup::AsyncCleanup<T>>,
-    ) -> Result<ResourceRef<T>, ManageResourceError<T>> {
+        policy: C,
+    ) -> Result<ResourceRef<T>, ManageWithError<T, C>>
+    where
+        T: Send + Sync + 'static,
+        C: super::cleanup::AsyncCleanup<T>,
+    {
         let reservation = match self.reserve() {
             Ok(reservation) => reservation,
-            Err(error) => return Err(ManageResourceError::new(manage_kind(error), value)),
+            Err(error) => {
+                return Err(ManageWithError::new(manage_kind(error), value, policy));
+            }
         };
         reservation.commit_with(value, policy).map_err(|error| {
-            let (reason, value, reservation) = error.into_parts();
+            let (reason, value, policy, reservation) = error.into_parts();
             drop(reservation);
-            ManageResourceError::new(reason, value)
+            ManageWithError::new(reason, value, policy)
         })
     }
 
@@ -141,9 +154,8 @@ impl Drop for ResourceScope {
 fn manage_kind(error: ResourceCapacityError) -> ResourceManageErrorKind {
     match error {
         ResourceCapacityError::ScopeEnded => ResourceManageErrorKind::ScopeEnded,
-        ResourceCapacityError::Exhausted
-        | ResourceCapacityError::CleanupQueueFull
-        | ResourceCapacityError::CleanupQueueClosed => ResourceManageErrorKind::CapacityExceeded,
+        ResourceCapacityError::Stopped => ResourceManageErrorKind::Stopped,
+        ResourceCapacityError::CapacityExceeded => ResourceManageErrorKind::CapacityExceeded,
     }
 }
 
@@ -282,6 +294,37 @@ mod tests {
     }
 
     #[test]
+    fn live_resource_reference_reports_waiting_then_cleanup_progress() {
+        let (scope, cleanup) = scope();
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&progress);
+        scope.set_progress_callback(Arc::new(move |value| {
+            observed.lock().unwrap().push(value);
+        }));
+        let resource = scope.manage(String::from("live")).unwrap();
+        scope.end();
+        assert_eq!(
+            *progress.lock().unwrap(),
+            vec![
+                crate::v02::report::ResourceProgress::ScopeOpen,
+                crate::v02::report::ResourceProgress::WaitingForUsers,
+            ]
+        );
+        drop(resource);
+        assert_eq!(
+            *progress.lock().unwrap(),
+            vec![
+                crate::v02::report::ResourceProgress::ScopeOpen,
+                crate::v02::report::ResourceProgress::WaitingForUsers,
+                crate::v02::report::ResourceProgress::Cleaning,
+            ]
+        );
+        let executor = executor();
+        cleanup.run_all(&executor);
+        executor.shutdown().wait().unwrap();
+    }
+
+    #[test]
     fn open_scope_reacquires_resource_by_typed_key() {
         let (scope, _) = scope();
         let first = scope.manage(String::from("ready")).unwrap();
@@ -317,6 +360,75 @@ mod tests {
         assert_eq!(reason, ResourceManageErrorKind::ScopeEnded);
         assert_eq!(resource, "owner");
         drop(reservation);
+    }
+
+    #[test]
+    fn retained_cleanup_uses_reservation_after_scope_end() {
+        use crate::v02::context::CleanupContext;
+        use crate::v02::resource::{AsyncCleanup, CleanupFuture};
+        use std::sync::atomic::AtomicBool;
+
+        struct CleanupMarker(Arc<AtomicBool>);
+        impl AsyncCleanup<String> for CleanupMarker {
+            fn cleanup(
+                self: Arc<Self>,
+                resource: String,
+                _context: CleanupContext,
+            ) -> CleanupFuture<String> {
+                Box::pin(async move {
+                    self.0.store(true, Ordering::SeqCst);
+                    drop(resource);
+                    crate::v02::resource::CleanupOutcome::Released
+                })
+            }
+        }
+
+        let (scope, cleanup) = scope();
+        let executor = executor();
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let observed_progress = Arc::clone(&progress);
+        scope.set_progress_callback(Arc::new(move |value| {
+            observed_progress.lock().unwrap().push(value);
+        }));
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&reports);
+        scope.set_settlement_callback(Box::new(move |report| {
+            observed.lock().unwrap().push(report);
+        }));
+        let reservation = scope.reserve().unwrap();
+        scope.end();
+        let ran_cleanup = Arc::new(AtomicBool::new(false));
+        let policy = CleanupMarker(Arc::clone(&ran_cleanup));
+        let error = match reservation.commit_with(String::from("partial session"), policy) {
+            Ok(_) => panic!("closed resource scope must reject commit"),
+            Err(error) => error,
+        };
+        let (reason, resource, policy, reservation) = error.into_parts();
+        assert_eq!(reason, ResourceManageErrorKind::ScopeEnded);
+        assert_eq!(resource, "partial session");
+        let resource_id = reservation.retain_with_for_cleanup(resource, policy);
+
+        assert_eq!(
+            *progress.lock().unwrap(),
+            vec![
+                crate::v02::report::ResourceProgress::ScopeOpen,
+                crate::v02::report::ResourceProgress::WaitingForUsers,
+                crate::v02::report::ResourceProgress::Cleaning,
+            ]
+        );
+
+        assert_eq!(resource_id.manager(), scope.state.core.manager);
+        assert!(!ran_cleanup.load(Ordering::SeqCst));
+        assert!(reports.lock().unwrap().is_empty());
+        cleanup.run_all(&executor);
+        while executor.poll_async_turn() > 0 {}
+        executor.shutdown().wait().unwrap();
+
+        assert!(ran_cleanup.load(Ordering::SeqCst));
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].resources.len(), 1);
+        assert_eq!(reports[0].resources[0].resource_id, resource_id);
     }
 
     #[test]

@@ -13,8 +13,8 @@ use crate::v02::report::{
     AdmissionError, ManagerCreateError, ManagerId, ManagerOptions, OperationId, OperationOptions,
     ResourceScopeId, ScopeLimits,
 };
-use crate::v02::resource::cleanup::{CleanupDispatcher, CleanupDispatcherError, CleanupPump};
 use crate::v02::resource::ResourceScope;
+use crate::v02::resource::cleanup::{CleanupDispatcher, CleanupDispatcherError, CleanupPump};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -574,11 +574,30 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use crate::v02::context::CleanupContext;
     use crate::v02::manager::core::{AsyncOperationManager, OperationManager};
     use crate::v02::report::{
-        ManagerOptions, OperationOptions, OperationOutcome, ShutdownMode, ShutdownWait,
+        ManagerOptions, OperationOptions, OperationOutcome, ResourceManageErrorKind,
+        ResourceProgress, ShutdownMode, ShutdownWait, StopReason, StopRequestStatus,
     };
+    use crate::v02::resource::{AsyncCleanup, CleanupFuture, CleanupOutcome};
+    use std::sync::{Arc, Barrier, mpsc};
     use std::time::Duration;
+
+    struct MarkerCleanup(Arc<std::sync::atomic::AtomicBool>);
+    impl AsyncCleanup<String> for MarkerCleanup {
+        fn cleanup(
+            self: Arc<Self>,
+            resource: String,
+            _context: CleanupContext,
+        ) -> CleanupFuture<String> {
+            Box::pin(async move {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                drop(resource);
+                CleanupOutcome::Released
+            })
+        }
+    }
 
     #[test]
     fn real_sync_and_async_managers_run_typed_operations_and_shutdown() {
@@ -642,5 +661,108 @@ mod tests {
             OperationOutcome::Succeeded(())
         ));
         assert!(completion.settlement.all_released());
+    }
+
+    #[test]
+    fn operation_scope_reservation_tracks_progress_and_can_be_retained_after_end() {
+        let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let gate = Arc::new(Barrier::new(2));
+        let body_gate = Arc::clone(&gate);
+        let cleanup_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_for_task = Arc::clone(&cleanup_ran);
+        let mut operation = manager
+            .try_submit(OperationOptions::default(), move |scope| {
+                let reservation = scope.reserve_resource().unwrap();
+                sender.send(reservation).unwrap();
+                body_gate.wait();
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+
+        let reservation = receiver.recv().unwrap();
+        assert_eq!(
+            operation.snapshot().resources,
+            Some(ResourceProgress::ScopeOpen)
+        );
+        gate.wait();
+        assert!(matches!(
+            operation.wait_outcome().unwrap(),
+            OperationOutcome::Succeeded(())
+        ));
+        assert_eq!(
+            operation.snapshot().resources,
+            Some(ResourceProgress::WaitingForUsers)
+        );
+
+        let error = match reservation.commit_with(
+            String::from("retained input"),
+            MarkerCleanup(cleanup_for_task),
+        ) {
+            Ok(_) => panic!("ended operation scope accepted a resource commit"),
+            Err(error) => error,
+        };
+        let (reason, resource, cleanup, reservation) = error.into_parts();
+        assert_eq!(reason, ResourceManageErrorKind::ScopeEnded);
+        assert_eq!(resource, "retained input");
+        let resource_id = reservation.retain_with_for_cleanup(resource, cleanup);
+        let settlement = operation.wait_settlement().unwrap();
+        assert!(settlement.all_released());
+        assert!(cleanup_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            settlement
+                .resource_reports
+                .iter()
+                .any(|report| { report.resource_id == resource_id })
+        );
+        assert_eq!(operation.snapshot().resources, None);
+    }
+
+    #[test]
+    fn accepted_stop_rejects_reserved_resource_commit_and_cleanup_settles_once() {
+        let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let (id_sender, id_receiver) = mpsc::channel();
+        let gate = Arc::new(Barrier::new(2));
+        let body_gate = Arc::clone(&gate);
+        let cleanup_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_for_task = Arc::clone(&cleanup_ran);
+        let mut operation = manager
+            .try_submit(OperationOptions::default(), move |scope| {
+                let reservation = scope.reserve_resource().unwrap();
+                sender.send(()).unwrap();
+                body_gate.wait();
+                let error = match reservation.commit_with(
+                    String::from("stopped owner"),
+                    MarkerCleanup(cleanup_for_task),
+                ) {
+                    Ok(resource) => {
+                        drop(resource);
+                        return Ok::<_, ()>(None);
+                    }
+                    Err(error) => error,
+                };
+                let (reason, resource, cleanup, reservation) = error.into_parts();
+                assert_eq!(reason, ResourceManageErrorKind::Stopped);
+                let resource_id = reservation.retain_with_for_cleanup(resource, cleanup);
+                id_sender.send(resource_id).unwrap();
+                Ok(Some(resource_id))
+            })
+            .unwrap();
+
+        receiver.recv().unwrap();
+        assert_eq!(
+            operation.request_stop(StopReason::UserCancelled),
+            StopRequestStatus::Accepted
+        );
+        gate.wait();
+        let outcome = operation.wait_outcome().unwrap();
+        assert!(matches!(outcome, OperationOutcome::Stopped(_)));
+        let settlement = operation.wait_settlement().unwrap();
+        assert!(settlement.all_released());
+        assert_eq!(settlement.resource_reports.len(), 1);
+        let resource_id = id_receiver.recv().unwrap();
+        assert!(cleanup_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(settlement.resource_reports[0].resource_id, resource_id);
     }
 }

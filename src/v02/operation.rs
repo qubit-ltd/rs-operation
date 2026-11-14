@@ -160,6 +160,7 @@ impl OperationCore {
         }
         let report = Arc::new(report);
         facts.settlement = Some(Arc::clone(&report));
+        facts.resources = None;
         drop(facts);
         self.notify_change();
         Ok(report)

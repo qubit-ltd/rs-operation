@@ -27,6 +27,9 @@ pub(crate) struct ScopeCore {
     group: Option<Arc<crate::v02::manager::group::GroupCore>>,
     children_changed: Notify,
     state: Mutex<ScopeState>,
+    resource_progress:
+        Mutex<HashMap<crate::v02::report::ResourceScopeId, crate::v02::report::ResourceProgress>>,
+    operation_core: Mutex<Option<Weak<crate::v02::operation::OperationCore>>>,
 }
 
 struct ScopeState {
@@ -103,6 +106,8 @@ impl ScopeCore {
             resource_scope: resource_scope.internal_clone(),
             group,
             children_changed: Notify::new(),
+            resource_progress: Mutex::new(HashMap::new()),
+            operation_core: Mutex::new(None),
             state: Mutex::new(ScopeState {
                 open: true,
                 stopping: false,
@@ -175,6 +180,37 @@ impl ScopeCore {
         &self.resource_scope
     }
 
+    pub(crate) fn bind_operation_core(
+        &self,
+        operation: &Arc<crate::v02::operation::OperationCore>,
+    ) {
+        *lock(&self.operation_core) = Some(Arc::downgrade(operation));
+        let progress = lock(&self.resource_progress)
+            .values()
+            .copied()
+            .max_by_key(|progress| resource_progress_rank(*progress));
+        operation.set_resource_progress(progress);
+    }
+
+    fn record_resource_progress(
+        &self,
+        id: crate::v02::report::ResourceScopeId,
+        progress: crate::v02::report::ResourceProgress,
+    ) {
+        let progress = {
+            let mut values = lock(&self.resource_progress);
+            values.insert(id, progress);
+            values
+                .values()
+                .copied()
+                .max_by_key(|progress| resource_progress_rank(*progress))
+        };
+        let operation = lock(&self.operation_core).as_ref().and_then(Weak::upgrade);
+        if let Some(operation) = operation {
+            operation.set_resource_progress(progress);
+        }
+    }
+
     pub(crate) fn mark_child(
         &self,
         id: OperationId,
@@ -232,6 +268,13 @@ impl ScopeCore {
                 .push(Box::new(resource_scope.internal_clone()));
         }
         let weak = Arc::downgrade(self);
+        let progress_scope = Arc::downgrade(self);
+        let resource_scope_id = resource_scope.id();
+        resource_scope.set_progress_callback(Arc::new(move |progress| {
+            if let Some(scope) = progress_scope.upgrade() {
+                scope.record_resource_progress(resource_scope_id, progress);
+            }
+        }));
         resource_scope.set_settlement_callback(Box::new(move |report| {
             if let Some(scope) = weak.upgrade() {
                 scope.record_resource_scope_report(report);
@@ -460,6 +503,26 @@ impl ScopeCore {
             child.request_stop(StopReason::ParentStopped);
         }
         accepted
+    }
+
+    pub(crate) fn with_resource_lifecycle<R>(
+        &self,
+        action: impl FnOnce() -> R,
+    ) -> Result<R, crate::v02::report::ResourceManageErrorKind> {
+        self.with_lifecycle_gate(|| {
+            if !self.is_open() {
+                return Err(crate::v02::report::ResourceManageErrorKind::ScopeEnded);
+            }
+            if self.ancestor_stop_accepted()
+                || self
+                    .manager
+                    .upgrade()
+                    .is_some_and(|manager| !manager.adapter_start_allowed())
+            {
+                return Err(crate::v02::report::ResourceManageErrorKind::Stopped);
+            }
+            Ok(action())
+        })
     }
 
     /// Commits a reserved manager child while serialized with every scope stop.
@@ -708,13 +771,16 @@ impl ScopeCore {
     }
 
     pub(crate) fn end(&self) {
-        let resources = {
+        let resources = self.with_lifecycle_gate(|| {
             let mut state = lock(&self.state);
             if !state.open {
-                return;
+                return None;
             }
             state.open = false;
-            std::mem::take(&mut state.resources)
+            Some(std::mem::take(&mut state.resources))
+        });
+        let Some(resources) = resources else {
+            return;
         };
         for resource in resources {
             resource.end();
@@ -730,6 +796,15 @@ impl ScopeCore {
     #[cfg(test)]
     fn _test_child_count(&self) -> usize {
         lock(&self.state).children.len()
+    }
+}
+
+fn resource_progress_rank(progress: crate::v02::report::ResourceProgress) -> u8 {
+    match progress {
+        crate::v02::report::ResourceProgress::ScopeOpen => 0,
+        crate::v02::report::ResourceProgress::WaitingForUsers => 1,
+        crate::v02::report::ResourceProgress::Cleaning => 2,
+        crate::v02::report::ResourceProgress::Unconfirmed => 3,
     }
 }
 
@@ -784,7 +859,55 @@ impl OperationScope {
         resource: T,
     ) -> Result<crate::v02::resource::ResourceRef<T>, crate::v02::resource::ManageResourceError<T>>
     {
-        self.core.resource_scope().manage(resource)
+        let reservation = match self.reserve_resource() {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let kind = match error {
+                    crate::v02::resource::ResourceCapacityError::ScopeEnded => {
+                        crate::v02::report::ResourceManageErrorKind::ScopeEnded
+                    }
+                    crate::v02::resource::ResourceCapacityError::Stopped => {
+                        crate::v02::report::ResourceManageErrorKind::Stopped
+                    }
+                    crate::v02::resource::ResourceCapacityError::CapacityExceeded => {
+                        crate::v02::report::ResourceManageErrorKind::CapacityExceeded
+                    }
+                };
+                return Err(crate::v02::resource::ManageResourceError::new(
+                    kind, resource,
+                ));
+            }
+        };
+        reservation.commit(resource).map_err(|error| {
+            let (kind, resource, reservation) = error.into_parts();
+            drop(reservation);
+            crate::v02::resource::ManageResourceError::new(kind, resource)
+        })
+    }
+
+    /// Reserves scope capacity and cleanup storage before creating a resource.
+    pub fn reserve_resource(
+        &self,
+    ) -> Result<
+        crate::v02::resource::ResourceReservation,
+        crate::v02::resource::ResourceCapacityError,
+    > {
+        let result = self
+            .core
+            .with_resource_lifecycle(|| self.core.resource_scope().reserve());
+        match result {
+            Ok(Ok(reservation)) => Ok(reservation.bind_operation_scope(Arc::clone(&self.core))),
+            Ok(Err(error)) => Err(error),
+            Err(crate::v02::report::ResourceManageErrorKind::ScopeEnded) => {
+                Err(crate::v02::resource::ResourceCapacityError::ScopeEnded)
+            }
+            Err(crate::v02::report::ResourceManageErrorKind::Stopped) => {
+                Err(crate::v02::resource::ResourceCapacityError::Stopped)
+            }
+            Err(crate::v02::report::ResourceManageErrorKind::CapacityExceeded) => {
+                unreachable!("lifecycle gate only rejects stop or scope end")
+            }
+        }
     }
 
     /// Looks up a resource while the attached scope remains open.

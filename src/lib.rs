@@ -37,8 +37,9 @@ pub use v02::protocol::{
 pub use v02::report::*;
 pub use v02::resource::{
     AsyncCleanup, AsyncRecoveryAttempt, CleanupFuture, CleanupOutcome, ManageResourceError,
-    RecoveryAttempt, RecoveryStore, RecoveryStoreOptions, RecoveryStoreShutdownHandle,
-    ResourceCapacityError, ResourceCommitError, ResourceKey, ResourceRef, ResourceScope,
+    ManageWithError, RecoveryAttempt, RecoveryStore, RecoveryStoreOptions,
+    RecoveryStoreShutdownHandle, ResourceCapacityError, ResourceCommitError,
+    ResourceCommitWithError, ResourceKey, ResourceRef, ResourceReservation, ResourceScope,
     ServiceResourceScope,
 };
 pub use v02::scope::OperationScope;
