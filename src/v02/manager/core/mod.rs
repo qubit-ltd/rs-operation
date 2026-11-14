@@ -141,6 +141,7 @@ pub(crate) struct ManagerCore {
 
 impl ManagerCore {
     /// Creates the real coordinator around supplied capacity and execution ports.
+    #[cfg(test)]
     pub(crate) fn new(
         port: Arc<dyn SubmissionPort>,
         root_context: OperationContext,
@@ -329,6 +330,7 @@ impl ManagerCore {
         Ok((body, id, scope_core, permit))
     }
 
+    #[cfg(test)]
     fn submit_scope<F>(
         self: &Arc<Self>,
         target: &SubmissionTarget,
@@ -351,6 +353,7 @@ impl ManagerCore {
         Ok(id)
     }
 
+    #[cfg(test)]
     fn submit_async_scope<F, Fut>(
         self: &Arc<Self>,
         target: &SubmissionTarget,
@@ -929,14 +932,6 @@ impl OperationManager {
             .map(crate::v02::resource::service::ServiceResourceScope::new)
     }
 
-    pub(crate) fn operation_resource_scope(
-        &self,
-        owner: &Arc<ScopeCore>,
-        options: crate::v02::report::ResourceScopeOptions,
-    ) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
-        self.core.operation_resource_scope(owner, options)
-    }
-
     pub(crate) fn bound(core: Arc<ManagerCore>, scope: &Arc<ScopeCore>) -> Self {
         core.bound(scope)
     }
@@ -1129,19 +1124,6 @@ impl OperationManager {
             },
         );
         Ok(handle)
-    }
-
-    pub(crate) fn try_submit_with<T, E, F>(
-        &self,
-        options: OperationOptions,
-        body: F,
-    ) -> Result<OperationHandle<T, E>, SubmitError<F>>
-    where
-        T: Send + 'static,
-        E: Send + 'static,
-        F: FnOnce(OperationScope) -> Result<T, E> + Send + 'static,
-    {
-        self.try_submit(options, body)
     }
 
     pub fn run<T, E, F>(

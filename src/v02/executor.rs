@@ -33,11 +33,13 @@ pub(crate) enum ExecutorCreateError {
 }
 
 /// Failure to submit a job, retaining ownership for retry or caller cleanup.
+#[cfg(test)]
 pub(crate) struct SubmitFailure<F> {
     error: ExecutorError,
     job: F,
 }
 
+#[cfg(test)]
 impl<F> std::fmt::Debug for SubmitFailure<F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -47,6 +49,7 @@ impl<F> std::fmt::Debug for SubmitFailure<F> {
     }
 }
 
+#[cfg(test)]
 impl<F> SubmitFailure<F> {
     pub(crate) fn error(&self) -> ExecutorError {
         self.error
@@ -167,7 +170,7 @@ impl PortableExecutor {
                 return;
             }
             drop(state);
-            self.poll_once();
+            self.poll_turn();
         }
     }
 
@@ -449,6 +452,7 @@ impl ThreadPoolExecutor {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn try_submit<F>(&self, job: F) -> Result<(), SubmitFailure<F>>
     where
         F: FnOnce() + Send + 'static,
@@ -509,10 +513,12 @@ impl CleanupExecutor {
     }
 
     /// Advances one scheduled asynchronous cleanup future.
+    #[cfg(test)]
     pub(crate) fn poll_async_once(&self) -> bool {
         self.asynchronous.poll_once()
     }
 
+    #[cfg(test)]
     pub(crate) fn poll_async_turn(&self) -> usize {
         self.asynchronous.poll_turn()
     }
@@ -571,6 +577,7 @@ impl Drop for ThreadPoolPermit {
 }
 
 impl ShutdownHandle {
+    #[cfg(test)]
     pub(crate) fn is_finished(&self) -> bool {
         let state = lock(&self.inner.state);
         state.outstanding == 0 && state.exited_workers == self.inner.worker_count

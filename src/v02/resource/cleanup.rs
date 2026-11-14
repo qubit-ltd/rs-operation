@@ -1105,16 +1105,16 @@ mod tests {
                 .is_ok()
         );
 
-        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        struct Probe(Arc<std::sync::atomic::AtomicUsize>);
+        let (drop_send, drop_receive) = mpsc::channel();
+        struct Probe(mpsc::Sender<()>);
         impl Drop for Probe {
             fn drop(&mut self) {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = self.0.send(());
             }
         }
         let second_id = ResourceId::new(manager, 2, 1);
         let job: Box<dyn CleanupJob> = Box::new(DefaultDropJob::new(
-            Probe(Arc::clone(&dropped)),
+            Probe(drop_send),
             None,
             |_| {},
         ));
@@ -1123,7 +1123,7 @@ mod tests {
             Err(failure) => failure,
         };
         assert_eq!(error, CleanupTransferError::Full);
-        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(drop_receive.try_recv().is_err());
 
         let second_receiver =
             CleanupTransferReceiver::new(manager, ResourceScopeId::new_unique(), 1, executor())
@@ -1135,13 +1135,7 @@ mod tests {
         assert_eq!(receipt.resource(), second_id);
         assert!(second_receiver.contains(second_id));
         assert_eq!(second_receiver.drive(1), 1);
-        for _ in 0..1_000 {
-            if dropped.load(std::sync::atomic::Ordering::SeqCst) == 1 {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop_receive.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(first_receiver.drive(1), 1);
     }
 
