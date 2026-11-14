@@ -54,7 +54,33 @@ impl<F> SubmitError<F> {
 }
 ```
 
-容量默认值为 manager：active 4、queued 64、admission waiters 64、未取 outcomes 64、清理并行 4、diagnostic events 256；scope：后代 child 数 64（含其后代、不含自身）、资源登记 128、副作用记录 64（含其后代）。`OperationOptions.requirement` 默认 Required，仅有父级时参与父成功判定。设计没有冻结 Rust `Default` 或 builder 构造器；实现只需确保 options 初始化能产生这些默认字段值，不额外假定公共构造方法。
+容量默认值为 manager：active 4、queued 64、admission waiters 64、未取 outcomes 64、清理并行 4、diagnostic events 256；scope：后代 child 数 64（含其后代、不含自身）、资源登记 128、副作用记录 64（含其后代）。`OperationOptions.requirement` 默认 Required，仅有父级时参与父成功判定。
+
+**冻结的标准库 `Default` 实现：** `ManagerLimits`、`ScopeLimits`、`PortableExecutorOptions`、`ThreadPoolExecutorOptions`、`ContextOptions`、`ManagerOptions`、`OperationOptions` 均实现 `Default`。四个设计 §8 配置 struct 的默认值如下：
+
+| 类型/字段 | 默认值 |
+| --- | ---: |
+| `ManagerLimits.active_operations` | 4 |
+| `ManagerLimits.queued_operations` | 64 |
+| `ManagerLimits.admission_waiters` | 64 |
+| `ManagerLimits.unconsumed_outcomes` | 64 |
+| `ManagerLimits.cleanup_concurrency` | 4 |
+| `ManagerLimits.diagnostic_events` | 256 |
+| `ScopeLimits.child_operations` | 64 |
+| `ScopeLimits.resources` | 128 |
+| `ScopeLimits.effect_records` | 64 |
+| `OperationOptions.requirement` | `ChildRequirement::Required` |
+| `OperationOptions.limits` | `ScopeLimits::default()` |
+| `OperationOptions.child_failure_policy` | `ChildFailurePolicy::StopSiblings` |
+| `OperationOptions.context` | `ContextOptions::default()`（clock/deadline/budget 均为 `None`） |
+| `ManagerOptions.limits` | `ManagerLimits::default()` |
+| `ManagerOptions.scope_limits` | `ScopeLimits::default()` |
+| `ManagerOptions.clock` | `None` |
+| `ManagerOptions.async_executor` | `worker_count=4, task_capacity=68, polls_per_turn=16` |
+| `ManagerOptions.sync_executor` | `worker_count=4, queue_capacity=64` |
+| `ManagerOptions.cleanup_executor` | `worker_count=4, queue_capacity=64` |
+
+`PortableExecutorOptions::default()` 与 `ThreadPoolExecutorOptions::default()` 分别等于表中的 async、thread-pool 配置；`ContextOptions::default()` 三个字段均为 None。async/sync worker 数与默认 active_operations=4 对齐；异步 task_capacity=68 对应 4 个活动槽加 64 个排队槽；polls_per_turn=16 沿用 0.1 driver 的公平轮转配置。`ResourceScopeOptions`、`GroupOptions`、`ServiceResourceOptions` 没有冻结 `Default` 实现；按 §8 使用显式 `capacity` 字段。执行器默认值属于本次 crate 默认配置，不是兼容承诺；应用可通过 ManagerOptions 显式覆盖。
 
 ```rust,ignore
 impl OperationManager {
@@ -133,7 +159,7 @@ impl<T: Send + Sync + 'static> ResourceRef<T> {
 
 以上类型签名以及设计 §8 的 observer、resource scope、reservation、report、recovery、group、shutdown、context 类型构成唯一来源；各模块不得另造同名类型或改 bounds。关键默认值见上。错误携带闭包、资源、策略或 reservation 时必须保留原 owner，不能只变成字符串；F/T/E 不要求 Clone/Debug。
 
-**验证用例：** 一个编译契约应从 crate 根同时导入 `OperationManager`、`AsyncOperationManager`、`OperationScope`、`ResourceRef`、`OperationOutcome`、`SettlementReport`、错误和配置类型，并编译设计中两个 submit 闭包的 bounds；另以 compile-fail 检查 scope 不可 Clone、ResourceRef 不可 `DerefMut`。根重导出列表由主控逐项对照设计 §8 实际声明，本文不以“待实现”冒充已导出。
+**验证用例：** 一个编译契约应从 crate 根同时导入 `OperationManager`、`AsyncOperationManager`、`OperationScope`、`ResourceRef`、`OperationOutcome`、`SettlementReport`、错误和配置类型，并编译设计中两个 submit 闭包的 bounds；断言七个冻结类型的 `Default` 输出字段逐一匹配上表；另以 compile-fail 检查 scope 不可 Clone、ResourceRef 不可 `DerefMut`。`ResourceScopeOptions` 等 capacity 配置以显式字段构造，不新增无文档依据的 Default。根重导出列表由主控逐项对照设计 §8 实际声明，本文不以“待实现”冒充已导出。
 
 ### C02 — adapter 预留/启动完整入口 — STABLE（内部端口，主控审查）
 
