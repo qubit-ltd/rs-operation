@@ -30,7 +30,12 @@ pub(crate) fn new_sync(options: ManagerOptions) -> Result<OperationManager, Mana
     })
     .map_err(|_| ManagerCreateError::InvalidOptions { field: "clock" })?;
     let port = ProductionSubmissionPort::new(&options)?;
-    let core = ManagerCore::new(Arc::new(port), root_context, options.scope_limits);
+    let core = ManagerCore::new_with_diagnostic_limit(
+        Arc::new(port),
+        root_context,
+        options.scope_limits,
+        options.limits.diagnostic_events,
+    );
     Ok(core.root_view())
 }
 
