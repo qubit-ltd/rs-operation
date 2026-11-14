@@ -23,6 +23,7 @@ impl<T: Send + Sync + 'static> Clone for ResourceKey<T> {
         }
     }
 }
+impl<T: Send + Sync + 'static> Copy for ResourceKey<T> {}
 impl<T: Send + Sync + 'static> std::fmt::Debug for ResourceKey<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResourceKey")
