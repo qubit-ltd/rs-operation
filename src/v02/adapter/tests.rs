@@ -147,6 +147,14 @@ impl DropSignal {
     }
 }
 
+struct PayloadDropFlag(Arc<AtomicBool>);
+
+impl Drop for PayloadDropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 struct Tracked(DropSignal);
 
 impl Drop for Tracked {
@@ -265,6 +273,180 @@ fn stop_before_commit_abandons_once() {
         !dropped.is_dropped(),
         "scope still owns the resource until it ends"
     );
+    scope.end();
+    cleanup.schedule_all();
+    dropped.wait_dropped();
+}
+
+#[test]
+fn commit_rejection_drops_payload_before_abandon_notification() {
+    let id = OperationId::new_unique();
+    let (scope, input, cleanup, dropped) = managed_input();
+    let (task, control) = ExternalTask::new(id, input);
+    let payload_dropped = Arc::new(AtomicBool::new(false));
+    let abandoned = Arc::new(AtomicUsize::new(0));
+    let child = AdapterReservation::new_with_gates(
+        Box::new(()),
+        || Err(AdapterErrorKind::Stopped),
+        || Ok(()),
+        |_| panic!("rejected child must not activate"),
+        {
+            let payload_dropped = Arc::clone(&payload_dropped);
+            let abandoned = Arc::clone(&abandoned);
+            move || {
+                assert!(payload_dropped.load(Ordering::SeqCst));
+                abandoned.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+    )
+    .attach(control, PayloadDropFlag(Arc::clone(&payload_dropped)))
+    .expect("attach should succeed");
+
+    let error = child.commit().expect_err("commit gate rejects start");
+    drop(error.payload);
+
+    assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+    task.confirm_input_release(ChildRelease {
+        operation_id: id,
+        confirmed_at: None,
+    })
+    .unwrap();
+    scope.end();
+    cleanup.schedule_all();
+    dropped.wait_dropped();
+}
+
+#[test]
+fn activation_rejection_drops_payload_before_abandon_notification() {
+    let id = OperationId::new_unique();
+    let (scope, input, cleanup, dropped) = managed_input();
+    let (task, control) = ExternalTask::new(id, input);
+    let payload_dropped = Arc::new(AtomicBool::new(false));
+    let abandoned = Arc::new(AtomicUsize::new(0));
+    let permit = AdapterReservation::new_with_gates(
+        Box::new(()),
+        || Ok(()),
+        || Err(AdapterErrorKind::Stopped),
+        |_| panic!("rejected child must not activate"),
+        {
+            let payload_dropped = Arc::clone(&payload_dropped);
+            let abandoned = Arc::clone(&abandoned);
+            move || {
+                assert!(payload_dropped.load(Ordering::SeqCst));
+                abandoned.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+    )
+    .attach(control, PayloadDropFlag(Arc::clone(&payload_dropped)))
+    .expect("attach should succeed")
+    .commit()
+    .expect("commit gate accepts start");
+
+    let error = permit
+        .activate()
+        .expect_err("activation gate rejects start");
+    drop(error.payload);
+
+    assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+    task.confirm_input_release(ChildRelease {
+        operation_id: id,
+        confirmed_at: None,
+    })
+    .unwrap();
+    scope.end();
+    cleanup.schedule_all();
+    dropped.wait_dropped();
+}
+
+#[test]
+fn dropping_reservation_releases_admission_before_abandon_notification() {
+    let admission_dropped = Arc::new(AtomicBool::new(false));
+    let abandoned = Arc::new(AtomicUsize::new(0));
+    let reservation = AdapterReservation::new(
+        Box::new(PayloadDropFlag(Arc::clone(&admission_dropped))),
+        |_| panic!("unattached reservation must not activate"),
+        {
+            let admission_dropped = Arc::clone(&admission_dropped);
+            let abandoned = Arc::clone(&abandoned);
+            move || {
+                assert!(admission_dropped.load(Ordering::SeqCst));
+                abandoned.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+    );
+
+    drop(reservation);
+
+    assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn dropping_attached_child_releases_payload_before_abandon_notification() {
+    let id = OperationId::new_unique();
+    let (scope, input, cleanup, dropped) = managed_input();
+    let (task, control) = ExternalTask::new(id, input);
+    let payload_dropped = Arc::new(AtomicBool::new(false));
+    let abandoned = Arc::new(AtomicUsize::new(0));
+    let child = AdapterReservation::new(
+        Box::new(()),
+        |_| panic!("dropped child must not activate"),
+        {
+            let payload_dropped = Arc::clone(&payload_dropped);
+            let abandoned = Arc::clone(&abandoned);
+            move || {
+                assert!(payload_dropped.load(Ordering::SeqCst));
+                abandoned.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+    )
+    .attach(control, PayloadDropFlag(Arc::clone(&payload_dropped)))
+    .expect("attach should succeed");
+
+    drop(child);
+
+    assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+    task.confirm_input_release(ChildRelease {
+        operation_id: id,
+        confirmed_at: None,
+    })
+    .unwrap();
+    scope.end();
+    cleanup.schedule_all();
+    dropped.wait_dropped();
+}
+
+#[test]
+fn dropping_start_permit_releases_payload_before_abandon_notification() {
+    let id = OperationId::new_unique();
+    let (scope, input, cleanup, dropped) = managed_input();
+    let (task, control) = ExternalTask::new(id, input);
+    let payload_dropped = Arc::new(AtomicBool::new(false));
+    let abandoned = Arc::new(AtomicUsize::new(0));
+    let permit = AdapterReservation::new(
+        Box::new(()),
+        |_| panic!("dropped permit must not activate"),
+        {
+            let payload_dropped = Arc::clone(&payload_dropped);
+            let abandoned = Arc::clone(&abandoned);
+            move || {
+                assert!(payload_dropped.load(Ordering::SeqCst));
+                abandoned.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+    )
+    .attach(control, PayloadDropFlag(Arc::clone(&payload_dropped)))
+    .expect("attach should succeed")
+    .commit()
+    .expect("commit should succeed");
+
+    drop(permit);
+
+    assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+    task.confirm_input_release(ChildRelease {
+        operation_id: id,
+        confirmed_at: None,
+    })
+    .unwrap();
     scope.end();
     cleanup.schedule_all();
     dropped.wait_dropped();

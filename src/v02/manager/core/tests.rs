@@ -24,6 +24,14 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
+struct PayloadDropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for PayloadDropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 struct WaitPort {
     ready: std::sync::atomic::AtomicBool,
     attempts: AtomicUsize,
@@ -938,8 +946,11 @@ fn production_cancel_abandons_adapter_without_running_unstarted_body() {
         Some(StopReason::ManagerShutdown)
     );
     let ran_body = Arc::new(AtomicUsize::new(0));
+    let payload_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let abandon_count = Arc::new(AtomicUsize::new(0));
     let ran_body_on_job = Arc::clone(&ran_body);
+    let payload_dropped_on_job = Arc::clone(&payload_dropped);
+    let drop_flag = PayloadDropFlag(Arc::clone(&payload_dropped_on_job));
     let abandon_count_on_callback = Arc::clone(&abandon_count);
     let abandon_scope = Arc::clone(&scope);
     let abandon_operation = Arc::clone(&operation);
@@ -952,9 +963,11 @@ fn production_cancel_abandons_adapter_without_running_unstarted_body() {
         Arc::clone(&control),
         execution,
         OperationJob::Sync(Box::new(move || {
+            let _drop_flag = drop_flag;
             ran_body_on_job.fetch_add(1, Ordering::SeqCst);
         })),
         move || {
+            assert!(payload_dropped.load(Ordering::SeqCst));
             abandon_count_on_callback.fetch_add(1, Ordering::SeqCst);
             ManagerCore::abandon_reserved_operation(
                 abandon_scope,
