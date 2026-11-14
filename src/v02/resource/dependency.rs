@@ -128,6 +128,75 @@ impl DependencyGraph {
     pub(crate) fn is_released(&self, resource: ResourceId) -> bool {
         lock(&self.state).released.contains(&resource)
     }
+
+    /// Returns the full undirected dependency component containing `resource`.
+    /// Transfer callers compare their proposed member list with this set so a
+    /// dependency group cannot be split across scopes.
+    pub(crate) fn group_members(&self, resource: ResourceId) -> HashSet<ResourceId> {
+        let state = lock(&self.state);
+        let mut members = HashSet::from([resource]);
+        let mut pending = VecDeque::from([resource]);
+        while let Some(current) = pending.pop_front() {
+            for (dependent, edges) in &state.edges {
+                for edge in edges {
+                    if (*dependent == current || edge.prerequisite == current)
+                        && members.insert(if *dependent == current {
+                            edge.prerequisite
+                        } else {
+                            *dependent
+                        })
+                    {
+                        pending.push_back(if *dependent == current {
+                            edge.prerequisite
+                        } else {
+                            *dependent
+                        });
+                    }
+                }
+            }
+        }
+        members
+    }
+
+    pub(crate) fn can_transfer_group(&self, members: &HashSet<ResourceId>) -> bool {
+        let Some(anchor) = members.iter().next().copied() else {
+            return false;
+        };
+        let state = lock(&self.state);
+        let actual = group_members_locked(&state, anchor);
+        if actual != *members {
+            return false;
+        }
+        members.iter().all(|resource| {
+            !state.started.contains(resource)
+                && !state.released.contains(resource)
+                && !state.failed.contains(resource)
+        })
+    }
+}
+
+fn group_members_locked(state: &GraphState, resource: ResourceId) -> HashSet<ResourceId> {
+    let mut members = HashSet::from([resource]);
+    let mut pending = VecDeque::from([resource]);
+    while let Some(current) = pending.pop_front() {
+        for (dependent, edges) in &state.edges {
+            for edge in edges {
+                let adjacent = if *dependent == current {
+                    Some(edge.prerequisite)
+                } else if edge.prerequisite == current {
+                    Some(*dependent)
+                } else {
+                    None
+                };
+                if let Some(adjacent) = adjacent
+                    && members.insert(adjacent)
+                {
+                    pending.push_back(adjacent);
+                }
+            }
+        }
+    }
+    members
 }
 
 fn reaches(state: &GraphState, from: ResourceId, target: ResourceId) -> bool {
