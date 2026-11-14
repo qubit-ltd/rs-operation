@@ -1,8 +1,18 @@
 //! Reserved, nonblocking ownership handoff for resource cleanup.
 
+use crate::v02::executor::CleanupExecutor;
+use std::sync::Arc;
+
 /// A type-erased cleanup action that owns the resource until it is run.
 pub(crate) trait CleanupJob: Send + 'static {
-    fn run(self: Box<Self>);
+    /// Schedules the owner on its appropriate bounded executor.
+    ///
+    /// On admission failure, returns the same job intact so the reserved
+    /// dispatch slot can keep it pending without dropping the resource.
+    fn schedule(
+        self: Box<Self>,
+        executor: Arc<CleanupExecutor>,
+    ) -> Result<(), Box<dyn CleanupJob>>;
 }
 
 /// Reserves bounded storage for one resource's eventual cleanup handoff.
