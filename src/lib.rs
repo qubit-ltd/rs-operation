@@ -11,17 +11,7 @@
 //! Typed operation lifecycles with bounded admission, scoped resources, and
 //! separate outcome and settlement reporting.
 
-mod internal;
-
-pub mod context;
-pub mod driver;
-pub mod operation;
-pub mod protocol;
-pub mod report;
-pub mod resource;
-pub mod scope;
-pub mod supervisor;
-pub mod v02;
+mod v02;
 
 pub use v02::context::{CleanupContext, DeadlineSignal, OperationContext, StopSignal};
 pub use v02::manager::core::{AsyncOperationManager, OperationManager};
@@ -37,12 +27,9 @@ pub use v02::protocol::{
 pub use v02::report::*;
 pub use v02::resource::{
     AsyncCleanup, AsyncRecoveryAttempt, CleanupFuture, CleanupOutcome, ManageResourceError,
-    ManageWithError, RecoveryAttempt, RecoveryStore, RecoveryStoreOptions,
-    RecoveryStoreShutdownHandle, ResourceCapacityError, ResourceCommitError,
-    ResourceCommitWithError, ResourceKey, ResourceRef, ResourceReservation, ResourceScope,
-    ServiceResourceScope,
+    ManageWithError, RecoveryAttempt, RecoveryHandle, RecoveryStore, RecoveryStoreOptions,
+    RecoveryStoreShutdownError, RecoveryStoreShutdownHandle, ResourceCapacityError,
+    ResourceCommitError, ResourceCommitWithError, ResourceKey, ResourceRef, ResourceReservation,
+    ResourceScope, ServiceResourceScope,
 };
 pub use v02::scope::OperationScope;
-
-#[cfg(test)]
-mod tests;
