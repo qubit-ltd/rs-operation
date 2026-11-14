@@ -101,3 +101,51 @@ fn async_manager_runs_a_non_clone_non_debug_result_and_settles_it() {
         .wait()
         .unwrap();
 }
+
+#[test]
+fn converting_to_observer_preserves_execution_but_dropping_handle_requests_stop() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = manager
+        .try_submit(OperationOptions::default(), move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    let observer = handle.observer();
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let observer_only = handle.into_observer();
+    assert!(observer.snapshot().stop.is_none());
+    release_tx.send(()).unwrap();
+    observer_only.wait_settlement().unwrap();
+    assert!(observer.snapshot().stop.is_none());
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = manager
+        .try_submit(OperationOptions::default(), move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    let observer = handle.observer();
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    drop(handle);
+    assert_eq!(
+        observer.snapshot().stop.unwrap().reason,
+        qubit_operation::StopReason::UserCancelled
+    );
+    release_tx.send(()).unwrap();
+    observer.wait_settlement().unwrap();
+    manager
+        .request_shutdown(ShutdownMode::Drain)
+        .wait()
+        .unwrap();
+}

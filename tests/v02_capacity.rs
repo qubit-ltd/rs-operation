@@ -39,7 +39,9 @@ fn a_parent_child_slot_stays_reserved_until_the_child_really_finishes() {
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let (rejection_tx, rejection_rx) = mpsc::channel();
-    let (observer_tx, observer_rx) = mpsc::channel();
+    let (child_handle_tx, child_handle_rx) = mpsc::channel();
+    let (continue_tx, continue_rx) = mpsc::channel();
+    let (followup_tx, followup_rx) = mpsc::channel();
     let mut parent = manager
         .try_submit(OperationOptions::default(), move |scope| {
             let child = scope
@@ -50,11 +52,21 @@ fn a_parent_child_slot_stays_reserved_until_the_child_really_finishes() {
                     Ok::<_, ()>(())
                 })
                 .unwrap();
-            observer_tx.send(child.observer()).unwrap();
+            child_handle_tx.send(child).unwrap();
             let rejected = scope
                 .manager()
                 .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()));
             rejection_tx.send(rejected.err().unwrap().reason()).unwrap();
+            continue_rx.recv().unwrap();
+            let followup = scope
+                .manager()
+                .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()))
+                .map_err(|error| error.reason())
+                .map(|mut handle| {
+                    let _ = handle.wait_outcome().unwrap();
+                    handle.wait_settlement().unwrap();
+                });
+            followup_tx.send(followup.is_ok()).unwrap();
             Ok::<_, ()>(())
         })
         .unwrap();
@@ -68,15 +80,27 @@ fn a_parent_child_slot_stays_reserved_until_the_child_really_finishes() {
             .unwrap(),
         AdmissionError::Busy
     );
-    let child_observer = observer_rx
+    let mut child = child_handle_rx
         .recv_timeout(std::time::Duration::from_secs(5))
         .unwrap();
+    let child_observer = child.observer();
     let before_release = child_observer.snapshot();
     assert!(
         before_release.stop.is_none(),
         "a Busy rejection must not stop the accepted child: {before_release:?}"
     );
     release_tx.send(()).unwrap();
+    assert!(matches!(
+        child.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    child.wait_settlement().unwrap();
+    continue_tx.send(()).unwrap();
+    assert!(
+        followup_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+    );
     let parent_outcome = parent.wait_outcome().unwrap();
     assert!(
         matches!(parent_outcome, OperationOutcome::Succeeded(())),

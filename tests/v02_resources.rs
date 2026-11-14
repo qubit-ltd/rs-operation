@@ -38,12 +38,13 @@ impl AsyncCleanup<usize> for GatedCleanup {
         let gate = self.0.clone();
         Box::pin(async move {
             gate.wait().await;
-            drop(resource);
+            let _ = resource;
             CleanupOutcome::Released
         })
     }
 }
 
+#[allow(dead_code, unused_imports)]
 #[path = "support/mod.rs"]
 mod support;
 
@@ -104,6 +105,44 @@ fn resource_ref_shares_mutex_protected_value() {
 }
 
 #[test]
+fn moving_scope_out_of_body_does_not_extend_its_authority() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let saved = Arc::new(std::sync::Mutex::new(None));
+    let saved_in_body = Arc::clone(&saved);
+    let mut operation = manager
+        .try_submit(OperationOptions::default(), move |scope| {
+            *saved_in_body.lock().unwrap() = Some(scope);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    operation.wait_settlement().unwrap();
+    let scope = saved.lock().unwrap().take().unwrap();
+    let error = match scope.manage(7usize) {
+        Ok(_) => panic!("ended scope unexpectedly accepted a resource"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        qubit_operation::ResourceManageErrorKind::ScopeEnded
+    );
+    let rejected = scope
+        .manager()
+        .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()));
+    assert!(matches!(
+        rejected,
+        Err(error) if error.reason() == qubit_operation::AdmissionError::ScopeEnded
+    ));
+    manager
+        .request_shutdown(ShutdownMode::Drain)
+        .wait()
+        .unwrap();
+}
+
+#[test]
 fn child_cleanup_keeps_parent_resource_until_its_last_parent_ref_is_released() {
     let drop_count = Arc::new(AtomicUsize::new(0));
     let drops = Arc::clone(&drop_count);
@@ -116,7 +155,7 @@ fn child_cleanup_keeps_parent_resource_until_its_last_parent_ref_is_released() {
             let parent_ref = scope.manage(probe).unwrap();
             let child_ref = parent_ref.clone();
             drop(parent_ref);
-            scope
+            let child = scope
                 .manager()
                 .try_submit(OperationOptions::default(), move |child_scope| {
                     let child_resources = child_scope
@@ -135,6 +174,7 @@ fn child_cleanup_keeps_parent_resource_until_its_last_parent_ref_is_released() {
                     Ok::<_, ()>(())
                 })
                 .unwrap();
+            let _child_observer = child.into_observer();
             Ok::<_, ()>(())
         })
         .unwrap();
@@ -173,7 +213,7 @@ fn unrelated_child_cleanup_does_not_delay_parent_resource_release() {
         .try_submit(OperationOptions::default(), move |scope| {
             let parent_ref = scope.manage(probe).unwrap();
             drop(parent_ref);
-            scope
+            let child = scope
                 .manager()
                 .try_submit(OperationOptions::default(), move |child_scope| {
                     let child_resources = child_scope
@@ -185,6 +225,7 @@ fn unrelated_child_cleanup_does_not_delay_parent_resource_release() {
                     Ok::<_, ()>(())
                 })
                 .unwrap();
+            let _child_observer = child.into_observer();
             Ok::<_, ()>(())
         })
         .unwrap();
