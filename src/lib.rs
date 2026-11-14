@@ -23,6 +23,7 @@ pub mod report;
 pub mod resource;
 pub mod scope;
 pub mod supervisor;
+pub mod v02;
 
 #[cfg(test)]
 mod tests;
