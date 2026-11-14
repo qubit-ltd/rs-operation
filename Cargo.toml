@@ -12,7 +12,7 @@ description = "Managed operation lifecycles and composition for Rust"
 readme = "README.md"
 keywords = ["operation", "lifecycle", "cancellation", "async", "composition"]
 categories = ["asynchronous", "concurrency", "rust-patterns"]
-include = ["/Cargo.toml", "/LICENSE", "/README.md", "/README.zh_CN.md", "/src/**", "/doc/**"]
+include = ["/Cargo.toml", "/LICENSE", "/README.md", "/README.zh_CN.md", "/src/**", "/doc/**", "/examples/**"]
 
 [lib]
 name = "qubit_operation"
