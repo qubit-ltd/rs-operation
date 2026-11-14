@@ -194,6 +194,7 @@ pub struct ContextOptions {
     pub budget: Option<Arc<dyn super::protocol::BudgetPolicy>>,
 }
 
+#[derive(Clone)]
 pub struct ManagerOptions {
     pub limits: ManagerLimits,
     pub scope_limits: ScopeLimits,

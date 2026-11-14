@@ -1,13 +1,14 @@
 //! Bounded, per-scope handoff queue for resource cleanup.
 #![allow(dead_code)] // The manager and scope assembly is completed by T11.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::{Context, Poll};
+use std::thread::{self, JoinHandle};
 
 use super::cleanup_port::{CleanupDispatch, CleanupDispatchPermit, CleanupJob, CleanupQueueError};
 use crate::v02::context::CleanupContext;
@@ -290,6 +291,101 @@ pub(crate) struct CleanupDispatcher {
     inner: Arc<CleanupDispatcherInner>,
 }
 
+/// Event-driven scheduler for pending per-scope dispatchers. The index is
+/// weak and contains only scopes with queued cleanup work.
+pub(crate) struct CleanupPump {
+    inner: Arc<CleanupPumpInner>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct CleanupPumpInner {
+    state: Mutex<CleanupPumpState>,
+    changed: Condvar,
+}
+
+struct CleanupPumpState {
+    stopping: bool,
+    signaled: bool,
+    next_id: u64,
+    dispatchers: HashMap<u64, Weak<CleanupDispatcherInner>>,
+}
+
+impl CleanupPump {
+    pub(crate) fn new() -> std::io::Result<Arc<Self>> {
+        let inner = Arc::new(CleanupPumpInner {
+            state: Mutex::new(CleanupPumpState {
+                stopping: false,
+                signaled: false,
+                next_id: 1,
+                dispatchers: HashMap::new(),
+            }),
+            changed: Condvar::new(),
+        });
+        let worker_inner = Arc::clone(&inner);
+        let worker = thread::Builder::new()
+            .name("qubit-operation-cleanup-pump".into())
+            .spawn(move || cleanup_pump_worker(worker_inner))?;
+        Ok(Arc::new(Self {
+            inner,
+            worker: Mutex::new(Some(worker)),
+        }))
+    }
+
+    fn register(&self, dispatcher: &Arc<CleanupDispatcherInner>) {
+        let mut registration = lock(&dispatcher.pump_registration);
+        if registration.is_some() {
+            return;
+        }
+        let id = {
+            let mut state = lock(&self.inner.state);
+            let id = state.next_id;
+            state.next_id = state.next_id.wrapping_add(1).max(1);
+            state.dispatchers.insert(id, Arc::downgrade(dispatcher));
+            id
+        };
+        *registration = Some(id);
+    }
+
+    fn unregister(&self, dispatcher: &Arc<CleanupDispatcherInner>) {
+        let id = lock(&dispatcher.pump_registration).take();
+        if let Some(id) = id {
+            lock(&self.inner.state).dispatchers.remove(&id);
+        }
+    }
+
+    pub(crate) fn kick(&self) {
+        let mut state = lock(&self.inner.state);
+        state.signaled = true;
+        drop(state);
+        self.inner.changed.notify_one();
+    }
+
+    pub(crate) fn shutdown(&self) {
+        {
+            let mut state = lock(&self.inner.state);
+            state.stopping = true;
+            state.signaled = true;
+        }
+        self.inner.changed.notify_all();
+        if let Some(worker) = lock(&self.worker).take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for CleanupPump {
+    fn drop(&mut self) {
+        {
+            let mut state = lock(&self.inner.state);
+            state.stopping = true;
+            state.signaled = true;
+        }
+        self.inner.changed.notify_all();
+        // Public manager Drop detaches this handle; explicit shutdown joins.
+        lock(&self.worker).take();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CleanupTransferError {
     Closed,
@@ -454,6 +550,8 @@ struct CleanupDispatcherInner {
     executor: Arc<CleanupExecutor>,
     state: Mutex<QueueState>,
     driver: Mutex<()>,
+    pump: Option<Arc<CleanupPump>>,
+    pump_registration: Mutex<Option<u64>>,
 }
 
 impl Drop for CleanupDispatcherInner {
@@ -467,6 +565,40 @@ impl Drop for CleanupDispatcherInner {
             // nonzero. Preserve owners if that lifetime invariant is broken.
             std::mem::forget(job);
         }
+        if let (Some(pump), Some(id)) = (&self.pump, *lock(&self.pump_registration)) {
+            lock(&pump.inner.state).dispatchers.remove(&id);
+        }
+    }
+}
+
+fn cleanup_pump_worker(inner: Arc<CleanupPumpInner>) {
+    loop {
+        let dispatchers = {
+            let mut state = lock(&inner.state);
+            while !state.signaled && !state.stopping {
+                state = inner
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            if state.stopping {
+                return;
+            }
+            state.signaled = false;
+            state
+                .dispatchers
+                .iter()
+                .map(|(id, dispatcher)| (*id, dispatcher.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        for (id, weak) in dispatchers {
+            if let Some(dispatcher) = weak.upgrade() {
+                CleanupDispatcher::drive_inner(&dispatcher, dispatcher.capacity);
+            } else {
+                lock(&inner.state).dispatchers.remove(&id);
+            }
+        }
     }
 }
 
@@ -474,6 +606,22 @@ impl CleanupDispatcher {
     pub(crate) fn new(
         scope_resource_capacity: usize,
         executor: Arc<CleanupExecutor>,
+    ) -> Result<Self, CleanupDispatcherError> {
+        Self::new_inner(scope_resource_capacity, executor, None)
+    }
+
+    pub(crate) fn new_with_pump(
+        scope_resource_capacity: usize,
+        executor: Arc<CleanupExecutor>,
+        pump: Arc<CleanupPump>,
+    ) -> Result<Self, CleanupDispatcherError> {
+        Self::new_inner(scope_resource_capacity, executor, Some(pump))
+    }
+
+    fn new_inner(
+        scope_resource_capacity: usize,
+        executor: Arc<CleanupExecutor>,
+        pump: Option<Arc<CleanupPump>>,
     ) -> Result<Self, CleanupDispatcherError> {
         if scope_resource_capacity == 0 {
             return Err(CleanupDispatcherError::ZeroCapacity);
@@ -488,6 +636,8 @@ impl CleanupDispatcher {
                     pending: VecDeque::with_capacity(scope_resource_capacity),
                 }),
                 driver: Mutex::new(()),
+                pump,
+                pump_registration: Mutex::new(None),
             }),
         })
     }
@@ -497,24 +647,33 @@ impl CleanupDispatcher {
     /// resource owner intact. T11 drives this method from manager progress and
     /// shutdown polling; the method never blocks or invokes user cleanup inline.
     pub(crate) fn drive(&self, limit: usize) -> usize {
-        let _driver = lock(&self.inner.driver);
+        Self::drive_inner(&self.inner, limit)
+    }
+
+    fn drive_inner(inner: &Arc<CleanupDispatcherInner>, limit: usize) -> usize {
+        let _driver = lock(&inner.driver);
         let mut scheduled = 0;
         while scheduled < limit {
-            let Some(job) = lock(&self.inner.state).pending.pop_front() else {
+            let Some(job) = lock(&inner.state).pending.pop_front() else {
                 break;
             };
-            match job.schedule(Arc::clone(&self.inner.executor)) {
+            match job.schedule(Arc::clone(&inner.executor)) {
                 Ok(()) => {
-                    let mut state = lock(&self.inner.state);
+                    let mut state = lock(&inner.state);
                     debug_assert!(state.reserved > 0);
                     state.reserved -= 1;
                     scheduled += 1;
                 }
                 Err(job) => {
-                    lock(&self.inner.state).pending.push_front(job);
+                    lock(&inner.state).pending.push_front(job);
                     break;
                 }
             }
+        }
+        if lock(&inner.state).pending.is_empty()
+            && let Some(pump) = &inner.pump
+        {
+            pump.unregister(inner);
         }
         scheduled
     }
@@ -562,11 +721,18 @@ struct DispatchPermit {
 
 impl CleanupDispatchPermit for DispatchPermit {
     fn enqueue(mut self: Box<Self>, job: Box<dyn CleanupJob>) {
-        let mut state = lock(&self.inner.state);
-        debug_assert!(self.active);
-        debug_assert!(state.pending.len() < self.inner.capacity);
-        state.pending.push_back(job);
-        self.active = false;
+        {
+            let mut state = lock(&self.inner.state);
+            debug_assert!(self.active);
+            debug_assert!(state.pending.len() < self.inner.capacity);
+            state.pending.push_back(job);
+            self.active = false;
+        }
+        if let Some(pump) = &self.inner.pump {
+            pump.register(&self.inner);
+            pump.kick();
+        }
+        CleanupDispatcher::drive_inner(&self.inner, self.inner.capacity);
     }
 }
 
@@ -704,7 +870,9 @@ mod tests {
             }
         });
         dispatcher.reserve().unwrap().enqueue(Box::new(job));
-        assert_eq!(dispatcher.drive(1), 1);
+        // Enqueue immediately kicks the dispatcher; the explicit drive sees
+        // no remaining pending work.
+        assert_eq!(dispatcher.drive(1), 0);
         drop_receive.recv_timeout(Duration::from_secs(1)).unwrap();
         let (evidence, thread_name) = complete_receive
             .recv_timeout(Duration::from_secs(1))
@@ -742,7 +910,7 @@ mod tests {
         dispatcher.close_admission();
         let (send, receive) = mpsc::channel();
         permit.enqueue(Box::new(DropOnSchedule(send)));
-        assert_eq!(dispatcher.drive(1), 1);
+        assert_eq!(dispatcher.drive(1), 0);
         assert!(receive.recv_timeout(Duration::from_secs(1)).is_ok());
     }
 

@@ -14,6 +14,12 @@ pub struct ResourceScope {
     state: Arc<ScopeState>,
 }
 impl ResourceScope {
+    pub(crate) fn id(&self) -> ResourceScopeId {
+        self.state.core.id
+    }
+    pub(crate) fn cleanup_in_flight(&self) -> usize {
+        self.state.cleanup_in_flight()
+    }
     pub(crate) fn new(
         manager: ManagerId,
         id: ResourceScopeId,

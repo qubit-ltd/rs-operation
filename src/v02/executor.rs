@@ -62,6 +62,7 @@ impl<F> SubmitFailure<F> {
 /// The owner of this executor calls `poll_once` from its own scheduling loop;
 /// no hidden thread is created. A task is only polled again after its waker is
 /// invoked. Reservations account for queued and currently-polled tasks.
+#[derive(Clone)]
 pub(crate) struct PortableExecutor {
     inner: Arc<PortableInner>,
 }
@@ -72,6 +73,8 @@ struct PortableInner {
     polls_per_turn: usize,
     pollers: Mutex<usize>,
     state: Mutex<PortableState>,
+    ready_available: Condvar,
+    capacity_callback: Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
 }
 
 struct PortableState {
@@ -109,8 +112,63 @@ impl PortableExecutor {
                     tasks: 0,
                     ready: VecDeque::new(),
                 }),
+                ready_available: Condvar::new(),
+                capacity_callback: Mutex::new(None),
             }),
         })
+    }
+
+    pub(crate) fn start_workers(
+        &self,
+        count: usize,
+        name: &'static str,
+    ) -> Result<Vec<JoinHandle<()>>, ExecutorCreateError> {
+        self.start_workers_with(count, |index, executor| {
+            let worker_name = format!("{name}-{index}");
+            thread::Builder::new()
+                .name(worker_name)
+                .spawn(move || executor.worker_loop())
+        })
+    }
+
+    fn start_workers_with(
+        &self,
+        count: usize,
+        mut spawn: impl FnMut(usize, PortableExecutor) -> std::io::Result<JoinHandle<()>>,
+    ) -> Result<Vec<JoinHandle<()>>, ExecutorCreateError> {
+        let mut workers = Vec::with_capacity(count);
+        for index in 0..count {
+            let executor = self.clone();
+            match spawn(index, executor) {
+                Ok(worker) => workers.push(worker),
+                Err(_) => {
+                    self.close_admission();
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(ExecutorCreateError::ThreadSpawn);
+                }
+            }
+        }
+        Ok(workers)
+    }
+
+    fn worker_loop(&self) {
+        loop {
+            let mut state = lock(&self.inner.state);
+            while state.ready.is_empty() && (state.accepting || state.tasks != 0) {
+                state = self
+                    .inner
+                    .ready_available
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            if state.ready.is_empty() && !state.accepting && state.tasks == 0 {
+                return;
+            }
+            drop(state);
+            self.poll_once();
+        }
     }
 
     pub(crate) fn reserve(&self) -> Result<PortablePermit, ExecutorError> {
@@ -168,6 +226,9 @@ impl PortableExecutor {
                     let mut state = lock(&inner.state);
                     state.ready.retain(|queued| !Arc::ptr_eq(queued, &task));
                     state.tasks -= 1;
+                    drop(state);
+                    inner.ready_available.notify_all();
+                    notify_capacity(&inner.capacity_callback);
                 }
             }
             return true;
@@ -183,6 +244,11 @@ impl PortableExecutor {
 
     pub(crate) fn close_admission(&self) {
         lock(&self.inner.state).accepting = false;
+        self.inner.ready_available.notify_all();
+    }
+
+    fn set_capacity_callback(&self, callback: Arc<dyn Fn() + Send + Sync + 'static>) {
+        *lock(&self.inner.capacity_callback) = Some(callback);
     }
 }
 
@@ -201,6 +267,8 @@ impl PortablePermit {
         });
         state.ready.push_back(Arc::clone(&task));
         self.active = false;
+        drop(state);
+        self.inner.ready_available.notify_one();
     }
 }
 
@@ -209,6 +277,9 @@ impl Drop for PortablePermit {
         if self.active {
             let mut state = lock(&self.inner.state);
             state.tasks -= 1;
+            drop(state);
+            self.inner.ready_available.notify_all();
+            notify_capacity(&self.inner.capacity_callback);
         }
     }
 }
@@ -237,6 +308,8 @@ impl PortableTask {
             self.queued.store(false, Ordering::Release);
         } else {
             state.ready.push_back(Arc::clone(self));
+            drop(state);
+            inner.ready_available.notify_one();
         }
     }
 }
@@ -279,6 +352,7 @@ struct PoolInner {
     changed: Condvar,
     join_lock: Mutex<()>,
     workers: Mutex<Vec<JoinHandle<()>>>,
+    capacity_callback: Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
 }
 
 struct PoolState {
@@ -310,6 +384,18 @@ pub(crate) enum ShutdownError {
 
 impl ThreadPoolExecutor {
     pub(crate) fn new(options: ThreadPoolExecutorOptions) -> Result<Self, ExecutorCreateError> {
+        Self::new_with_spawn(options, |id, index, worker_inner| {
+            let name = format!("qubit-operation-{id}-{index}");
+            thread::Builder::new()
+                .name(name)
+                .spawn(move || pool_worker(worker_inner))
+        })
+    }
+
+    fn new_with_spawn(
+        options: ThreadPoolExecutorOptions,
+        mut spawn: impl FnMut(u64, usize, Arc<PoolInner>) -> std::io::Result<JoinHandle<()>>,
+    ) -> Result<Self, ExecutorCreateError> {
         if options.worker_count == 0 || options.queue_capacity == 0 {
             return Err(ExecutorCreateError::InvalidOptions);
         }
@@ -330,23 +416,20 @@ impl ThreadPoolExecutor {
             changed: Condvar::new(),
             join_lock: Mutex::new(()),
             workers: Mutex::new(Vec::with_capacity(options.worker_count)),
+            capacity_callback: Mutex::new(None),
         });
         for index in 0..options.worker_count {
-            let worker_inner = Arc::clone(&inner);
-            let name = format!("qubit-operation-{id}-{index}");
-            let worker = thread::Builder::new()
-                .name(name)
-                .spawn(move || pool_worker(worker_inner))
-                .map_err(|_| {
-                    {
-                        let mut state = lock(&inner.state);
-                        state.accepting = false;
-                        state.stopping = true;
+            match spawn(id, index, Arc::clone(&inner)) {
+                Ok(worker) => lock(&inner.workers).push(worker),
+                Err(_) => {
+                    close_pool(&inner);
+                    let workers = std::mem::take(&mut *lock(&inner.workers));
+                    for worker in workers {
+                        let _ = worker.join();
                     }
-                    inner.work_available.notify_all();
-                    ExecutorCreateError::ThreadSpawn
-                })?;
-            lock(&inner.workers).push(worker);
+                    return Err(ExecutorCreateError::ThreadSpawn);
+                }
+            }
         }
         Ok(Self { inner })
     }
@@ -412,6 +495,19 @@ impl CleanupExecutor {
         self.asynchronous.reserve()
     }
 
+    pub(crate) fn start_async_workers(
+        &self,
+        count: usize,
+        name: &'static str,
+    ) -> Result<Vec<JoinHandle<()>>, ExecutorCreateError> {
+        self.asynchronous.start_workers(count, name)
+    }
+
+    pub(crate) fn set_capacity_callback(&self, callback: Arc<dyn Fn() + Send + Sync + 'static>) {
+        *lock(&self.blocking.inner.capacity_callback) = Some(Arc::clone(&callback));
+        self.asynchronous.set_capacity_callback(callback);
+    }
+
     /// Advances one scheduled asynchronous cleanup future.
     pub(crate) fn poll_async_once(&self) -> bool {
         self.asynchronous.poll_once()
@@ -469,6 +565,7 @@ impl Drop for ThreadPoolPermit {
             drop(state);
             self.inner.changed.notify_all();
             self.inner.work_available.notify_all();
+            notify_capacity(&self.inner.capacity_callback);
         }
     }
 }
@@ -544,6 +641,7 @@ fn pool_worker(inner: Arc<PoolInner>) {
         drop(state);
         inner.changed.notify_all();
         inner.work_available.notify_all();
+        notify_capacity(&inner.capacity_callback);
     }
     CURRENT_POOL_ID.with(|current| current.set(0));
 }
@@ -552,6 +650,13 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn notify_capacity(callback: &Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>) {
+    let callback = lock(callback).as_ref().map(Arc::clone);
+    if let Some(callback) = callback {
+        callback();
+    }
 }
 
 #[cfg(test)]
@@ -776,6 +881,48 @@ mod tests {
             Err(ShutdownError::WouldDeadlock)
         );
         shutdown.wait().unwrap();
+    }
+
+    #[test]
+    fn portable_worker_spawn_failure_joins_started_workers() {
+        let executor = PortableExecutor::new(PortableExecutorOptions {
+            worker_count: 2,
+            task_capacity: 2,
+            polls_per_turn: 1,
+        })
+        .unwrap();
+        let exited = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&exited);
+        let result = executor.start_workers_with(2, move |index, executor| {
+            if index == 1 {
+                return Err(std::io::Error::other("injected spawn failure"));
+            }
+            let exited = Arc::clone(&observed);
+            Ok(thread::spawn(move || {
+                executor.worker_loop();
+                exited.fetch_add(1, Ordering::SeqCst);
+            }))
+        });
+        assert_eq!(result.unwrap_err(), ExecutorCreateError::ThreadSpawn);
+        assert_eq!(exited.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn thread_pool_worker_spawn_failure_joins_started_workers() {
+        let exited = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&exited);
+        let result = ThreadPoolExecutor::new_with_spawn(options(2, 1), move |_, index, inner| {
+            if index == 1 {
+                return Err(std::io::Error::other("injected spawn failure"));
+            }
+            let exited = Arc::clone(&observed);
+            Ok(thread::spawn(move || {
+                pool_worker(inner);
+                exited.fetch_add(1, Ordering::SeqCst);
+            }))
+        });
+        assert!(matches!(result, Err(ExecutorCreateError::ThreadSpawn)));
+        assert_eq!(exited.load(Ordering::SeqCst), 1);
     }
 
     #[test]

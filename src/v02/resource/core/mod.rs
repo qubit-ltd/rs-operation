@@ -140,6 +140,7 @@ impl<T: Send + Sync + 'static> Owner<T> {
         )>,
     ) {
         if let Some((value, registration, permit, resource_id, completion)) = ready {
+            completion.start();
             permit.enqueue(Box::new(DefaultDropJob {
                 value: Some(value),
                 registration: Some(registration),
@@ -157,6 +158,7 @@ pub(super) struct ScopeCompletion {
 
 struct ScopeCompletionState {
     expected: Option<usize>,
+    started: usize,
     completed: usize,
     seen: HashSet<ResourceId>,
     resources: Vec<ResourceCleanupReport>,
@@ -173,6 +175,7 @@ impl ScopeCompletion {
         Arc::new(Self {
             state: Mutex::new(ScopeCompletionState {
                 expected: None,
+                started: 0,
                 completed: 0,
                 seen: HashSet::new(),
                 resources: Vec::new(),
@@ -220,6 +223,16 @@ impl ScopeCompletion {
             state.transfers_truncated = true;
         }
         true
+    }
+
+    fn start(&self) {
+        let mut state = lock(&self.state);
+        state.started = state.started.saturating_add(1);
+    }
+
+    fn cleaning(&self) -> usize {
+        let state = lock(&self.state);
+        state.started.saturating_sub(state.completed)
     }
 
     fn seal(&self, expected: usize) {
@@ -532,6 +545,10 @@ impl ScopeState {
 
     pub(super) fn record_transfer(&self, receipt: TransferReceipt) -> bool {
         self.completion.record_transfer(receipt)
+    }
+
+    pub(super) fn cleanup_in_flight(&self) -> usize {
+        self.completion.cleaning()
     }
 
     pub(super) fn end(&self) {

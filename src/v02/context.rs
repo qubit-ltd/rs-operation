@@ -69,6 +69,17 @@ pub struct OperationContext {
     policies: Vec<Arc<dyn BudgetPolicy>>,
 }
 
+impl Clone for OperationContext {
+    fn clone(&self) -> Self {
+        Self {
+            node: Arc::clone(&self.node),
+            clock: self.clock.clone(),
+            deadline: self.deadline,
+            policies: self.policies.clone(),
+        }
+    }
+}
+
 impl OperationContext {
     /// Constructs a root context after validating its clock and deadline.
     pub fn new(options: ContextOptions) -> Result<Self, ContextError> {
@@ -141,6 +152,10 @@ impl OperationContext {
     /// Returns the effective deadline inherited from this context's ancestry.
     pub const fn deadline(&self) -> Option<Deadline> {
         self.deadline
+    }
+
+    pub(crate) fn clock_source(&self) -> Option<Arc<dyn ClockSource>> {
+        self.clock.clone()
     }
 
     /// Returns true when the configured clock has reached this context's deadline.

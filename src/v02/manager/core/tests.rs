@@ -81,16 +81,21 @@ impl SubmissionLease for NoopLease {
 impl SubmissionPort for WaitPort {
     fn reserve(
         &self,
-        _parent: Option<&super::ScopeCore>,
-        _options: &OperationOptions,
+        scope_id: crate::v02::report::OperationId,
+        _execution: super::ExecutionKind,
+        parent: Option<&super::ScopeCore>,
+        options: &OperationOptions,
     ) -> Result<SubmissionReservation, AdmissionError> {
         self.attempts.fetch_add(1, Ordering::SeqCst);
         if !self.ready.load(Ordering::Acquire) {
             return Err(AdmissionError::Busy);
         }
+        let (capacity, resource_scope) = super::test_resources(scope_id, parent, options);
         Ok(SubmissionReservation {
             execution: Box::new(InlinePermit),
             lifecycle: Arc::new(NoopLease),
+            capacity,
+            resource_scope,
         })
     }
 
@@ -194,14 +199,20 @@ fn async_submit_parent_close_and_stop_interrupt_wait_and_preserve_body() {
     for stop in [false, true] {
         let port = Arc::new(WaitPort::new());
         let (core, _) = wait_test_manager(Arc::clone(&port));
+        let id = crate::v02::report::OperationId::new_unique();
+        let options = crate::v02::report::OperationOptions::default();
+        let (capacity, resource_scope) = super::test_resources(id, None, &options);
         let parent = super::ScopeCore::new(
-            crate::v02::report::OperationId::new_unique(),
+            id,
             Arc::downgrade(&core),
             None,
             None,
             crate::v02::context::OperationContext::new(ContextOptions::default()).unwrap(),
-            crate::v02::report::OperationOptions::default(),
+            options,
             8,
+            capacity,
+            resource_scope,
+            None,
         );
         let child_manager = OperationManager::bound(Arc::clone(&core), &parent);
         let async_child_manager = child_manager.as_async();
@@ -532,12 +543,17 @@ struct CountingLease(Arc<LeaseCounts>);
 impl SubmissionPort for SingleWorkerPort {
     fn reserve(
         &self,
-        _parent: Option<&super::ScopeCore>,
-        _options: &OperationOptions,
+        scope_id: crate::v02::report::OperationId,
+        _execution: super::ExecutionKind,
+        parent: Option<&super::ScopeCore>,
+        options: &OperationOptions,
     ) -> Result<SubmissionReservation, AdmissionError> {
+        let (capacity, resource_scope) = super::test_resources(scope_id, parent, options);
         Ok(SubmissionReservation {
             execution: Box::new(SingleWorkerPermit(self.0.clone())),
             lifecycle: Arc::new(CountingLease(Arc::clone(&self.1))),
+            capacity,
+            resource_scope,
         })
     }
 

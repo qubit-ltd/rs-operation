@@ -2,6 +2,7 @@
 
 use crate::v02::context::OperationContext;
 use crate::v02::internal::notify::Notify;
+use crate::v02::manager::capacity::ScopeCapacity;
 use crate::v02::manager::core::{ManagerCore, OperationManager};
 use crate::v02::report::{
     ChildFailurePolicy, ChildFailureSummary, ChildOutcomeKind, ChildOutcomeSummary,
@@ -21,6 +22,9 @@ pub(crate) struct ScopeCore {
     context: OperationContext,
     options: OperationOptions,
     diagnostic_limit: usize,
+    capacity: Arc<ScopeCapacity>,
+    resource_scope: crate::v02::resource::ResourceScope,
+    group: Option<Arc<crate::v02::manager::group::GroupCore>>,
     children_changed: Notify,
     state: Mutex<ScopeState>,
 }
@@ -74,8 +78,11 @@ impl ScopeCore {
         context: OperationContext,
         options: OperationOptions,
         diagnostic_limit: usize,
+        capacity: Arc<ScopeCapacity>,
+        resource_scope: crate::v02::resource::ResourceScope,
+        group: Option<Arc<crate::v02::manager::group::GroupCore>>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let core = Arc::new(Self {
             id,
             manager,
             parent,
@@ -83,6 +90,9 @@ impl ScopeCore {
             context,
             options,
             diagnostic_limit,
+            capacity,
+            resource_scope: resource_scope.internal_clone(),
+            group,
             children_changed: Notify::new(),
             state: Mutex::new(ScopeState {
                 open: true,
@@ -110,7 +120,9 @@ impl ScopeCore {
                 body_finished: false,
                 outcome_callback: None,
             }),
-        })
+        });
+        let _ = core.attach_resource_scope(resource_scope);
+        core
     }
 
     pub(crate) fn id(&self) -> OperationId {
@@ -135,6 +147,22 @@ impl ScopeCore {
 
     pub(crate) fn options(&self) -> &OperationOptions {
         &self.options
+    }
+
+    pub(crate) fn capacity(&self) -> &Arc<ScopeCapacity> {
+        &self.capacity
+    }
+
+    pub(crate) fn cleanup_in_flight(&self) -> usize {
+        self.resource_scope.cleanup_in_flight()
+    }
+
+    pub(crate) fn group(&self) -> Option<&Arc<crate::v02::manager::group::GroupCore>> {
+        self.group.as_ref()
+    }
+
+    pub(crate) fn resource_scope(&self) -> &crate::v02::resource::ResourceScope {
+        &self.resource_scope
     }
 
     pub(crate) fn mark_child(
@@ -629,6 +657,11 @@ impl OperationScope {
         self.core.id
     }
 
+    /// Returns the operation's shared cancellation, clock, and budget context.
+    pub fn context(&self) -> OperationContext {
+        self.core.context().clone()
+    }
+
     /// Creates an owned manager view bound to this operation's direct children.
     pub fn manager(&self) -> OperationManager {
         let manager = self
@@ -637,6 +670,28 @@ impl OperationScope {
             .upgrade()
             .unwrap_or_else(|| Arc::clone(&self.manager));
         OperationManager::bound(manager, &self.core)
+    }
+
+    /// Returns the business resource scope attached to this execution frame.
+    pub fn resource_scope(&self) -> crate::v02::resource::ResourceScope {
+        self.core.resource_scope().internal_clone()
+    }
+
+    /// Registers a resource in this operation's real cleanup scope.
+    pub fn manage<T: Send + Sync + 'static>(
+        &self,
+        resource: T,
+    ) -> Result<crate::v02::resource::ResourceRef<T>, crate::v02::resource::ManageResourceError<T>>
+    {
+        self.core.resource_scope().manage(resource)
+    }
+
+    /// Looks up a resource while the attached scope remains open.
+    pub fn get_resource<T: Send + Sync + 'static>(
+        &self,
+        key: crate::v02::resource::ResourceKey<T>,
+    ) -> Result<crate::v02::resource::ResourceRef<T>, crate::v02::report::ResourceLookupError> {
+        self.core.resource_scope().get_resource(key)
     }
 
     /// Requests stop for this scope and propagates it to descendants.
@@ -806,10 +861,11 @@ mod lifecycle_tests {
         let manager_id = ManagerId::new_unique();
         let manager = ManagerCapacityPools::new(ManagerLimits::default());
         let capacity = ScopeCapacity::root(&manager, 1, ScopeLimits::default());
+        let capacity = Arc::new(capacity);
         let resources = crate::v02::resource::ResourceScope::new(
             manager_id,
             ResourceScopeId::new_unique(),
-            Arc::new(capacity),
+            Arc::clone(&capacity),
             Arc::new(NoCleanup),
         );
         let context = OperationContext::new(ContextOptions::default()).unwrap();
@@ -821,8 +877,10 @@ mod lifecycle_tests {
             context,
             OperationOptions::default(),
             8,
+            capacity,
+            resources.internal_clone(),
+            None,
         );
-        assert!(scope.attach_resource_scope(resources).is_ok());
         assert!(!scope.settlement_ready());
         scope.end();
         assert!(scope.settlement_ready());

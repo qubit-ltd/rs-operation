@@ -1,29 +1,34 @@
 //! Shared admission and operation-tree coordination for manager views.
 
 use crate::v02::context::OperationContext;
+use crate::v02::manager::capacity::ScopeCapacity;
 use crate::v02::operation::OutcomeDelivery;
 use crate::v02::operation::{
     AsyncOperationHandle, OperationCore, OperationHandle, OutcomeSlot, StopControl,
 };
 use crate::v02::report::{
-    AdmissionError, ChildOutcomeKind, ChildOutcomeSummary, ContextError, ContextOptions,
-    DiagnosticSummary, ExecutionPhase, OperationId, OperationOptions, OperationOutcome,
-    PanicSummary, ScopeLimits, SettlementReport, SettlementStatus, StopReason, SubmitError,
+    AdmissionError, ChildOutcomeKind, ChildOutcomeSummary, ContextError, DiagnosticSummary,
+    ExecutionPhase, OperationId, OperationOptions, OperationOutcome, PanicSummary, ScopeLimits,
+    SettlementReport, SettlementStatus, StopReason, SubmitError,
 };
+use crate::v02::resource::ResourceScope;
 use crate::v02::scope::{ExecutionFrameGuard, OperationScope, ScopeCore};
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::task::Poll;
 
 /// The immutable submission location carried by manager views.
 #[derive(Clone)]
 pub(crate) enum SubmissionTarget {
-    Root,
+    Root {
+        group: Option<Arc<super::group::GroupCore>>,
+    },
     Parent {
         id: OperationId,
         scope: Weak<ScopeCore>,
+        group: Option<Arc<super::group::GroupCore>>,
     },
 }
 
@@ -43,6 +48,14 @@ pub(crate) trait SubmissionLease: Send + Sync + 'static {
 pub(crate) struct SubmissionReservation {
     pub(crate) execution: Box<dyn SubmissionPermit>,
     pub(crate) lifecycle: Arc<dyn SubmissionLease>,
+    pub(crate) capacity: Arc<ScopeCapacity>,
+    pub(crate) resource_scope: ResourceScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecutionKind {
+    Sync,
+    Async,
 }
 
 /// A sync closure or async future whose frame guard ends only on completion/drop.
@@ -55,6 +68,8 @@ pub(crate) enum OperationJob {
 pub(crate) trait SubmissionPort: Send + Sync + 'static {
     fn reserve(
         &self,
+        scope_id: OperationId,
+        execution: ExecutionKind,
         parent: Option<&ScopeCore>,
         options: &OperationOptions,
     ) -> Result<SubmissionReservation, AdmissionError>;
@@ -67,6 +82,15 @@ pub(crate) trait SubmissionPort: Send + Sync + 'static {
         parent: Option<Arc<ScopeCore>>,
         options: OperationOptions,
     ) -> Pin<Box<dyn Future<Output = Result<(), AdmissionError>> + Send + 'a>>;
+
+    fn phase_changed(&self, _phase: ManagerPhase) {}
+    fn finish_shutdown(&self) {}
+    fn service_resource_scope(
+        &self,
+        _capacity: usize,
+    ) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
+        Err(crate::v02::report::ResourceScopeError::InvalidOptions)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +103,8 @@ pub(crate) enum ManagerPhase {
 
 struct ManagerState {
     phase: ManagerPhase,
+    active_scopes: std::collections::HashMap<OperationId, Weak<ScopeCore>>,
+    service_scopes: std::collections::HashMap<crate::v02::report::ResourceScopeId, ResourceScope>,
     #[cfg(test)]
     relationships: Vec<(OperationId, Option<OperationId>)>,
     #[cfg(test)]
@@ -88,6 +114,8 @@ struct ManagerState {
 /// State shared by all sync and async manager views.
 pub(crate) struct ManagerCore {
     state: Mutex<ManagerState>,
+    shutdown_changed: Condvar,
+    shutdown_notify: crate::v02::internal::notify::Notify,
     port: Arc<dyn SubmissionPort>,
     root_context: Arc<OperationContext>,
     scope_limits: ScopeLimits,
@@ -113,11 +141,15 @@ impl ManagerCore {
         Arc::new(Self {
             state: Mutex::new(ManagerState {
                 phase: ManagerPhase::Open,
+                active_scopes: std::collections::HashMap::new(),
+                service_scopes: std::collections::HashMap::new(),
                 #[cfg(test)]
                 relationships: Vec::new(),
                 #[cfg(test)]
                 values: Vec::new(),
             }),
+            shutdown_changed: Condvar::new(),
+            shutdown_notify: crate::v02::internal::notify::Notify::new(),
             port,
             root_context: Arc::new(root_context),
             scope_limits,
@@ -128,7 +160,7 @@ impl ManagerCore {
     pub(crate) fn root_view(self: &Arc<Self>) -> OperationManager {
         OperationManager {
             core: Arc::clone(self),
-            target: SubmissionTarget::Root,
+            target: SubmissionTarget::Root { group: None },
         }
     }
 
@@ -138,6 +170,7 @@ impl ManagerCore {
             target: SubmissionTarget::Parent {
                 id: scope.id(),
                 scope: Arc::downgrade(scope),
+                group: scope.group().cloned(),
             },
         }
     }
@@ -146,14 +179,15 @@ impl ManagerCore {
         self: &Arc<Self>,
         target: &SubmissionTarget,
         mut options: OperationOptions,
+        execution: ExecutionKind,
         body: F,
     ) -> Result<(F, OperationId, Arc<ScopeCore>, SubmissionReservation), SubmitError<F>>
     where
         F: Send + 'static,
     {
-        let parent = match target {
-            SubmissionTarget::Root => None,
-            SubmissionTarget::Parent { id, scope } => {
+        let (parent, group) = match target {
+            SubmissionTarget::Root { group } => (None, group.as_ref()),
+            SubmissionTarget::Parent { id, scope, group } => {
                 let Some(scope) = scope.upgrade() else {
                     return Err(SubmitError::new(AdmissionError::ScopeEnded, body));
                 };
@@ -163,8 +197,15 @@ impl ManagerCore {
                 if let Err(error) = scope.context().check() {
                     return Err(SubmitError::new(map_context_error(error), body));
                 }
-                Some((*id, scope))
+                (Some((*id, scope)), group.as_ref())
             }
+        };
+        let group_permit = match group {
+            Some(group) => match group.reserve(parent.is_some()) {
+                Ok(permit) => Some(permit),
+                Err(reason) => return Err(SubmitError::new(reason, body)),
+            },
+            None => None,
         };
         if options.limits == ScopeLimits::default() {
             options.limits = self.scope_limits;
@@ -181,14 +222,16 @@ impl ManagerCore {
             return Err(SubmitError::new(map_context_error(error), body));
         }
         let parent_id = parent.as_ref().map(|(id, _)| *id);
-        let permit = match self
-            .port
-            .reserve(parent.as_ref().map(|(_, scope)| scope.as_ref()), &options)
-        {
+        let id = OperationId::new_unique();
+        let permit = match self.port.reserve(
+            id,
+            execution,
+            parent.as_ref().map(|(_, scope)| scope.as_ref()),
+            &options,
+        ) {
             Ok(permit) => permit,
             Err(reason) => return Err(SubmitError::new(reason, body)),
         };
-        let id = OperationId::new_unique();
         let scope_core = ScopeCore::new(
             id,
             Arc::downgrade(self),
@@ -197,6 +240,9 @@ impl ManagerCore {
             context,
             options,
             self.diagnostic_limit,
+            Arc::clone(&permit.capacity),
+            permit.resource_scope.internal_clone(),
+            group.cloned(),
         );
         {
             let mut state = lock(&self.state);
@@ -217,6 +263,12 @@ impl ManagerCore {
                     body,
                 ));
             }
+            if let Some(group) = group
+                && !group.register_scope(id, Arc::downgrade(&scope_core))
+            {
+                drop(state);
+                return Err(SubmitError::new(AdmissionError::Stopped, body));
+            }
             if let Some((_, parent_scope)) = parent.as_ref()
                 && !parent_scope.mark_child(
                     id,
@@ -224,11 +276,22 @@ impl ManagerCore {
                     scope_core.options().requirement,
                 )
             {
+                if let Some(group) = group {
+                    group.unregister_scope(id);
+                }
                 drop(state);
                 return Err(SubmitError::new(AdmissionError::ScopeEnded, body));
             }
+            state.active_scopes.insert(id, Arc::downgrade(&scope_core));
             #[cfg(test)]
             state.relationships.push((id, parent_id));
+        }
+        let mut permit = permit;
+        if let Some(group_permit) = group_permit {
+            permit.lifecycle = Arc::new(super::group::GroupLease::new(
+                Arc::clone(&permit.lifecycle),
+                group_permit,
+            ));
         }
         Ok((body, id, scope_core, permit))
     }
@@ -242,7 +305,8 @@ impl ManagerCore {
     where
         F: FnOnce(OperationScope) + Send + 'static,
     {
-        let (body, id, scope_core, permit) = self.reserve_scope(target, options, body)?;
+        let (body, id, scope_core, permit) =
+            self.reserve_scope(target, options, ExecutionKind::Sync, body)?;
         let core = Arc::clone(self);
         permit
             .execution
@@ -264,7 +328,8 @@ impl ManagerCore {
         F: FnOnce(OperationScope) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let (body, id, scope_core, permit) = self.reserve_scope(target, options, body)?;
+        let (body, id, scope_core, permit) =
+            self.reserve_scope(target, options, ExecutionKind::Async, body)?;
         let core = Arc::clone(self);
         let scope = OperationScope::new(Arc::clone(&scope_core), core);
         let future = async move {
@@ -347,7 +412,195 @@ impl ManagerCore {
                     parent.record_child_settlement(operation_id, report);
                 }
             }
+            let mut state = lock(&manager.state);
+            state.active_scopes.remove(&operation_id);
+            drop(state);
+            if let Some(group) = scope_for_callback.group() {
+                group.settlement_finished(operation_id);
+            }
+            manager.shutdown_changed.notify_all();
+            manager.shutdown_notify.notify_waiters();
         });
+    }
+
+    pub(crate) fn request_shutdown(&self, mode: crate::v02::report::ShutdownMode) -> ManagerPhase {
+        let (phase, scopes, services) = {
+            let mut state = lock(&self.state);
+            match (state.phase, mode) {
+                (ManagerPhase::Open, crate::v02::report::ShutdownMode::Drain) => {
+                    state.phase = ManagerPhase::Draining;
+                }
+                (
+                    ManagerPhase::Open | ManagerPhase::Draining,
+                    crate::v02::report::ShutdownMode::Cancel,
+                ) => {
+                    state.phase = ManagerPhase::Cancelling;
+                }
+                _ => {}
+            }
+            let scopes = if state.phase == ManagerPhase::Cancelling {
+                state
+                    .active_scopes
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let services = state
+                .service_scopes
+                .values()
+                .map(ResourceScope::internal_clone)
+                .collect::<Vec<_>>();
+            (state.phase, scopes, services)
+        };
+        self.port.phase_changed(phase);
+        if phase == ManagerPhase::Cancelling {
+            for scope in scopes {
+                scope.request_stop(StopReason::ManagerShutdown);
+            }
+        }
+        for service in services {
+            service.end();
+        }
+        phase
+    }
+
+    pub(crate) fn phase(&self) -> ManagerPhase {
+        lock(&self.state).phase
+    }
+
+    pub(crate) fn clock(&self) -> Option<Arc<dyn crate::v02::protocol::ClockSource>> {
+        self.root_context.clock_source()
+    }
+
+    pub(crate) fn active_scope_count(&self) -> usize {
+        lock(&self.state).active_scopes.len()
+    }
+
+    pub(crate) fn finish_shutdown(&self) {
+        let is_empty = {
+            let state = lock(&self.state);
+            state.active_scopes.is_empty() && state.service_scopes.is_empty()
+        };
+        if is_empty {
+            self.port.finish_shutdown();
+            lock(&self.state).phase = ManagerPhase::Closed;
+        }
+    }
+
+    pub(crate) fn service_resource_scope(
+        self: &Arc<Self>,
+        capacity: usize,
+        group: Option<Arc<super::group::GroupCore>>,
+    ) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
+        let scope = self.port.service_resource_scope(capacity)?;
+        let id = scope.id();
+        let manager = Arc::downgrade(self);
+        let group_callback = group.clone();
+        scope.set_settlement_callback(Box::new(move |_| {
+            let removed = if let Some(manager) = manager.upgrade() {
+                let removed = lock(&manager.state).service_scopes.remove(&id);
+                manager.shutdown_changed.notify_all();
+                manager.shutdown_notify.notify_waiters();
+                removed
+            } else {
+                None
+            };
+            if let Some(group) = group_callback {
+                group.service_finished(id);
+            }
+            drop(removed);
+        }));
+        {
+            let mut state = lock(&self.state);
+            if state.phase != ManagerPhase::Open {
+                drop(state);
+                scope.end();
+                return Err(crate::v02::report::ResourceScopeError::ScopeEnded);
+            }
+            state.service_scopes.insert(id, scope.internal_clone());
+        }
+        if let Some(group) = group {
+            if !group.register_service(scope.internal_clone()) {
+                scope.end();
+                return Err(crate::v02::report::ResourceScopeError::ScopeEnded);
+            }
+        }
+        Ok(scope)
+    }
+
+    pub(crate) fn shutdown_wait_for(&self, timeout: std::time::Duration) -> bool {
+        let until = std::time::Instant::now() + timeout;
+        let mut state = lock(&self.state);
+        while !state.active_scopes.is_empty() || !state.service_scopes.is_empty() {
+            let now = std::time::Instant::now();
+            if now >= until {
+                return false;
+            }
+            let (next, result) = self
+                .shutdown_changed
+                .wait_timeout(state, until.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if result.timed_out()
+                && (!state.active_scopes.is_empty() || !state.service_scopes.is_empty())
+            {
+                return false;
+            }
+        }
+        drop(state);
+        self.finish_shutdown();
+        true
+    }
+
+    pub(crate) async fn shutdown_wait(&self) {
+        loop {
+            if self.is_shutdown_empty() {
+                self.finish_shutdown();
+                return;
+            }
+            let changed = self.shutdown_notify.notified();
+            if self.is_shutdown_empty() {
+                continue;
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn is_shutdown_empty(&self) -> bool {
+        let state = lock(&self.state);
+        state.active_scopes.is_empty() && state.service_scopes.is_empty()
+    }
+
+    pub(crate) fn service_scope_count(&self) -> usize {
+        lock(&self.state).service_scopes.len()
+    }
+
+    pub(crate) fn cleaning_resource_count(&self) -> usize {
+        let (operations, services) = {
+            let state = lock(&self.state);
+            (
+                state
+                    .active_scopes
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .collect::<Vec<_>>(),
+                state
+                    .service_scopes
+                    .values()
+                    .map(ResourceScope::internal_clone)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        operations
+            .iter()
+            .map(|scope| scope.cleanup_in_flight())
+            .sum::<usize>()
+            + services
+                .iter()
+                .map(ResourceScope::cleanup_in_flight)
+                .sum::<usize>()
     }
 
     async fn wait_for_retry_capacity(
@@ -399,7 +652,7 @@ impl ManagerCore {
     ) -> (Arc<Self>, OperationManager) {
         let core = Self::new_with_diagnostic_limit(
             Arc::new(TestPort),
-            OperationContext::new(ContextOptions::default()).unwrap(),
+            OperationContext::new(crate::v02::report::ContextOptions::default()).unwrap(),
             ScopeLimits::default(),
             diagnostic_limit,
         );
@@ -415,8 +668,67 @@ pub struct OperationManager {
     target: SubmissionTarget,
 }
 impl OperationManager {
+    /// Constructs a manager with real bounded executors and resource cleanup.
+    pub fn new(
+        options: crate::v02::report::ManagerOptions,
+    ) -> Result<Self, crate::v02::report::ManagerCreateError> {
+        super::production::new_sync(options)
+    }
+
+    pub fn close_admission(&self) {
+        self.core
+            .request_shutdown(crate::v02::report::ShutdownMode::Drain);
+    }
+
+    pub fn request_shutdown(
+        &self,
+        mode: crate::v02::report::ShutdownMode,
+    ) -> crate::v02::manager::shutdown::ShutdownHandle {
+        self.core.request_shutdown(mode);
+        crate::v02::manager::shutdown::ShutdownHandle::new(Arc::clone(&self.core))
+    }
+
+    pub fn group(
+        &self,
+        options: crate::v02::report::GroupOptions,
+    ) -> Result<super::group::OperationGroup, crate::v02::report::ManagerCreateError> {
+        super::group::OperationGroup::new(self.clone(), options)
+    }
+
+    pub(crate) fn service_resource_scope(
+        &self,
+        capacity: usize,
+    ) -> Result<
+        crate::v02::resource::service::ServiceResourceScope,
+        crate::v02::report::ResourceScopeError,
+    > {
+        self.core
+            .service_resource_scope(
+                capacity,
+                match &self.target {
+                    SubmissionTarget::Root { group } | SubmissionTarget::Parent { group, .. } => {
+                        group.clone()
+                    }
+                },
+            )
+            .map(crate::v02::resource::service::ServiceResourceScope::new)
+    }
+
     pub(crate) fn bound(core: Arc<ManagerCore>, scope: &Arc<ScopeCore>) -> Self {
         core.bound(scope)
+    }
+
+    pub(crate) fn with_group(mut self, group: Arc<super::group::GroupCore>) -> Self {
+        match &mut self.target {
+            SubmissionTarget::Root {
+                group: target_group,
+            } => *target_group = Some(group),
+            SubmissionTarget::Parent {
+                group: target_group,
+                ..
+            } => *target_group = Some(group),
+        }
+        self
     }
 
     /// Returns a sync view with the same fixed submission target.
@@ -432,7 +744,7 @@ impl OperationManager {
         }
     }
 
-    pub(crate) fn submit<T, E, F>(
+    pub fn submit<T, E, F>(
         &self,
         options: OperationOptions,
         body: F,
@@ -471,7 +783,7 @@ impl OperationManager {
     }
 
     /// Submits a body through the shared operation-tree coordinator.
-    pub(crate) fn try_submit<T, E, F>(
+    pub fn try_submit<T, E, F>(
         &self,
         options: OperationOptions,
         body: F,
@@ -521,7 +833,10 @@ impl OperationManager {
             scope_core.mark_body_finished();
         };
         let (runner, id, scope, reservation) =
-            match self.core.reserve_scope(&self.target, options, runner) {
+            match self
+                .core
+                .reserve_scope(&self.target, options, ExecutionKind::Sync, runner)
+            {
                 Ok(result) => result,
                 Err(error) => {
                     let (reason, _runner) = error.into_parts();
@@ -605,6 +920,24 @@ pub struct AsyncOperationManager {
     target: SubmissionTarget,
 }
 impl AsyncOperationManager {
+    /// Constructs an async view with real bounded executors and cleanup.
+    pub fn new(
+        options: crate::v02::report::ManagerOptions,
+    ) -> Result<Self, crate::v02::report::ManagerCreateError> {
+        super::production::new_async(options)
+    }
+
+    pub fn close_admission(&self) {
+        self.as_sync().close_admission();
+    }
+
+    pub fn request_shutdown(
+        &self,
+        mode: crate::v02::report::ShutdownMode,
+    ) -> crate::v02::manager::shutdown::ShutdownHandle {
+        self.as_sync().request_shutdown(mode)
+    }
+
     /// Returns the corresponding sync view without changing its target.
     pub fn as_sync(&self) -> OperationManager {
         OperationManager {
@@ -613,7 +946,7 @@ impl AsyncOperationManager {
         }
     }
 
-    pub(crate) async fn submit<T, E, F, Fut>(
+    pub async fn submit<T, E, F, Fut>(
         &self,
         options: OperationOptions,
         body: F,
@@ -654,7 +987,7 @@ impl AsyncOperationManager {
         }
     }
 
-    pub(crate) fn try_submit<T, E, F, Fut>(
+    pub fn try_submit<T, E, F, Fut>(
         &self,
         options: OperationOptions,
         body: F,
@@ -707,7 +1040,10 @@ impl AsyncOperationManager {
             }
         };
         let (runner, id, scope, reservation) =
-            match self.core.reserve_scope(&self.target, options, runner) {
+            match self
+                .core
+                .reserve_scope(&self.target, options, ExecutionKind::Async, runner)
+            {
                 Ok(result) => result,
                 Err(error) => {
                     let (reason, _runner) = error.into_parts();
@@ -888,13 +1224,12 @@ struct TestLease;
 impl SubmissionPort for TestPort {
     fn reserve(
         &self,
-        _parent: Option<&ScopeCore>,
-        _options: &OperationOptions,
+        scope_id: OperationId,
+        _execution: ExecutionKind,
+        parent: Option<&ScopeCore>,
+        options: &OperationOptions,
     ) -> Result<SubmissionReservation, AdmissionError> {
-        Ok(SubmissionReservation {
-            execution: Box::new(TestPermit),
-            lifecycle: Arc::new(TestLease),
-        })
+        Ok(test_reservation(scope_id, parent, options))
     }
 
     fn wait_for_capacity<'a>(
@@ -904,6 +1239,59 @@ impl SubmissionPort for TestPort {
     ) -> Pin<Box<dyn Future<Output = Result<(), AdmissionError>> + Send + 'a>> {
         Box::pin(std::future::pending())
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_reservation(
+    scope_id: OperationId,
+    parent: Option<&ScopeCore>,
+    options: &OperationOptions,
+) -> SubmissionReservation {
+    let (capacity, resource_scope) = test_resources(scope_id, parent, options);
+    SubmissionReservation {
+        execution: Box::new(TestPermit),
+        lifecycle: Arc::new(TestLease),
+        capacity,
+        resource_scope,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_resources(
+    scope_id: OperationId,
+    parent: Option<&ScopeCore>,
+    options: &OperationOptions,
+) -> (
+    Arc<crate::v02::manager::capacity::ScopeCapacity>,
+    ResourceScope,
+) {
+    use crate::v02::manager::capacity::{ManagerCapacityPools, ScopeCapacity};
+    use crate::v02::report::{ManagerId, ManagerLimits, ResourceScopeId};
+    use crate::v02::resource::cleanup_port::{
+        CleanupDispatch, CleanupDispatchPermit, CleanupQueueError,
+    };
+
+    struct NoCleanup;
+    impl CleanupDispatch for NoCleanup {
+        fn reserve(&self) -> Result<Box<dyn CleanupDispatchPermit>, CleanupQueueError> {
+            Err(CleanupQueueError::Closed)
+        }
+    }
+
+    let manager = ManagerCapacityPools::new(ManagerLimits::default());
+    let capacity = Arc::new(match parent {
+        Some(parent) => parent
+            .capacity()
+            .child_for_operation(scope_id, options.limits),
+        None => ScopeCapacity::root_for_operation(&manager, scope_id, options.limits),
+    });
+    let resource_scope = ResourceScope::new(
+        ManagerId::new_unique(),
+        ResourceScopeId::new_unique(),
+        Arc::clone(&capacity),
+        Arc::new(NoCleanup),
+    );
+    (capacity, resource_scope)
 }
 #[cfg(test)]
 impl SubmissionLease for TestLease {

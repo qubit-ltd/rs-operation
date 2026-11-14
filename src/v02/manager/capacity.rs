@@ -22,7 +22,7 @@ pub(crate) enum ResourceLabel {
     Named(&'static str),
     Manager(ManagerCapacity),
     Scope {
-        scope_id: u64,
+        scope_id: u128,
         capacity: ScopeCapacityKind,
     },
 }
@@ -179,6 +179,10 @@ impl AdmissionCoordinator {
             };
             waiter.waker.wake();
         }
+    }
+
+    pub(crate) fn wake_waiters(&self) {
+        self.notify();
     }
 }
 
@@ -504,6 +508,39 @@ impl ManagerCapacityPools {
         PermitBundle::try_acquire(&[self.active_roots.clone(), self.unconsumed_outcomes.clone()])
     }
 
+    /// Reserves root execution and outcome capacity atomically, but returns
+    /// the permits separately so their lifecycle owners can release them at
+    /// different operation facts.
+    pub(crate) fn root_lifecycle_permits(
+        &self,
+    ) -> Result<(CapacityPermit, CapacityPermit), CapacityError> {
+        let mut permits = PermitBundle::try_acquire(&[
+            self.active_roots.clone(),
+            self.unconsumed_outcomes.clone(),
+        ])?;
+        Ok((
+            permits
+                .take(&self.active_roots)
+                .expect("active root permit"),
+            permits
+                .take(&self.unconsumed_outcomes)
+                .expect("outcome permit"),
+        ))
+    }
+
+    pub(crate) fn outcome_permit(&self) -> Result<CapacityPermit, CapacityError> {
+        self.unconsumed_outcomes.try_acquire()
+    }
+
+    #[cfg(test)]
+    fn active_root_permit(&self) -> Result<CapacityPermit, CapacityError> {
+        self.active_roots.try_acquire()
+    }
+
+    pub(crate) fn root_pools(&self) -> Vec<CapacityPool> {
+        vec![self.active_roots.clone(), self.unconsumed_outcomes.clone()]
+    }
+
     pub(crate) fn root_admission_request(&self) -> Result<AdmissionRequest, CapacityError> {
         self.admission_request(vec![
             self.active_roots.clone(),
@@ -527,6 +564,29 @@ impl ManagerCapacityPools {
         self.admission_request(pools)
     }
 
+    pub(crate) fn child_lifecycle_permits(
+        &self,
+        scope: &ScopeCapacity,
+    ) -> Result<(PermitBundle, CapacityPermit), CapacityError> {
+        let mut permits = PermitBundle::try_acquire(
+            &[
+                scope.child_operation_pools.as_slice(),
+                std::slice::from_ref(&self.unconsumed_outcomes),
+            ]
+            .concat(),
+        )?;
+        let outcome = permits
+            .take(&self.unconsumed_outcomes)
+            .expect("outcome permit");
+        Ok((permits, outcome))
+    }
+
+    pub(crate) fn child_admission_pools(&self, scope: &ScopeCapacity) -> Vec<CapacityPool> {
+        let mut pools = scope.child_operation_pools.clone();
+        pools.push(self.unconsumed_outcomes.clone());
+        pools
+    }
+
     pub(crate) fn queue_permit(&self) -> Result<CapacityPermit, CapacityError> {
         self.queued_roots.try_acquire()
     }
@@ -542,10 +602,15 @@ impl ManagerCapacityPools {
     pub(crate) fn coordinator(&self) -> Arc<AdmissionCoordinator> {
         Arc::clone(&self.coordinator)
     }
+
+    pub(crate) fn notify_waiters(&self) {
+        self.coordinator.wake_waiters();
+    }
 }
 
 /// The active capacity path for one operation, including all applicable
 /// ancestors. Child scopes add local pools without pre-reserving their limits.
+#[derive(Clone)]
 pub(crate) struct ScopeCapacity {
     limits: ScopeLimits,
     child_operation_pools: Vec<CapacityPool>,
@@ -555,6 +620,44 @@ pub(crate) struct ScopeCapacity {
 
 impl ScopeCapacity {
     pub(crate) fn root(manager: &ManagerCapacityPools, scope_id: u64, limits: ScopeLimits) -> Self {
+        let coordinator = manager.coordinator();
+        let pool = |capacity, kind| {
+            CapacityPool::with_coordinator(
+                ResourceLabel::Scope {
+                    scope_id: u128::from(scope_id),
+                    capacity: kind,
+                },
+                capacity,
+                Arc::clone(&coordinator),
+            )
+        };
+        Self {
+            limits,
+            child_operation_pools: vec![pool(
+                limits.child_operations,
+                ScopeCapacityKind::ChildOperations,
+            )],
+            resource_pools: vec![pool(limits.resources, ScopeCapacityKind::Resources)],
+            effect_record_pools: vec![pool(
+                limits.effect_records,
+                ScopeCapacityKind::EffectRecords,
+            )],
+        }
+    }
+
+    pub(crate) fn root_for_operation(
+        manager: &ManagerCapacityPools,
+        scope_id: crate::v02::report::OperationId,
+        limits: ScopeLimits,
+    ) -> Self {
+        Self::root_with_identity(manager, scope_id.raw(), limits)
+    }
+
+    pub(crate) fn root_with_identity(
+        manager: &ManagerCapacityPools,
+        scope_id: u128,
+        limits: ScopeLimits,
+    ) -> Self {
         let coordinator = manager.coordinator();
         let pool = |capacity, kind| {
             CapacityPool::with_coordinator(
@@ -581,6 +684,18 @@ impl ScopeCapacity {
     }
 
     pub(crate) fn child(&self, scope_id: u64, requested: ScopeLimits) -> Self {
+        self.child_with_identity(u128::from(scope_id), requested)
+    }
+
+    pub(crate) fn child_for_operation(
+        &self,
+        scope_id: crate::v02::report::OperationId,
+        requested: ScopeLimits,
+    ) -> Self {
+        self.child_with_identity(scope_id.raw(), requested)
+    }
+
+    fn child_with_identity(&self, scope_id: u128, requested: ScopeLimits) -> Self {
         let limits = ScopeLimits {
             child_operations: self.limits.child_operations.min(requested.child_operations),
             resources: self.limits.resources.min(requested.resources),
@@ -843,5 +958,21 @@ mod tests {
         assert_eq!(second.available(), 0);
         assert_eq!(waiters.available(), 1);
         drop(held_second);
+    }
+
+    #[test]
+    fn root_execution_and_outcome_permits_have_distinct_lifetimes() {
+        let manager = ManagerCapacityPools::new(ManagerLimits {
+            active_operations: 1,
+            unconsumed_outcomes: 1,
+            ..ManagerLimits::default()
+        });
+        let (execution, outcome) = manager.root_lifecycle_permits().unwrap();
+        drop(execution);
+        let next_execution = manager.active_root_permit().unwrap();
+        assert!(manager.outcome_permit().is_err());
+        drop(outcome);
+        assert!(manager.outcome_permit().is_ok());
+        drop(next_execution);
     }
 }

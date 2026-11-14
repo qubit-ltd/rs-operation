@@ -10,6 +10,7 @@ mod resource_key;
 mod resource_ref;
 mod resource_reservation;
 mod resource_scope;
+pub mod service;
 pub(crate) mod transfer;
 
 pub use resource_error::{ManageResourceError, ResourceCapacityError, ResourceCommitError};
