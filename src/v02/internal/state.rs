@@ -1,16 +1,13 @@
-//! Single-consumer result publication and repeatable settlement state.
+//! Single-consumer result publication and stop arbitration.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 
 use crate::v02::internal::notify::Notify;
 use crate::v02::protocol::MonotonicTime;
-use crate::v02::report::{
-    OperationOutcome, OutcomeError, SettlementReport, StopReason, StopReport,
-};
+use crate::v02::report::{OperationOutcome, OutcomeError, StopReason, StopReport};
 
 /// Single-consumer business-result state plus independently published lifecycle facts.
 pub(crate) struct StateCell<T, E> {
@@ -22,7 +19,6 @@ struct State<T, E> {
     result: ResultSlot<T, E>,
     stop: Option<StopReport>,
     success_published: bool,
-    settlement: Option<Arc<SettlementReport>>,
 }
 
 enum ResultSlot<T, E> {
@@ -40,7 +36,6 @@ impl<T, E> StateCell<T, E> {
                 result: ResultSlot::Pending,
                 stop: None,
                 success_published: false,
-                settlement: None,
             }),
             changed: Notify::new(),
         }
@@ -158,28 +153,6 @@ impl<T, E> StateCell<T, E> {
         changed
     }
 
-    /// Publishes one immutable settlement snapshot.
-    pub(crate) fn publish_settlement(
-        &self,
-        report: SettlementReport,
-    ) -> Result<Arc<SettlementReport>, SettlementReport> {
-        let mut state = lock(&self.state);
-        if state.settlement.is_some() {
-            drop(state);
-            return Err(report);
-        }
-        let report = Arc::new(report);
-        state.settlement = Some(Arc::clone(&report));
-        drop(state);
-        self.changed.notify_waiters();
-        Ok(report)
-    }
-
-    /// Returns a repeatable stable settlement snapshot.
-    pub(crate) fn settlement(&self) -> Option<Arc<SettlementReport>> {
-        lock(&self.state).settlement.as_ref().map(Arc::clone)
-    }
-
     /// Returns the first accepted stop report.
     pub(crate) fn stop_report(&self) -> Option<StopReport> {
         lock(&self.state).stop.clone()
@@ -227,6 +200,7 @@ mod tests {
     use crate::v02::report::OperationOutcome;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use std::sync::Weak;
 
     struct LockCheckingDrop {
