@@ -58,6 +58,15 @@ pub(crate) trait SubmissionPort: Send + Sync + 'static {
         parent: Option<&ScopeCore>,
         options: &OperationOptions,
     ) -> Result<SubmissionReservation, AdmissionError>;
+
+    /// Waits for a retryable capacity miss. Implementations must reserve a
+    /// bounded waiter slot and wake for capacity, manager close, or parent
+    /// scope end/stop. Dropping the future must unregister and release it.
+    fn wait_for_capacity<'a>(
+        &'a self,
+        parent: Option<Arc<ScopeCore>>,
+        options: OperationOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AdmissionError>> + Send + 'a>>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -330,13 +339,38 @@ impl ManagerCore {
         let scope_for_callback = Arc::clone(&scope);
         scope.on_settlement_ready(move || {
             let report = Arc::new(manager.make_settlement_report(&scope_for_callback));
+            // Return the exact settlement reservation before making the
+            // completed report observable to waiters.
+            lease.settlement_finished();
             if operation.publish_settlement((*report).clone()).is_ok() {
-                lease.settlement_finished();
                 if let Some(parent) = parent {
                     parent.record_child_settlement(operation_id, report);
                 }
             }
         });
+    }
+
+    async fn wait_for_retry_capacity(
+        &self,
+        parent: Option<Arc<ScopeCore>>,
+        options: OperationOptions,
+    ) -> Result<(), AdmissionError> {
+        let port_wait = self.port.wait_for_capacity(parent.clone(), options);
+        let Some(parent) = parent else {
+            return port_wait.await;
+        };
+        let mut port_wait = port_wait;
+        let mut scope_wait = Box::pin(parent.wait_unavailable());
+        std::future::poll_fn(|context| {
+            if let Poll::Ready(reason) = scope_wait.as_mut().poll(context) {
+                return Poll::Ready(Err(reason));
+            }
+            if let Poll::Ready(result) = port_wait.as_mut().poll(context) {
+                return Poll::Ready(result);
+            }
+            Poll::Pending
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -398,6 +432,44 @@ impl OperationManager {
         }
     }
 
+    pub(crate) fn submit<T, E, F>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<OperationHandle<T, E>, SubmitError<F>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(OperationScope) -> Result<T, E> + Send + 'static,
+    {
+        let mut body = Some(body);
+        loop {
+            match self.try_submit(
+                options.clone(),
+                body.take()
+                    .expect("submission body remains available until accepted"),
+            ) {
+                Ok(handle) => return Ok(handle),
+                Err(error) => {
+                    let (reason, original) = error.into_parts();
+                    if reason != AdmissionError::Busy {
+                        return Err(SubmitError::new(reason, original));
+                    }
+                    let parent = match resolve_wait_parent(&self.target) {
+                        Ok(parent) => parent,
+                        Err(reason) => return Err(SubmitError::new(reason, original)),
+                    };
+                    if let Err(reason) =
+                        block_on(self.core.wait_for_retry_capacity(parent, options.clone()))
+                    {
+                        return Err(SubmitError::new(reason, original));
+                    }
+                    body = Some(original);
+                }
+            }
+        }
+    }
+
     /// Submits a body through the shared operation-tree coordinator.
     pub(crate) fn try_submit<T, E, F>(
         &self,
@@ -445,8 +517,8 @@ impl OperationManager {
                 }
                 let _ = slot.publish(outcome);
             });
-            scope_core.mark_body_finished();
             drop(frame);
+            scope_core.mark_body_finished();
         };
         let (runner, id, scope, reservation) =
             match self.core.reserve_scope(&self.target, options, runner) {
@@ -541,6 +613,47 @@ impl AsyncOperationManager {
         }
     }
 
+    pub(crate) async fn submit<T, E, F, Fut>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<AsyncOperationHandle<T, E>, SubmitError<F>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(OperationScope) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+    {
+        let mut body = Some(body);
+        loop {
+            match self.try_submit(
+                options.clone(),
+                body.take()
+                    .expect("async submission body remains available until accepted"),
+            ) {
+                Ok(handle) => return Ok(handle),
+                Err(error) => {
+                    let (reason, original) = error.into_parts();
+                    if reason != AdmissionError::Busy {
+                        return Err(SubmitError::new(reason, original));
+                    }
+                    let parent = match resolve_wait_parent(&self.target) {
+                        Ok(parent) => parent,
+                        Err(reason) => return Err(SubmitError::new(reason, original)),
+                    };
+                    if let Err(reason) = self
+                        .core
+                        .wait_for_retry_capacity(parent, options.clone())
+                        .await
+                    {
+                        return Err(SubmitError::new(reason, original));
+                    }
+                    body = Some(original);
+                }
+            }
+        }
+    }
+
     pub(crate) fn try_submit<T, E, F, Fut>(
         &self,
         options: OperationOptions,
@@ -589,8 +702,8 @@ impl AsyncOperationManager {
                     }
                     let _ = slot.publish(outcome);
                 });
-                scope_core.mark_body_finished();
                 drop(frame);
+                scope_core.mark_body_finished();
             }
         };
         let (runner, id, scope, reservation) =
@@ -699,6 +812,22 @@ fn child_outcome_summary<T, E>(
     }
 }
 
+fn resolve_wait_parent(
+    target: &SubmissionTarget,
+) -> Result<Option<Arc<ScopeCore>>, AdmissionError> {
+    let SubmissionTarget::Parent { scope, .. } = target else {
+        return Ok(None);
+    };
+    let scope = scope.upgrade().ok_or(AdmissionError::ScopeEnded)?;
+    if !scope.is_open() {
+        return Err(AdmissionError::ScopeEnded);
+    }
+    if let Err(error) = scope.context().check() {
+        return Err(map_context_error(error));
+    }
+    Ok(Some(scope))
+}
+
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<String>() {
         format!("operation panicked: {message}")
@@ -706,6 +835,30 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         format!("operation panicked: {message}")
     } else {
         "operation panicked with a non-string payload".to_owned()
+    }
+}
+
+struct ThreadUnparker(std::thread::Thread);
+impl std::task::Wake for ThreadUnparker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let unparker = Arc::new(ThreadUnparker(std::thread::current()));
+    let waker = std::task::Waker::from(unparker);
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::park(),
+        }
     }
 }
 
@@ -742,6 +895,14 @@ impl SubmissionPort for TestPort {
             execution: Box::new(TestPermit),
             lifecycle: Arc::new(TestLease),
         })
+    }
+
+    fn wait_for_capacity<'a>(
+        &'a self,
+        _parent: Option<Arc<ScopeCore>>,
+        _options: OperationOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AdmissionError>> + Send + 'a>> {
+        Box::pin(std::future::pending())
     }
 }
 #[cfg(test)]

@@ -317,6 +317,7 @@ pub(crate) struct CleanupTransferReceiver {
     executor: Arc<CleanupExecutor>,
     state: Mutex<TransferQueueState>,
     driver: Mutex<()>,
+    receipt_callback: Option<Arc<dyn Fn(TransferReceipt) + Send + Sync + 'static>>,
 }
 
 impl Drop for CleanupTransferReceiver {
@@ -340,6 +341,26 @@ impl CleanupTransferReceiver {
         capacity: usize,
         executor: Arc<CleanupExecutor>,
     ) -> Result<Self, CleanupDispatcherError> {
+        Self::new_inner(manager, scope, capacity, executor, None)
+    }
+
+    pub(crate) fn new_with_receipt_callback(
+        manager: ManagerId,
+        scope: ResourceScopeId,
+        capacity: usize,
+        executor: Arc<CleanupExecutor>,
+        callback: impl Fn(TransferReceipt) + Send + Sync + 'static,
+    ) -> Result<Self, CleanupDispatcherError> {
+        Self::new_inner(manager, scope, capacity, executor, Some(Arc::new(callback)))
+    }
+
+    fn new_inner(
+        manager: ManagerId,
+        scope: ResourceScopeId,
+        capacity: usize,
+        executor: Arc<CleanupExecutor>,
+        receipt_callback: Option<Arc<dyn Fn(TransferReceipt) + Send + Sync + 'static>>,
+    ) -> Result<Self, CleanupDispatcherError> {
         if capacity == 0 {
             return Err(CleanupDispatcherError::ZeroCapacity);
         }
@@ -355,6 +376,7 @@ impl CleanupTransferReceiver {
                 ids: HashSet::with_capacity(capacity),
             }),
             driver: Mutex::new(()),
+            receipt_callback,
         })
     }
 
@@ -386,12 +408,13 @@ impl CleanupTransferReceiver {
         state.pending.push_back((resource, job));
         state.reserved += 1;
         let nonce = NEXT_CLEANUP_TRANSFER_NONCE.fetch_add(1, Ordering::Relaxed);
-        Ok(TransferReceipt::new(
-            resource,
-            source_scope,
-            self.scope,
-            nonce,
-        ))
+        let receipt = TransferReceipt::new(resource, source_scope, self.scope, nonce);
+        drop(state);
+        if let Some(callback) = &self.receipt_callback {
+            let receipt_for_callback = receipt.clone();
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| callback(receipt_for_callback)));
+        }
+        Ok(receipt)
     }
 
     pub(crate) fn drive(&self, limit: usize) -> usize {
@@ -909,6 +932,74 @@ mod tests {
         }
         assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(first_receiver.drive(1), 1);
+    }
+
+    #[test]
+    fn cleanup_transfer_callback_runs_after_acceptance_outside_queue_lock() {
+        let manager = ManagerId::new_unique();
+        let source_scope = ResourceScopeId::new_unique();
+        let receiver_scope = ResourceScopeId::new_unique();
+        let holder = Arc::new(std::sync::Mutex::new(None::<Arc<CleanupTransferReceiver>>));
+        let callback_holder = Arc::clone(&holder);
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = Arc::clone(&callbacks);
+        let receiver = Arc::new(
+            CleanupTransferReceiver::new_with_receipt_callback(
+                manager,
+                receiver_scope,
+                1,
+                executor(),
+                move |receipt| {
+                    let receiver = callback_holder.lock().unwrap().as_ref().unwrap().clone();
+                    assert!(receiver.contains(receipt.resource()));
+                    callback_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
+            .unwrap(),
+        );
+        *holder.lock().unwrap() = Some(Arc::clone(&receiver));
+        let resource = ResourceId::new(manager, 19, 1);
+        let receipt = match receiver.accept(
+            resource,
+            source_scope,
+            Box::new(DropOnSchedule(mpsc::channel().0)),
+        ) {
+            Ok(receipt) => receipt,
+            Err(_) => panic!("open receiver should accept transfer"),
+        };
+        assert_eq!(receipt.resource(), resource);
+        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let second = ResourceId::new(manager, 20, 1);
+        let job: Box<dyn CleanupJob> = Box::new(DropOnSchedule(mpsc::channel().0));
+        let (error, _job) = receiver.accept(second, source_scope, job).unwrap_err();
+        assert_eq!(error, CleanupTransferError::Full);
+        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cleanup_transfer_callback_panic_does_not_revoke_acceptance() {
+        let manager = ManagerId::new_unique();
+        let source_scope = ResourceScopeId::new_unique();
+        let receiver = CleanupTransferReceiver::new_with_receipt_callback(
+            manager,
+            ResourceScopeId::new_unique(),
+            1,
+            executor(),
+            |_| panic!("observer callback panic"),
+        )
+        .unwrap();
+        let resource = ResourceId::new(manager, 21, 1);
+        let receipt = match receiver.accept(
+            resource,
+            source_scope,
+            Box::new(DropOnSchedule(mpsc::channel().0)),
+        ) {
+            Ok(receipt) => receipt,
+            Err(_) => panic!("open receiver should accept transfer"),
+        };
+        assert_eq!(receipt.resource(), resource);
+        assert!(receiver.contains(resource));
     }
 
     #[test]

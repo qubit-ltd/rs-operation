@@ -240,7 +240,7 @@ impl ScopeCompletion {
     fn complete(
         &self,
         resource_id: ResourceId,
-        evidence: CleanupEvidence,
+        evidence: Option<CleanupEvidence>,
         failure: Option<CleanupFailure>,
     ) {
         let (callback, report) = {
@@ -249,10 +249,12 @@ impl ScopeCompletion {
                 return;
             }
             state.completed = state.completed.saturating_add(1);
-            state.resources.push(ResourceCleanupReport {
-                resource_id,
-                evidence,
-            });
+            if let Some(evidence) = evidence {
+                state.resources.push(ResourceCleanupReport {
+                    resource_id,
+                    evidence,
+                });
+            }
             if let Some(failure) = failure {
                 state.failures.push(failure);
             }
@@ -342,14 +344,15 @@ impl<T> Drop for ScheduledDrop<T> {
     fn drop(&mut self) {
         let result = panic::catch_unwind(AssertUnwindSafe(|| drop(self.value.take())));
         drop(self.registration.take());
-        let failure = result.err().map(|payload| CleanupFailure {
+        let failure = result.as_ref().err().map(|payload| CleanupFailure {
             resource_id: self.resource_id,
             stage: CleanupStage::Drop,
             summary: DiagnosticSummary::new(&panic_summary(payload.as_ref())),
             source: None,
         });
+        let evidence = result.is_ok().then_some(CleanupEvidence::DropCompleted);
         self.completion
-            .complete(self.resource_id, CleanupEvidence::DropCompleted, failure);
+            .complete(self.resource_id, evidence, failure);
     }
 }
 

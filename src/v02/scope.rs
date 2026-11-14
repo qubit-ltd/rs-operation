@@ -404,7 +404,47 @@ impl ScopeCore {
             }
             state.stopping = true;
         }
-        self.context.request_stop(reason)
+        let accepted = self.context.request_stop(reason);
+        self.children_changed.notify_waiters();
+        accepted
+    }
+
+    pub(crate) async fn wait_unavailable(&self) -> crate::v02::report::AdmissionError {
+        let mut stopped = Box::pin(self.context.stop_requested());
+        loop {
+            if !self.is_open() {
+                return crate::v02::report::AdmissionError::ScopeEnded;
+            }
+            if self.context.check().is_err() {
+                return crate::v02::report::AdmissionError::Stopped;
+            }
+            let mut changed = Box::pin(self.children_changed.notified());
+            let result = std::future::poll_fn(|cx| {
+                if !self.is_open() {
+                    return std::task::Poll::Ready(Some(
+                        crate::v02::report::AdmissionError::ScopeEnded,
+                    ));
+                }
+                if self.context.check().is_err() {
+                    return std::task::Poll::Ready(Some(
+                        crate::v02::report::AdmissionError::Stopped,
+                    ));
+                }
+                if changed.as_mut().poll(cx).is_ready() {
+                    return std::task::Poll::Ready(None);
+                }
+                if stopped.as_mut().poll(cx).is_ready() {
+                    return std::task::Poll::Ready(Some(
+                        crate::v02::report::AdmissionError::Stopped,
+                    ));
+                }
+                std::task::Poll::Pending
+            })
+            .await;
+            if let Some(error) = result {
+                return error;
+            }
+        }
     }
 
     pub(crate) fn child_reports(&self) -> (Vec<ChildSettlement>, usize, bool) {
@@ -542,7 +582,7 @@ impl ScopeCore {
         }
     }
 
-    fn end(&self) {
+    pub(crate) fn end(&self) {
         let resources = {
             let mut state = lock(&self.state);
             if !state.open {

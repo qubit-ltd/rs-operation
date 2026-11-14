@@ -123,9 +123,10 @@ mod tests {
     use crate::v02::executor::CleanupExecutor;
     use crate::v02::manager::capacity::{ManagerCapacityPools, ScopeCapacity};
     use crate::v02::report::{
-        ManagerId, ManagerLimits, PortableExecutorOptions, ResourceManageErrorKind,
+        ManagerId, ManagerLimits, PortableExecutorOptions, ResourceId, ResourceManageErrorKind,
         ResourceScopeId, ScopeLimits, ThreadPoolExecutorOptions,
     };
+    use crate::v02::resource::cleanup::CleanupTransferReceiver;
     use crate::v02::resource::cleanup_port::{
         CleanupDispatch, CleanupDispatchPermit, CleanupJob, CleanupQueueError,
     };
@@ -320,5 +321,111 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].resources.len(), 1);
         assert_eq!(reports[0].failures.len(), 0);
+    }
+
+    struct AcceptedOwner(Arc<AtomicUsize>);
+    impl Drop for AcceptedOwner {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl CleanupJob for AcceptedOwner {
+        fn schedule(
+            self: Box<Self>,
+            executor: Arc<CleanupExecutor>,
+        ) -> Result<(), Box<dyn CleanupJob>> {
+            match executor.reserve_drop() {
+                Ok(permit) => {
+                    permit.drop_value(self);
+                    Ok(())
+                }
+                Err(_) => Err(self),
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_cleanup_transfer_receipt_reaches_resource_scope_report() {
+        let manager_id = ManagerId::new_unique();
+        let source_id = ResourceScopeId::new_unique();
+        let target_id = ResourceScopeId::new_unique();
+        let pools = ManagerCapacityPools::new(ManagerLimits::default());
+        let source = ResourceScope::new(
+            manager_id,
+            source_id,
+            Arc::new(ScopeCapacity::root(&pools, 77, ScopeLimits::default())),
+            ManualCleanup::new(1),
+        );
+        let report = Arc::new(Mutex::new(None));
+        let report_slot = Arc::clone(&report);
+        source.set_settlement_callback(Box::new(move |report| {
+            *report_slot.lock().unwrap() = Some(report);
+        }));
+        let reporting_scope = source.internal_clone();
+        let executor = executor();
+        let receiver = CleanupTransferReceiver::new_with_receipt_callback(
+            manager_id,
+            target_id,
+            1,
+            Arc::clone(&executor),
+            move |receipt| {
+                assert!(reporting_scope.record_transfer_receipt(receipt));
+            },
+        )
+        .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let resource_id = ResourceId::new(manager_id, 12, 1);
+        let receipt = match receiver.accept(
+            resource_id,
+            source_id,
+            Box::new(AcceptedOwner(Arc::clone(&drops))),
+        ) {
+            Ok(receipt) => receipt,
+            Err(_) => panic!("open receiver should accept transfer"),
+        };
+        assert_eq!(receipt.resource(), resource_id);
+        assert_eq!(receiver.drive(1), 1);
+        executor.shutdown().wait().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        source.end();
+        let report = report.lock().unwrap().take().unwrap();
+        assert_eq!(report.transfers_total, 1);
+        assert!(!report.transfers_truncated);
+        assert_eq!(report.transfers[0].resource(), resource_id);
+        assert_eq!(report.transfers[0].source_scope(), source_id);
+        assert_eq!(report.transfers[0].target_scope(), target_id);
+    }
+
+    struct PanicOnDrop;
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("resource cleanup did not confirm release");
+        }
+    }
+
+    #[test]
+    fn resource_drop_panic_has_no_released_evidence() {
+        let (scope, cleanup) = scope();
+        let report = Arc::new(Mutex::new(None));
+        let report_slot = Arc::clone(&report);
+        scope.set_settlement_callback(Box::new(move |report| {
+            *report_slot.lock().unwrap() = Some(report);
+        }));
+        let resource = match scope.manage(PanicOnDrop) {
+            Ok(resource) => resource,
+            Err(_) => panic!("open resource scope should accept resource"),
+        };
+        scope.end();
+        drop(resource);
+        let executor = executor();
+        cleanup.run_all(&executor);
+        executor.shutdown().wait().unwrap();
+        let report = report.lock().unwrap().take().unwrap();
+        assert!(report.resources.is_empty());
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(
+            report.failures[0].stage,
+            crate::v02::report::CleanupStage::Drop
+        );
     }
 }
