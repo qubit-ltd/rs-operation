@@ -2,15 +2,20 @@
 
 use crate::v02::operation::OperationCore;
 use crate::v02::protocol::OperationControl;
+#[cfg(test)]
+use crate::v02::report::OperationId;
 use crate::v02::report::{
-    ChildOutcomeSummary, ChildRelease, ChildSnapshot, OperationId, SettlementReport, StopReason,
-    StopReport,
+    ChildOutcomeSummary, ChildRelease, ChildSnapshot, SettlementReport, StopReason, StopReport,
 };
+#[cfg(test)]
 use crate::v02::resource::ResourceRef;
 use crate::v02::scope::ScopeCore;
 use std::any::Any;
+#[cfg(test)]
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 #[cfg(test)]
@@ -51,6 +56,7 @@ pub(crate) struct AdapterReservation {
 }
 
 impl AdapterReservation {
+    #[cfg(test)]
     pub(crate) fn new(
         admission: Box<dyn Any + Send>,
         activate: impl FnOnce(Box<dyn Any + Send>) + Send + 'static,
@@ -136,6 +142,7 @@ pub(crate) struct AttachedChild {
 }
 
 impl AttachedChild {
+    #[cfg(test)]
     pub(crate) fn request_stop(&self, reason: StopReason) {
         let accepted = {
             let mut lifecycle = lock(&self.lifecycle);
@@ -529,10 +536,12 @@ fn poll_managed_fact<V: Clone>(
 }
 
 /// External work together with the resource reference that keeps its input alive.
+#[cfg(test)]
 pub(crate) struct ExternalTask<T: Send + Sync + 'static> {
     state: Arc<Mutex<TaskState<T>>>,
 }
 
+#[cfg(test)]
 struct TaskState<T: Send + Sync + 'static> {
     operation_id: OperationId,
     execution: crate::v02::report::ExecutionPhase,
@@ -547,9 +556,12 @@ struct TaskState<T: Send + Sync + 'static> {
     settlement_waiters: Vec<Waker>,
 }
 
+#[cfg(test)]
 type LostInputs = HashMap<OperationId, Box<dyn Any + Send + Sync>>;
+#[cfg(test)]
 static LOST_INPUTS: OnceLock<Mutex<LostInputs>> = OnceLock::new();
 
+#[cfg(test)]
 impl<T: Send + Sync + 'static> Drop for TaskState<T> {
     fn drop(&mut self) {
         if self.runtime_lost {
@@ -565,6 +577,7 @@ impl<T: Send + Sync + 'static> Drop for TaskState<T> {
 ///
 /// The reference is removed under the registry lock and dropped after unlocking so
 /// normal resource cleanup can continue without running user destructors in the lock.
+#[cfg(test)]
 pub(crate) fn recover_lost_input(operation_id: OperationId) -> bool {
     let input = LOST_INPUTS
         .get()
@@ -574,6 +587,7 @@ pub(crate) fn recover_lost_input(operation_id: OperationId) -> bool {
     found
 }
 
+#[cfg(test)]
 impl<T: Send + Sync + 'static> ExternalTask<T> {
     pub(crate) fn new(
         operation_id: OperationId,
@@ -689,6 +703,7 @@ impl<T: Send + Sync + 'static> ExternalTask<T> {
     }
 }
 
+#[cfg(test)]
 impl<T: Send + Sync + 'static> Clone for ExternalTask<T> {
     fn clone(&self) -> Self {
         Self {
@@ -698,10 +713,12 @@ impl<T: Send + Sync + 'static> Clone for ExternalTask<T> {
 }
 
 /// Cloneable observation port independent of the task's ownership.
+#[cfg(test)]
 pub(crate) struct ExternalTaskControl<T: Send + Sync + 'static> {
     state: Arc<Mutex<TaskState<T>>>,
 }
 
+#[cfg(test)]
 impl<T: Send + Sync + 'static> OperationControl for ExternalTaskControl<T> {
     fn request_stop(&self, reason: StopReason) {
         let waiters = {
@@ -760,6 +777,7 @@ impl<T: Send + Sync + 'static> OperationControl for ExternalTaskControl<T> {
     }
 }
 
+#[cfg(test)]
 fn poll_fact<T, V: Clone>(
     state: &Arc<Mutex<TaskState<T>>>,
     cx: &mut Context<'_>,
