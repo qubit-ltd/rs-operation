@@ -2,9 +2,13 @@
 #![allow(dead_code)] // Consumed by T11 resource-scope wiring.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 
-use crate::v02::report::{CleanupDependencyError, ResourceId, ResourceScopeId};
+use crate::v02::report::CleanupDependencyError;
+use crate::v02::report::ResourceId;
+use crate::v02::report::ResourceScopeId;
 
 type DependencyLease = Box<dyn Any + Send + Sync + 'static>;
 
@@ -31,7 +35,8 @@ pub(crate) struct DependencyGraph {
 
 impl DependencyGraph {
     /// Adds `dependent -> prerequisite`: the dependent must wait for the
-    /// prerequisite, and its lease is retained until dependent cleanup succeeds.
+    /// prerequisite, and its lease is retained until dependent cleanup
+    /// succeeds.
     pub(crate) fn add(
         &self,
         dependent: ResourceId,
@@ -58,14 +63,10 @@ impl DependencyGraph {
         if reaches(&state, prerequisite, dependent) {
             return err(CleanupDependencyError::Cycle, lease);
         }
-        state
-            .edges
-            .entry(dependent)
-            .or_default()
-            .push(DependencyEdge {
-                prerequisite,
-                _lease: lease,
-            });
+        state.edges.entry(dependent).or_default().push(DependencyEdge {
+            prerequisite,
+            _lease: lease,
+        });
         Ok(())
     }
 
@@ -74,10 +75,7 @@ impl DependencyGraph {
     /// unavailable for cleanup and leaves its dependency leases intact.
     pub(crate) fn try_start(&self, resource: ResourceId) -> bool {
         let mut state = lock(&self.state);
-        if state.started.contains(&resource)
-            || state.failed.contains(&resource)
-            || state.released.contains(&resource)
-        {
+        if state.started.contains(&resource) || state.failed.contains(&resource) || state.released.contains(&resource) {
             return false;
         }
         let ready = state
@@ -168,9 +166,7 @@ impl DependencyGraph {
             return false;
         }
         members.iter().all(|resource| {
-            !state.started.contains(resource)
-                && !state.released.contains(resource)
-                && !state.failed.contains(resource)
+            !state.started.contains(resource) && !state.released.contains(resource) && !state.failed.contains(resource)
         })
     }
 }
@@ -217,19 +213,20 @@ fn reaches(state: &GraphState, from: ResourceId, target: ResourceId) -> bool {
 }
 
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
     use super::DependencyGraph;
-    use crate::v02::report::{CleanupDependencyError, ManagerId, ResourceId, ResourceScopeId};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use crate::v02::report::CleanupDependencyError;
+    use crate::v02::report::ManagerId;
+    use crate::v02::report::ResourceId;
+    use crate::v02::report::ResourceScopeId;
 
     fn rid(manager: ManagerId, slot: u64) -> ResourceId {
         ResourceId::new(manager, slot, 1)
@@ -286,9 +283,7 @@ mod tests {
         let scope = ResourceScopeId::new_unique();
         let prerequisite = rid(manager, 1);
         let dependent = rid(manager, 2);
-        graph
-            .add(dependent, scope, prerequisite, scope, Box::new(()))
-            .unwrap();
+        graph.add(dependent, scope, prerequisite, scope, Box::new(())).unwrap();
         assert!(graph.try_start(prerequisite));
         assert!(graph.finish(prerequisite, false));
         assert!(!graph.try_start(dependent));

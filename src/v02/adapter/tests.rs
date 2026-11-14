@@ -1,21 +1,43 @@
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
+use std::time::Duration;
+
 use super::*;
 use crate::v02::executor::CleanupExecutor;
-use crate::v02::manager::capacity::{ManagerCapacityPools, ScopeCapacity};
+use crate::v02::manager::capacity::ManagerCapacityPools;
+use crate::v02::manager::capacity::ScopeCapacity;
 use crate::v02::protocol::OperationControl;
-use crate::v02::report::{
-    ChildOutcomeKind, ChildOutcomeSummary, ChildRelease, CleanupFailure, DiagnosticSummary,
-    EffectRecord, ManagerId, ManagerLimits, OperationId, ResourceCleanupReport, ResourceScopeId,
-    ScopeLimits, SettlementReport, SettlementStatus, StopReason, ThreadPoolExecutorOptions,
-    TransferReceipt,
-};
-use crate::v02::resource::cleanup_port::{
-    CleanupDispatch, CleanupDispatchPermit, CleanupJob, CleanupQueueError,
-};
-use crate::v02::resource::{ResourceRef, ResourceScope};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
-use std::time::Duration;
+use crate::v02::report::ChildOutcomeKind;
+use crate::v02::report::ChildOutcomeSummary;
+use crate::v02::report::ChildRelease;
+use crate::v02::report::CleanupFailure;
+use crate::v02::report::DiagnosticSummary;
+use crate::v02::report::EffectRecord;
+use crate::v02::report::ManagerId;
+use crate::v02::report::ManagerLimits;
+use crate::v02::report::OperationId;
+use crate::v02::report::ResourceCleanupReport;
+use crate::v02::report::ResourceScopeId;
+use crate::v02::report::ScopeLimits;
+use crate::v02::report::SettlementReport;
+use crate::v02::report::SettlementStatus;
+use crate::v02::report::StopReason;
+use crate::v02::report::ThreadPoolExecutorOptions;
+use crate::v02::report::TransferReceipt;
+use crate::v02::resource::ResourceRef;
+use crate::v02::resource::ResourceScope;
+use crate::v02::resource::cleanup_port::CleanupDispatch;
+use crate::v02::resource::cleanup_port::CleanupDispatchPermit;
+use crate::v02::resource::cleanup_port::CleanupJob;
+use crate::v02::resource::cleanup_port::CleanupQueueError;
 
 #[derive(Default)]
 struct Gate {
@@ -117,11 +139,7 @@ struct DropSignal(Arc<(AtomicBool, Mutex<()>, Condvar)>);
 
 impl DropSignal {
     fn new() -> Self {
-        Self(Arc::new((
-            AtomicBool::new(false),
-            Mutex::new(()),
-            Condvar::new(),
-        )))
+        Self(Arc::new((AtomicBool::new(false), Mutex::new(()), Condvar::new())))
     }
 
     fn mark(&self) {
@@ -134,9 +152,7 @@ impl DropSignal {
         let (dropped, lock, changed) = &*self.0;
         let guard = lock.lock().unwrap();
         let (guard, timeout) = changed
-            .wait_timeout_while(guard, Duration::from_secs(5), |_| {
-                !dropped.load(Ordering::SeqCst)
-            })
+            .wait_timeout_while(guard, Duration::from_secs(5), |_| !dropped.load(Ordering::SeqCst))
             .unwrap();
         assert!(!timeout.timed_out() || dropped.load(Ordering::SeqCst));
         drop(guard);
@@ -163,12 +179,7 @@ impl Drop for Tracked {
     }
 }
 
-fn managed_input() -> (
-    ResourceScope,
-    ResourceRef<Tracked>,
-    Arc<DeferredCleanup>,
-    DropSignal,
-) {
+fn managed_input() -> (ResourceScope, ResourceRef<Tracked>, Arc<DeferredCleanup>, DropSignal) {
     let manager = ManagerCapacityPools::new(ManagerLimits::default());
     let capacity = Arc::new(ScopeCapacity::root(&manager, 81, ScopeLimits::default()));
     let cleanup = DeferredCleanup::new();
@@ -259,20 +270,13 @@ fn stop_before_commit_abandons_once() {
         .expect("first attach should succeed");
 
     child.request_stop(StopReason::UserCancelled);
-    let error = child
-        .commit()
-        .expect_err("accepted stop must prevent commit");
+    let error = child.commit().expect_err("accepted stop must prevent commit");
     drop(error.payload);
 
     assert_eq!(activated.load(Ordering::SeqCst), 0);
     assert_eq!(abandoned.load(Ordering::SeqCst), 1);
-    assert!(
-        matches!(control.snapshot().stop, Some(stop) if stop.reason == StopReason::UserCancelled)
-    );
-    assert!(
-        !dropped.is_dropped(),
-        "scope still owns the resource until it ends"
-    );
+    assert!(matches!(control.snapshot().stop, Some(stop) if stop.reason == StopReason::UserCancelled));
+    assert!(!dropped.is_dropped(), "scope still owns the resource until it ends");
     scope.end();
     cleanup.schedule_all();
     dropped.wait_dropped();
@@ -342,9 +346,7 @@ fn activation_rejection_drops_payload_before_abandon_notification() {
     .commit()
     .expect("commit gate accepts start");
 
-    let error = permit
-        .activate()
-        .expect_err("activation gate rejects start");
+    let error = permit.activate().expect_err("activation gate rejects start");
     drop(error.payload);
 
     assert_eq!(abandoned.load(Ordering::SeqCst), 1);
@@ -387,18 +389,14 @@ fn dropping_attached_child_releases_payload_before_abandon_notification() {
     let (task, control) = ExternalTask::new(id, input);
     let payload_dropped = Arc::new(AtomicBool::new(false));
     let abandoned = Arc::new(AtomicUsize::new(0));
-    let child = AdapterReservation::new(
-        Box::new(()),
-        |_| panic!("dropped child must not activate"),
-        {
-            let payload_dropped = Arc::clone(&payload_dropped);
-            let abandoned = Arc::clone(&abandoned);
-            move || {
-                assert!(payload_dropped.load(Ordering::SeqCst));
-                abandoned.fetch_add(1, Ordering::SeqCst);
-            }
-        },
-    )
+    let child = AdapterReservation::new(Box::new(()), |_| panic!("dropped child must not activate"), {
+        let payload_dropped = Arc::clone(&payload_dropped);
+        let abandoned = Arc::clone(&abandoned);
+        move || {
+            assert!(payload_dropped.load(Ordering::SeqCst));
+            abandoned.fetch_add(1, Ordering::SeqCst);
+        }
+    })
     .attach(control, PayloadDropFlag(Arc::clone(&payload_dropped)))
     .expect("attach should succeed");
 
@@ -422,18 +420,14 @@ fn dropping_start_permit_releases_payload_before_abandon_notification() {
     let (task, control) = ExternalTask::new(id, input);
     let payload_dropped = Arc::new(AtomicBool::new(false));
     let abandoned = Arc::new(AtomicUsize::new(0));
-    let permit = AdapterReservation::new(
-        Box::new(()),
-        |_| panic!("dropped permit must not activate"),
-        {
-            let payload_dropped = Arc::clone(&payload_dropped);
-            let abandoned = Arc::clone(&abandoned);
-            move || {
-                assert!(payload_dropped.load(Ordering::SeqCst));
-                abandoned.fetch_add(1, Ordering::SeqCst);
-            }
-        },
-    )
+    let permit = AdapterReservation::new(Box::new(()), |_| panic!("dropped permit must not activate"), {
+        let payload_dropped = Arc::clone(&payload_dropped);
+        let abandoned = Arc::clone(&abandoned);
+        move || {
+            assert!(payload_dropped.load(Ordering::SeqCst));
+            abandoned.fetch_add(1, Ordering::SeqCst);
+        }
+    })
     .attach(control, PayloadDropFlag(Arc::clone(&payload_dropped)))
     .expect("attach should succeed")
     .commit()
@@ -477,9 +471,7 @@ fn activate_is_once() {
     .attach(control, payload)
     .expect("attach should succeed");
     let permit = child.commit().expect("no stop was accepted");
-    permit
-        .activate()
-        .expect("start permit should activate once");
+    permit.activate().expect("start permit should activate once");
 
     assert_eq!(activated.load(Ordering::SeqCst), 1);
     assert_eq!(abandoned.load(Ordering::SeqCst), 0);
@@ -513,10 +505,7 @@ fn business_result_does_not_confirm_release() {
     assert!(!control.snapshot().input_released);
     assert!(!dropped.is_dropped());
     scope.end();
-    assert!(
-        !dropped.is_dropped(),
-        "outcome cannot release the input owner"
-    );
+    assert!(!dropped.is_dropped(), "outcome cannot release the input owner");
 
     task.confirm_input_release(ChildRelease {
         operation_id: id,
@@ -571,27 +560,13 @@ fn runtime_lost_retains_unconfirmed_owner() {
     task.mark_runtime_lost();
 
     assert!(task.is_unconfirmed());
-    assert!(
-        control
-            .poll_release(&mut context(Waker::noop()))
-            .is_pending()
-    );
-    assert!(
-        control
-            .poll_settlement(&mut context(Waker::noop()))
-            .is_pending()
-    );
+    assert!(control.poll_release(&mut context(Waker::noop())).is_pending());
+    assert!(control.poll_settlement(&mut context(Waker::noop())).is_pending());
     assert!(!control.snapshot().input_released);
-    assert!(
-        !dropped.is_dropped(),
-        "lost runtime still owns the input reference"
-    );
+    assert!(!dropped.is_dropped(), "lost runtime still owns the input reference");
     drop(task);
     drop(control);
-    assert!(
-        recover_lost_input(id),
-        "lost reference must survive task handles"
-    );
+    assert!(recover_lost_input(id), "lost reference must survive task handles");
     cleanup.schedule_all();
     dropped.wait_dropped();
 }
@@ -615,17 +590,11 @@ fn stopped_noninterruptible_work_keeps_input_until_return() {
     gate.wait_started();
     control.request_stop(StopReason::UserCancelled);
     scope.end();
-    assert!(
-        control
-            .poll_release(&mut context(Waker::noop()))
-            .is_pending()
-    );
+    assert!(control.poll_release(&mut context(Waker::noop())).is_pending());
     assert!(!dropped.is_dropped());
 
     gate.allow_return();
-    worker
-        .join()
-        .expect("noninterruptible worker should return");
+    worker.join().expect("noninterruptible worker should return");
     cleanup.schedule_all();
     dropped.wait_dropped();
 }

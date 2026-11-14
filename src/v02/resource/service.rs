@@ -1,6 +1,9 @@
 //! Long-lived resources shared across operations in an application group.
 
-use super::{ManageResourceError, ResourceKey, ResourceRef, ResourceScope};
+use super::ManageResourceError;
+use super::ResourceKey;
+use super::ResourceRef;
+use super::ResourceScope;
 use crate::v02::report::ResourceLookupError;
 
 /// A separately bounded resource owner whose close waits for its last user.
@@ -13,10 +16,7 @@ impl ServiceResourceScope {
         Self { resources }
     }
 
-    pub fn manage<T: Send + Sync + 'static>(
-        &self,
-        resource: T,
-    ) -> Result<ResourceRef<T>, ManageResourceError<T>> {
+    pub fn manage<T: Send + Sync + 'static>(&self, resource: T) -> Result<ResourceRef<T>, ManageResourceError<T>> {
         self.resources.manage(resource)
     }
 
@@ -34,13 +34,15 @@ impl ServiceResourceScope {
 
 #[cfg(test)]
 mod tests {
-    use crate::v02::manager::core::OperationManager;
-    use crate::v02::report::{
-        GroupOptions, ManagerOptions, ServiceResourceOptions, ShutdownMode,
-        ThreadPoolExecutorOptions,
-    };
     use std::sync::mpsc;
     use std::time::Duration;
+
+    use crate::v02::manager::core::OperationManager;
+    use crate::v02::report::GroupOptions;
+    use crate::v02::report::ManagerOptions;
+    use crate::v02::report::ServiceResourceOptions;
+    use crate::v02::report::ShutdownMode;
+    use crate::v02::report::ThreadPoolExecutorOptions;
 
     struct DropNotice(Option<mpsc::Sender<()>>);
     impl Drop for DropNotice {
@@ -55,9 +57,7 @@ mod tests {
     fn service_refs_delay_close() {
         let manager = OperationManager::new(ManagerOptions::default()).unwrap();
         let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
-        let service = group
-            .resource_scope(ServiceResourceOptions { capacity: 1 })
-            .unwrap();
+        let service = group.resource_scope(ServiceResourceOptions { capacity: 1 }).unwrap();
         assert_eq!(group.snapshot().service_resource_scopes, 1);
         let (drop_tx, drop_rx) = mpsc::channel();
         let value = service.manage(DropNotice(Some(drop_tx))).unwrap();
@@ -72,9 +72,7 @@ mod tests {
             crate::v02::report::ShutdownWait::Pending(_)
         ));
         drop(held);
-        drop_rx
-            .recv()
-            .expect("last service reference enables cleanup");
+        drop_rx.recv().expect("last service reference enables cleanup");
         assert!(matches!(
             shutdown.wait_for(Duration::from_secs(2)).unwrap(),
             crate::v02::report::ShutdownWait::Completed(_)
@@ -120,9 +118,7 @@ mod tests {
         };
         let manager = OperationManager::new(options).unwrap();
         let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
-        let service = group
-            .resource_scope(ServiceResourceOptions { capacity: 3 })
-            .unwrap();
+        let service = group.resource_scope(ServiceResourceOptions { capacity: 3 }).unwrap();
         let (starts_tx, starts_rx) = mpsc::channel();
         let gate = Arc::new(Gate {
             open: std::sync::Mutex::new(false),

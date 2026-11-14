@@ -2,13 +2,18 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 
-use super::report::{
-    ChildOutcomeSummary, ChildRelease, ChildSnapshot, DiagnosticSummary, SettlementReport,
-    StopReason,
-};
+use super::report::ChildOutcomeSummary;
+use super::report::ChildRelease;
+use super::report::ChildSnapshot;
+use super::report::DiagnosticSummary;
+use super::report::SettlementReport;
+use super::report::StopReason;
 
 static NEXT_CLOCK_DOMAIN: AtomicU64 = AtomicU64::new(1);
 
@@ -19,9 +24,7 @@ pub struct ClockDomainId(u128);
 impl ClockDomainId {
     /// Creates a process-unique clock-domain identity for an external clock.
     pub fn new_unique() -> Self {
-        Self(u128::from(
-            NEXT_CLOCK_DOMAIN.fetch_add(1, Ordering::Relaxed),
-        ))
+        Self(u128::from(NEXT_CLOCK_DOMAIN.fetch_add(1, Ordering::Relaxed)))
     }
 
     #[allow(dead_code)]
@@ -38,11 +41,7 @@ pub struct ClockDomainMismatch {
 
 impl fmt::Display for ClockDomainMismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "clock domains differ: {:?} and {:?}",
-            self.left, self.right
-        )
+        write!(f, "clock domains differ: {:?} and {:?}", self.left, self.right)
     }
 }
 impl std::error::Error for ClockDomainMismatch {}
@@ -87,11 +86,7 @@ impl Deadline {
                 right: other.at.domain,
             });
         }
-        Ok(if self.at.ticks <= other.at.ticks {
-            self
-        } else {
-            other
-        })
+        Ok(if self.at.ticks <= other.at.ticks { self } else { other })
     }
 }
 

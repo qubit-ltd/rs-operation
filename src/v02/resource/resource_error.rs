@@ -1,5 +1,6 @@
-use crate::v02::report::ResourceManageErrorKind;
 use std::fmt;
+
+use crate::v02::report::ResourceManageErrorKind;
 
 pub struct ManageResourceError<T> {
     kind: ResourceManageErrorKind,
@@ -61,11 +62,7 @@ pub struct ResourceCommitError<T> {
     reservation: super::ResourceReservation,
 }
 impl<T> ResourceCommitError<T> {
-    pub(super) fn new(
-        reason: ResourceManageErrorKind,
-        resource: T,
-        reservation: super::ResourceReservation,
-    ) -> Self {
+    pub(super) fn new(reason: ResourceManageErrorKind, resource: T, reservation: super::ResourceReservation) -> Self {
         Self {
             reason,
             resource,

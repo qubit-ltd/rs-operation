@@ -1,13 +1,20 @@
-use super::core::ScopeState;
-use super::resource_error::{ManageResourceError, ManageWithError};
-use super::{ResourceKey, ResourceRef, ResourceReservation};
-use crate::v02::manager::capacity::ScopeCapacity;
-use crate::v02::report::{
-    ManagerId, ResourceCapacityError, ResourceLookupError, ResourceManageErrorKind,
-    ResourceScopeId, ResourceScopeReport, TransferReceipt,
-};
-use crate::v02::resource::cleanup_port::CleanupDispatch;
 use std::sync::Arc;
+
+use super::ResourceKey;
+use super::ResourceRef;
+use super::ResourceReservation;
+use super::core::ScopeState;
+use super::resource_error::ManageResourceError;
+use super::resource_error::ManageWithError;
+use crate::v02::manager::capacity::ScopeCapacity;
+use crate::v02::report::ManagerId;
+use crate::v02::report::ResourceCapacityError;
+use crate::v02::report::ResourceLookupError;
+use crate::v02::report::ResourceManageErrorKind;
+use crate::v02::report::ResourceScopeId;
+use crate::v02::report::ResourceScopeReport;
+use crate::v02::report::TransferReceipt;
+use crate::v02::resource::cleanup_port::CleanupDispatch;
 
 /// Independently endable heterogeneous resource scope.
 pub struct ResourceScope {
@@ -40,10 +47,7 @@ impl ResourceScope {
         }
     }
 
-    pub(crate) fn set_settlement_callback(
-        &self,
-        callback: Box<dyn FnOnce(ResourceScopeReport) + Send + 'static>,
-    ) {
+    pub(crate) fn set_settlement_callback(&self, callback: Box<dyn FnOnce(ResourceScopeReport) + Send + 'static>) {
         self.state.set_settlement_callback(callback);
     }
 
@@ -64,10 +68,7 @@ impl ResourceScope {
     pub(crate) fn record_transfer_receipt(&self, receipt: TransferReceipt) -> bool {
         self.state.record_transfer(receipt)
     }
-    pub fn manage<T: Send + Sync + 'static>(
-        &self,
-        value: T,
-    ) -> Result<ResourceRef<T>, ManageResourceError<T>> {
+    pub fn manage<T: Send + Sync + 'static>(&self, value: T) -> Result<ResourceRef<T>, ManageResourceError<T>> {
         let reservation = match self.reserve() {
             Ok(reservation) => reservation,
             Err(error) => return Err(ManageResourceError::new(manage_kind(error), value)),
@@ -79,11 +80,7 @@ impl ResourceScope {
         })
     }
 
-    pub fn manage_with<T, C>(
-        &self,
-        value: T,
-        policy: C,
-    ) -> Result<ResourceRef<T>, ManageWithError<T, C>>
+    pub fn manage_with<T, C>(&self, value: T, policy: C) -> Result<ResourceRef<T>, ManageWithError<T, C>>
     where
         T: Send + Sync + 'static,
         C: super::cleanup::AsyncCleanup<T>,
@@ -112,17 +109,11 @@ impl ResourceScope {
         if key.type_id != std::any::TypeId::of::<T>() {
             return Err(ResourceLookupError::StaleKey);
         }
-        let state = core
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = core.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !state.open {
             return Err(ResourceLookupError::ScopeEnded);
         }
-        let entry = state
-            .slots
-            .get(&key.slot)
-            .ok_or(ResourceLookupError::StaleKey)?;
+        let entry = state.slots.get(&key.slot).ok_or(ResourceLookupError::StaleKey)?;
         let owner = entry
             .owner
             .as_any()
@@ -161,21 +152,28 @@ fn manage_kind(error: ResourceCapacityError) -> ResourceManageErrorKind {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
     use super::ResourceScope;
     use crate::v02::executor::CleanupExecutor;
-    use crate::v02::manager::capacity::{ManagerCapacityPools, ScopeCapacity};
-    use crate::v02::report::{
-        ManagerId, ManagerLimits, PortableExecutorOptions, ResourceId, ResourceManageErrorKind,
-        ResourceScopeId, ScopeLimits, ThreadPoolExecutorOptions,
-    };
+    use crate::v02::manager::capacity::ManagerCapacityPools;
+    use crate::v02::manager::capacity::ScopeCapacity;
+    use crate::v02::report::ManagerId;
+    use crate::v02::report::ManagerLimits;
+    use crate::v02::report::PortableExecutorOptions;
+    use crate::v02::report::ResourceId;
+    use crate::v02::report::ResourceManageErrorKind;
+    use crate::v02::report::ResourceScopeId;
+    use crate::v02::report::ScopeLimits;
+    use crate::v02::report::ThreadPoolExecutorOptions;
     use crate::v02::resource::cleanup::CleanupTransferReceiver;
-    use crate::v02::resource::cleanup_port::{
-        CleanupDispatch, CleanupDispatchPermit, CleanupJob, CleanupQueueError,
-    };
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use crate::v02::resource::cleanup_port::CleanupDispatch;
+    use crate::v02::resource::cleanup_port::CleanupDispatchPermit;
+    use crate::v02::resource::cleanup_port::CleanupJob;
+    use crate::v02::resource::cleanup_port::CleanupQueueError;
 
     struct QueueSlot {
         reserved: bool,
@@ -364,17 +362,15 @@ mod tests {
 
     #[test]
     fn retained_cleanup_uses_reservation_after_scope_end() {
-        use crate::v02::context::CleanupContext;
-        use crate::v02::resource::{AsyncCleanup, CleanupFuture};
         use std::sync::atomic::AtomicBool;
+
+        use crate::v02::context::CleanupContext;
+        use crate::v02::resource::AsyncCleanup;
+        use crate::v02::resource::CleanupFuture;
 
         struct CleanupMarker(Arc<AtomicBool>);
         impl AsyncCleanup<String> for CleanupMarker {
-            fn cleanup(
-                self: Arc<Self>,
-                resource: String,
-                _context: CleanupContext,
-            ) -> CleanupFuture<String> {
+            fn cleanup(self: Arc<Self>, resource: String, _context: CleanupContext) -> CleanupFuture<String> {
                 Box::pin(async move {
                     self.0.store(true, Ordering::SeqCst);
                     drop(resource);
@@ -472,10 +468,7 @@ mod tests {
         }
     }
     impl CleanupJob for AcceptedOwner {
-        fn schedule(
-            self: Box<Self>,
-            executor: Arc<CleanupExecutor>,
-        ) -> Result<(), Box<dyn CleanupJob>> {
+        fn schedule(self: Box<Self>, executor: Arc<CleanupExecutor>) -> Result<(), Box<dyn CleanupJob>> {
             match executor.reserve_drop() {
                 Ok(permit) => {
                     permit.drop_value(self);
@@ -517,11 +510,7 @@ mod tests {
         .unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
         let resource_id = ResourceId::new(manager_id, 12, 1);
-        let receipt = match receiver.accept(
-            resource_id,
-            source_id,
-            Box::new(AcceptedOwner(Arc::clone(&drops))),
-        ) {
+        let receipt = match receiver.accept(resource_id, source_id, Box::new(AcceptedOwner(Arc::clone(&drops)))) {
             Ok(receipt) => receipt,
             Err(_) => panic!("open receiver should accept transfer"),
         };
@@ -565,9 +554,6 @@ mod tests {
         let report = report.lock().unwrap().take().unwrap();
         assert!(report.resources.is_empty());
         assert_eq!(report.failures.len(), 1);
-        assert_eq!(
-            report.failures[0].stage,
-            crate::v02::report::CleanupStage::Drop
-        );
+        assert_eq!(report.failures[0].stage, crate::v02::report::CleanupStage::Drop);
     }
 }

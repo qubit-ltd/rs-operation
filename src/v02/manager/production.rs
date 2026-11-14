@@ -1,25 +1,47 @@
 //! Production assembly for manager capacity, scopes, and executors.
 
-use super::capacity::{CapacityPermit, ManagerCapacityPools, PermitBundle, ScopeCapacity};
-use super::core::{
-    AsyncOperationManager, ExecutionKind, ManagerCore, ManagerPhase, OperationJob,
-    OperationManager, SubmissionLease, SubmissionPermit, SubmissionPort, SubmissionReservation,
-};
-use crate::v02::context::OperationContext;
-use crate::v02::executor::{
-    CleanupExecutor, ExecutorCreateError, ExecutorError, PortableExecutor, ThreadPoolExecutor,
-};
-use crate::v02::report::{
-    AdmissionError, ManagerCreateError, ManagerId, ManagerOptions, OperationId, OperationOptions,
-    ResourceScopeId, ScopeLimits,
-};
-use crate::v02::resource::ResourceScope;
-use crate::v02::resource::cleanup::{CleanupDispatcher, CleanupDispatcherError, CleanupPump};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
+
+use super::capacity::CapacityPermit;
+use super::capacity::ManagerCapacityPools;
+use super::capacity::PermitBundle;
+use super::capacity::ScopeCapacity;
+use super::core::AsyncOperationManager;
+use super::core::ExecutionKind;
+use super::core::ManagerCore;
+use super::core::ManagerPhase;
+use super::core::OperationJob;
+use super::core::OperationManager;
+use super::core::SubmissionLease;
+use super::core::SubmissionPermit;
+use super::core::SubmissionPort;
+use super::core::SubmissionReservation;
+use crate::v02::context::OperationContext;
+use crate::v02::executor::CleanupExecutor;
+use crate::v02::executor::ExecutorCreateError;
+use crate::v02::executor::ExecutorError;
+use crate::v02::executor::PortableExecutor;
+use crate::v02::executor::ThreadPoolExecutor;
+use crate::v02::report::AdmissionError;
+use crate::v02::report::ManagerCreateError;
+use crate::v02::report::ManagerId;
+use crate::v02::report::ManagerOptions;
+use crate::v02::report::OperationId;
+use crate::v02::report::OperationOptions;
+use crate::v02::report::ResourceScopeId;
+use crate::v02::report::ScopeLimits;
+use crate::v02::resource::ResourceScope;
+use crate::v02::resource::cleanup::CleanupDispatcher;
+use crate::v02::resource::cleanup::CleanupDispatcherError;
+use crate::v02::resource::cleanup::CleanupPump;
 
 pub(crate) fn new_sync(options: ManagerOptions) -> Result<OperationManager, ManagerCreateError> {
     validate_options(&options)?;
@@ -39,9 +61,7 @@ pub(crate) fn new_sync(options: ManagerOptions) -> Result<OperationManager, Mana
     Ok(core.root_view())
 }
 
-pub(crate) fn new_async(
-    options: ManagerOptions,
-) -> Result<AsyncOperationManager, ManagerCreateError> {
+pub(crate) fn new_async(options: ManagerOptions) -> Result<AsyncOperationManager, ManagerCreateError> {
     new_sync(options).map(|manager| manager.as_async())
 }
 
@@ -54,39 +74,15 @@ fn validate_options(options: &ManagerOptions) -> Result<(), ManagerCreateError> 
         ("limits.unconsumed_outcomes", limits.unconsumed_outcomes),
         ("limits.cleanup_concurrency", limits.cleanup_concurrency),
         ("limits.diagnostic_events", limits.diagnostic_events),
-        (
-            "scope_limits.child_operations",
-            options.scope_limits.child_operations,
-        ),
+        ("scope_limits.child_operations", options.scope_limits.child_operations),
         ("scope_limits.resources", options.scope_limits.resources),
-        (
-            "scope_limits.effect_records",
-            options.scope_limits.effect_records,
-        ),
-        (
-            "async_executor.worker_count",
-            options.async_executor.worker_count,
-        ),
-        (
-            "async_executor.task_capacity",
-            options.async_executor.task_capacity,
-        ),
-        (
-            "async_executor.polls_per_turn",
-            options.async_executor.polls_per_turn,
-        ),
-        (
-            "sync_executor.worker_count",
-            options.sync_executor.worker_count,
-        ),
-        (
-            "sync_executor.queue_capacity",
-            options.sync_executor.queue_capacity,
-        ),
-        (
-            "cleanup_executor.worker_count",
-            options.cleanup_executor.worker_count,
-        ),
+        ("scope_limits.effect_records", options.scope_limits.effect_records),
+        ("async_executor.worker_count", options.async_executor.worker_count),
+        ("async_executor.task_capacity", options.async_executor.task_capacity),
+        ("async_executor.polls_per_turn", options.async_executor.polls_per_turn),
+        ("sync_executor.worker_count", options.sync_executor.worker_count),
+        ("sync_executor.queue_capacity", options.sync_executor.queue_capacity),
+        ("cleanup_executor.worker_count", options.cleanup_executor.worker_count),
         (
             "cleanup_executor.queue_capacity",
             options.cleanup_executor.queue_capacity,
@@ -116,10 +112,9 @@ struct ProductionSubmissionPort {
 impl ProductionSubmissionPort {
     fn new(options: &ManagerOptions) -> Result<Self, ManagerCreateError> {
         let capacities = ManagerCapacityPools::new(options.limits);
-        let cleanup_pump =
-            CleanupPump::new().map_err(|source| ManagerCreateError::ThreadSpawn {
-                source: Arc::new(source),
-            })?;
+        let cleanup_pump = CleanupPump::new().map_err(|source| ManagerCreateError::ThreadSpawn {
+            source: Arc::new(source),
+        })?;
         let sync = match ThreadPoolExecutor::new(options.sync_executor) {
             Ok(executor) => Arc::new(executor),
             Err(error) => {
@@ -135,17 +130,16 @@ impl ProductionSubmissionPort {
                 return Err(map_executor_create_error(error));
             }
         };
-        let async_workers = match asynchronous
-            .start_workers(options.async_executor.worker_count, "qubit-operation-async")
-        {
-            Ok(workers) => workers,
-            Err(error) => {
-                asynchronous.close_admission();
-                let _ = sync.shutdown().wait();
-                cleanup_pump.shutdown();
-                return Err(map_executor_create_error(error));
-            }
-        };
+        let async_workers =
+            match asynchronous.start_workers(options.async_executor.worker_count, "qubit-operation-async") {
+                Ok(workers) => workers,
+                Err(error) => {
+                    asynchronous.close_admission();
+                    let _ = sync.shutdown().wait();
+                    cleanup_pump.shutdown();
+                    return Err(map_executor_create_error(error));
+                }
+            };
         let cleanup = match CleanupExecutor::new(options.cleanup_executor, options.async_executor) {
             Ok(executor) => Arc::new(executor),
             Err(error) => {
@@ -164,22 +158,20 @@ impl ProductionSubmissionPort {
                 pump.kick();
             }
         }));
-        let cleanup_workers = match cleanup.start_async_workers(
-            options.async_executor.worker_count,
-            "qubit-operation-cleanup-async",
-        ) {
-            Ok(workers) => workers,
-            Err(error) => {
-                let _ = cleanup.shutdown().wait();
-                asynchronous.close_admission();
-                for worker in async_workers {
-                    let _ = worker.join();
+        let cleanup_workers =
+            match cleanup.start_async_workers(options.async_executor.worker_count, "qubit-operation-cleanup-async") {
+                Ok(workers) => workers,
+                Err(error) => {
+                    let _ = cleanup.shutdown().wait();
+                    asynchronous.close_admission();
+                    for worker in async_workers {
+                        let _ = worker.join();
+                    }
+                    let _ = sync.shutdown().wait();
+                    cleanup_pump.shutdown();
+                    return Err(map_executor_create_error(error));
                 }
-                let _ = sync.shutdown().wait();
-                cleanup_pump.shutdown();
-                return Err(map_executor_create_error(error));
-            }
-        };
+            };
         Ok(Self {
             manager_id: ManagerId::new_unique(),
             capacities,
@@ -195,25 +187,17 @@ impl ProductionSubmissionPort {
         })
     }
 
-    fn execution_permit(
-        &self,
-        kind: ExecutionKind,
-        queue: CapacityPermit,
-    ) -> Result<ProductionPermit, AdmissionError> {
+    fn execution_permit(&self, kind: ExecutionKind, queue: CapacityPermit) -> Result<ProductionPermit, AdmissionError> {
         match kind {
             ExecutionKind::Sync => self
                 .sync
                 .reserve()
-                .map(|permit| {
-                    ProductionPermit::Sync(permit, Arc::clone(&self.queued_operations), queue)
-                })
+                .map(|permit| ProductionPermit::Sync(permit, Arc::clone(&self.queued_operations), queue))
                 .map_err(map_executor_admission),
             ExecutionKind::Async => self
                 .asynchronous
                 .reserve()
-                .map(|permit| {
-                    ProductionPermit::Async(permit, Arc::clone(&self.queued_operations), queue)
-                })
+                .map(|permit| ProductionPermit::Async(permit, Arc::clone(&self.queued_operations), queue))
                 .map_err(map_executor_admission),
         }
     }
@@ -321,9 +305,7 @@ impl SubmissionPort for ProductionSubmissionPort {
             self.capacities.root_admission_request()
         };
         match request {
-            Ok(request) => {
-                Box::pin(async move { request.await.map(|_| ()).map_err(|_| AdmissionError::Busy) })
-            }
+            Ok(request) => Box::pin(async move { request.await.map(|_| ()).map_err(|_| AdmissionError::Busy) }),
             Err(_) => Box::pin(std::future::ready(Err(AdmissionError::Busy))),
         }
     }
@@ -353,10 +335,7 @@ impl SubmissionPort for ProductionSubmissionPort {
         self.queued_operations.load(Ordering::Acquire)
     }
 
-    fn service_resource_scope(
-        &self,
-        capacity: usize,
-    ) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
+    fn service_resource_scope(&self, capacity: usize) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
         if capacity == 0 {
             return Err(crate::v02::report::ResourceScopeError::InvalidOptions);
         }
@@ -366,25 +345,12 @@ impl SubmissionPort for ProductionSubmissionPort {
             resources: capacity,
             effect_records: 1,
         };
-        let resource_capacity = Arc::new(ScopeCapacity::root_with_identity(
-            &self.capacities,
-            id.raw(),
-            limits,
-        ));
+        let resource_capacity = Arc::new(ScopeCapacity::root_with_identity(&self.capacities, id.raw(), limits));
         let dispatcher = Arc::new(
-            CleanupDispatcher::new_with_pump(
-                capacity,
-                Arc::clone(&self.cleanup),
-                Arc::clone(&self.cleanup_pump),
-            )
-            .map_err(|_| crate::v02::report::ResourceScopeError::CapacityExceeded)?,
+            CleanupDispatcher::new_with_pump(capacity, Arc::clone(&self.cleanup), Arc::clone(&self.cleanup_pump))
+                .map_err(|_| crate::v02::report::ResourceScopeError::CapacityExceeded)?,
         );
-        Ok(ResourceScope::new(
-            self.manager_id,
-            id,
-            resource_capacity,
-            dispatcher,
-        ))
+        Ok(ResourceScope::new(self.manager_id, id, resource_capacity, dispatcher))
     }
 
     fn operation_resource_scope(
@@ -400,26 +366,13 @@ impl SubmissionPort for ProductionSubmissionPort {
             )
             .map_err(|_| crate::v02::report::ResourceScopeError::CapacityExceeded)?,
         );
-        Ok(ResourceScope::new(
-            self.manager_id,
-            id,
-            capacity,
-            dispatcher,
-        ))
+        Ok(ResourceScope::new(self.manager_id, id, capacity, dispatcher))
     }
 }
 
 enum ProductionPermit {
-    Sync(
-        crate::v02::executor::ThreadPoolPermit,
-        Arc<AtomicUsize>,
-        CapacityPermit,
-    ),
-    Async(
-        crate::v02::executor::PortablePermit,
-        Arc<AtomicUsize>,
-        CapacityPermit,
-    ),
+    Sync(crate::v02::executor::ThreadPoolPermit, Arc<AtomicUsize>, CapacityPermit),
+    Async(crate::v02::executor::PortablePermit, Arc<AtomicUsize>, CapacityPermit),
 }
 
 impl SubmissionPermit for ProductionPermit {
@@ -503,11 +456,7 @@ struct LeaseState {
 }
 
 impl ProductionLease {
-    fn new(
-        active_root: Option<CapacityPermit>,
-        child_path: Option<PermitBundle>,
-        outcome: CapacityPermit,
-    ) -> Self {
+    fn new(active_root: Option<CapacityPermit>, child_path: Option<PermitBundle>, outcome: CapacityPermit) -> Self {
         Self {
             state: Mutex::new(LeaseState {
                 active_root,
@@ -567,30 +516,35 @@ fn map_executor_create_error(error: ExecutorCreateError) -> ManagerCreateError {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::v02::context::CleanupContext;
-    use crate::v02::manager::core::{AsyncOperationManager, OperationManager};
-    use crate::v02::report::{
-        ManagerOptions, OperationOptions, OperationOutcome, ResourceManageErrorKind,
-        ResourceProgress, ShutdownMode, ShutdownWait, StopReason, StopRequestStatus,
-    };
-    use crate::v02::resource::{AsyncCleanup, CleanupFuture, CleanupOutcome};
-    use std::sync::{Arc, Barrier, mpsc};
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::sync::mpsc;
     use std::time::Duration;
+
+    use crate::v02::context::CleanupContext;
+    use crate::v02::manager::core::AsyncOperationManager;
+    use crate::v02::manager::core::OperationManager;
+    use crate::v02::report::ManagerOptions;
+    use crate::v02::report::OperationOptions;
+    use crate::v02::report::OperationOutcome;
+    use crate::v02::report::ResourceManageErrorKind;
+    use crate::v02::report::ResourceProgress;
+    use crate::v02::report::ShutdownMode;
+    use crate::v02::report::ShutdownWait;
+    use crate::v02::report::StopReason;
+    use crate::v02::report::StopRequestStatus;
+    use crate::v02::resource::AsyncCleanup;
+    use crate::v02::resource::CleanupFuture;
+    use crate::v02::resource::CleanupOutcome;
 
     struct MarkerCleanup(Arc<std::sync::atomic::AtomicBool>);
     impl AsyncCleanup<String> for MarkerCleanup {
-        fn cleanup(
-            self: Arc<Self>,
-            resource: String,
-            _context: CleanupContext,
-        ) -> CleanupFuture<String> {
+        fn cleanup(self: Arc<Self>, resource: String, _context: CleanupContext) -> CleanupFuture<String> {
             Box::pin(async move {
                 self.0.store(true, std::sync::atomic::Ordering::SeqCst);
                 drop(resource);
@@ -605,10 +559,7 @@ mod tests {
         let mut sync = manager
             .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(17usize))
             .unwrap();
-        assert!(matches!(
-            sync.wait_outcome().unwrap(),
-            OperationOutcome::Succeeded(17)
-        ));
+        assert!(matches!(sync.wait_outcome().unwrap(), OperationOutcome::Succeeded(17)));
         assert!(sync.wait_settlement().unwrap().all_released());
         assert!(matches!(
             manager
@@ -620,9 +571,7 @@ mod tests {
 
         let manager = AsyncOperationManager::new(ManagerOptions::default()).unwrap();
         let mut asynchronous = manager
-            .try_submit(OperationOptions::default(), |_| async {
-                Ok::<_, ()>(23usize)
-            })
+            .try_submit(OperationOptions::default(), |_| async { Ok::<_, ()>(23usize) })
             .unwrap()
             .into_sync();
         assert!(matches!(
@@ -656,10 +605,7 @@ mod tests {
                 Ok::<_, ()>(())
             })
             .unwrap();
-        assert!(matches!(
-            completion.outcome,
-            OperationOutcome::Succeeded(())
-        ));
+        assert!(matches!(completion.outcome, OperationOutcome::Succeeded(())));
         assert!(completion.settlement.all_released());
     }
 
@@ -681,24 +627,15 @@ mod tests {
             .unwrap();
 
         let reservation = receiver.recv().unwrap();
-        assert_eq!(
-            operation.snapshot().resources,
-            Some(ResourceProgress::ScopeOpen)
-        );
+        assert_eq!(operation.snapshot().resources, Some(ResourceProgress::ScopeOpen));
         gate.wait();
         assert!(matches!(
             operation.wait_outcome().unwrap(),
             OperationOutcome::Succeeded(())
         ));
-        assert_eq!(
-            operation.snapshot().resources,
-            Some(ResourceProgress::WaitingForUsers)
-        );
+        assert_eq!(operation.snapshot().resources, Some(ResourceProgress::WaitingForUsers));
 
-        let error = match reservation.commit_with(
-            String::from("retained input"),
-            MarkerCleanup(cleanup_for_task),
-        ) {
+        let error = match reservation.commit_with(String::from("retained input"), MarkerCleanup(cleanup_for_task)) {
             Ok(_) => panic!("ended operation scope accepted a resource commit"),
             Err(error) => error,
         };
@@ -732,16 +669,14 @@ mod tests {
                 let reservation = scope.reserve_resource().unwrap();
                 sender.send(()).unwrap();
                 body_gate.wait();
-                let error = match reservation.commit_with(
-                    String::from("stopped owner"),
-                    MarkerCleanup(cleanup_for_task),
-                ) {
-                    Ok(resource) => {
-                        drop(resource);
-                        return Ok::<_, ()>(None);
-                    }
-                    Err(error) => error,
-                };
+                let error =
+                    match reservation.commit_with(String::from("stopped owner"), MarkerCleanup(cleanup_for_task)) {
+                        Ok(resource) => {
+                            drop(resource);
+                            return Ok::<_, ()>(None);
+                        }
+                        Err(error) => error,
+                    };
                 let (reason, resource, cleanup, reservation) = error.into_parts();
                 assert_eq!(reason, ResourceManageErrorKind::Stopped);
                 let resource_id = reservation.retain_with_for_cleanup(resource, cleanup);

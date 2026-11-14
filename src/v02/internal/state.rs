@@ -3,13 +3,18 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::task::{Context, Poll};
+use std::task::Context;
+use std::task::Poll;
 
 use crate::v02::internal::notify::Notify;
 use crate::v02::protocol::MonotonicTime;
-use crate::v02::report::{OperationOutcome, OutcomeError, StopReason, StopReport};
+use crate::v02::report::OperationOutcome;
+use crate::v02::report::OutcomeError;
+use crate::v02::report::StopReason;
+use crate::v02::report::StopReport;
 
-/// Single-consumer business-result state plus independently published lifecycle facts.
+/// Single-consumer business-result state plus independently published lifecycle
+/// facts.
 pub(crate) struct StateCell<T, E> {
     state: Mutex<State<T, E>>,
     changed: Notify,
@@ -62,10 +67,7 @@ impl<T, E> StateCell<T, E> {
     }
 
     /// Publishes the first outcome, returning it unchanged if another fact won.
-    pub(crate) fn publish(
-        &self,
-        outcome: OperationOutcome<T, E>,
-    ) -> Result<(), OperationOutcome<T, E>> {
+    pub(crate) fn publish(&self, outcome: OperationOutcome<T, E>) -> Result<(), OperationOutcome<T, E>> {
         let mut state = lock(&self.state);
         if !matches!(state.result, ResultSlot::Pending) || state.stop.is_some() {
             drop(state);
@@ -84,20 +86,13 @@ impl<T, E> StateCell<T, E> {
     }
 
     /// Accepts the first stop unless success or an earlier stop already won.
-    pub(crate) fn request_stop(
-        &self,
-        reason: StopReason,
-        accepted_at: Option<MonotonicTime>,
-    ) -> bool {
+    pub(crate) fn request_stop(&self, reason: StopReason, accepted_at: Option<MonotonicTime>) -> bool {
         let accepted = {
             let mut state = lock(&self.state);
             if state.success_published || state.stop.is_some() {
                 false
             } else {
-                let report = StopReport {
-                    reason,
-                    accepted_at,
-                };
+                let report = StopReport { reason, accepted_at };
                 state.stop = Some(report.clone());
                 if matches!(state.result, ResultSlot::Pending) {
                     state.result = ResultSlot::Ready(OperationOutcome::Stopped(report));
@@ -130,7 +125,8 @@ impl<T, E> StateCell<T, E> {
         }
     }
 
-    /// Discards delivery rights, dropping a ready outcome outside the state lock.
+    /// Discards delivery rights, dropping a ready outcome outside the state
+    /// lock.
     ///
     /// Returns true when this call changes Pending or Ready to Discarded.
     pub(crate) fn discard_result(&self) -> bool {
@@ -179,8 +175,7 @@ impl<T, E> Future for ResultFuture<'_, T, E> {
             if self.notification.is_none() {
                 self.notification = Some(self.cell.changed.notified_since(generation));
             }
-            match Pin::new(self.notification.as_mut().expect("notification was set")).poll(context)
-            {
+            match Pin::new(self.notification.as_mut().expect("notification was set")).poll(context) {
                 Poll::Ready(()) => self.notification = None,
                 Poll::Pending => return Poll::Pending,
             }
@@ -189,19 +184,18 @@ impl<T, E> Future for ResultFuture<'_, T, E> {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::v02::report::OperationOutcome;
     use std::sync::Arc;
     use std::sync::Weak;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::v02::report::OperationOutcome;
 
     struct LockCheckingDrop {
         cell: Weak<StateCell<LockCheckingDrop, ()>>,
@@ -239,10 +233,7 @@ mod tests {
         assert!(future.as_mut().poll(&mut context).is_pending());
         drop(future);
 
-        assert!(
-            cell.publish(OperationOutcome::Succeeded(Box::new(91)))
-                .is_ok()
-        );
+        assert!(cell.publish(OperationOutcome::Succeeded(Box::new(91))).is_ok());
         let outcome = cell
             .take_if_ready()
             .expect("cancelled observation must not take result")
@@ -275,9 +266,6 @@ mod tests {
             OperationOutcome::Succeeded(value) => assert_eq!(*value, 73),
             _ => panic!("expected successful outcome"),
         }
-        assert_eq!(
-            cell.take_if_ready().unwrap_err(),
-            OutcomeError::AlreadyTaken
-        );
+        assert_eq!(cell.take_if_ready().unwrap_err(), OutcomeError::AlreadyTaken);
     }
 }

@@ -1,22 +1,37 @@
 //! Bounded, per-scope handoff queue for resource cleanup.
 #![allow(dead_code)] // The manager and scope assembly is completed by T11.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::future::Future;
-use std::panic::{self, AssertUnwindSafe};
+use std::panic::AssertUnwindSafe;
+use std::panic::{self};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::task::{Context, Poll};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::Weak;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::thread::JoinHandle;
+use std::thread::{self};
 
-use super::cleanup_port::{CleanupDispatch, CleanupDispatchPermit, CleanupJob, CleanupQueueError};
+use super::cleanup_port::CleanupDispatch;
+use super::cleanup_port::CleanupDispatchPermit;
+use super::cleanup_port::CleanupJob;
+use super::cleanup_port::CleanupQueueError;
 use crate::v02::context::CleanupContext;
 use crate::v02::executor::CleanupExecutor;
 use crate::v02::manager::capacity::ResourceRegistration;
-use crate::v02::report::{
-    CleanupEvidence, CleanupFailure, ManagerId, ResourceId, ResourceScopeId, TransferReceipt,
-};
+use crate::v02::report::CleanupEvidence;
+use crate::v02::report::CleanupFailure;
+use crate::v02::report::ManagerId;
+use crate::v02::report::ResourceId;
+use crate::v02::report::ResourceScopeId;
+use crate::v02::report::TransferReceipt;
 
 pub type CleanupFuture<T> = Pin<Box<dyn Future<Output = CleanupOutcome<T>> + Send + 'static>>;
 
@@ -39,10 +54,7 @@ where
 pub enum CleanupOutcome<T> {
     Released,
     Transferred(TransferReceipt),
-    Failed {
-        failure: CleanupFailure,
-        resource: T,
-    },
+    Failed { failure: CleanupFailure, resource: T },
 }
 
 /// Default-drop owner. T05's blocking executor owns this value until its
@@ -51,8 +63,7 @@ pub enum CleanupOutcome<T> {
 pub(crate) struct DefaultDropJob<T: Send + 'static> {
     resource: Option<T>,
     registration: Option<ResourceRegistration>,
-    completed:
-        Option<Box<dyn FnOnce(Result<CleanupEvidence, UnconfirmedCleanup>) + Send + 'static>>,
+    completed: Option<Box<dyn FnOnce(Result<CleanupEvidence, UnconfirmedCleanup>) + Send + 'static>>,
 }
 
 /// Retained business capacity and panic evidence after a destructor fails.
@@ -118,10 +129,7 @@ impl<T: Send + 'static> DefaultDropJob<T> {
 }
 
 impl<T: Send + 'static> CleanupJob for DefaultDropJob<T> {
-    fn schedule(
-        self: Box<Self>,
-        executor: Arc<CleanupExecutor>,
-    ) -> Result<(), Box<dyn CleanupJob>> {
+    fn schedule(self: Box<Self>, executor: Arc<CleanupExecutor>) -> Result<(), Box<dyn CleanupJob>> {
         match executor.reserve_drop() {
             Ok(permit) => {
                 permit.drop_value(self);
@@ -194,20 +202,14 @@ impl<T: Send + Sync + 'static> AsyncCleanupJob<T> {
         self
     }
 
-    pub(crate) fn with_callback(
-        mut self,
-        callback: impl FnOnce(AsyncCleanupCompletion<T>) + Send + 'static,
-    ) -> Self {
+    pub(crate) fn with_callback(mut self, callback: impl FnOnce(AsyncCleanupCompletion<T>) + Send + 'static) -> Self {
         self.callback = Some(Box::new(callback));
         self
     }
 }
 
 impl<T: Send + Sync + 'static> CleanupJob for AsyncCleanupJob<T> {
-    fn schedule(
-        mut self: Box<Self>,
-        executor: Arc<CleanupExecutor>,
-    ) -> Result<(), Box<dyn CleanupJob>> {
+    fn schedule(mut self: Box<Self>, executor: Arc<CleanupExecutor>) -> Result<(), Box<dyn CleanupJob>> {
         let permit = match executor.reserve_async() {
             Ok(permit) => permit,
             Err(_) => return Err(self),
@@ -263,8 +265,7 @@ impl<T: Send + Sync + 'static> Future for AsyncCleanupTask<T> {
         match outcome {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(outcome)) => {
-                let evidence = matches!(&outcome, CleanupOutcome::Released)
-                    .then_some(CleanupEvidence::Confirmed);
+                let evidence = matches!(&outcome, CleanupOutcome::Released).then_some(CleanupEvidence::Confirmed);
                 let policy = this.policy.take().expect("policy is present");
                 let completion = AsyncCleanupCompletion {
                     outcome: Some(outcome),
@@ -288,8 +289,7 @@ impl<T: Send + Sync + 'static> Future for AsyncCleanupTask<T> {
                     .take()
                     .map(|future| Box::new(future) as Box<dyn std::any::Any + Send>);
                 let policy = this.policy.take().expect("policy is present");
-                let policy_capsule: Box<dyn std::any::Any + Send + Sync> =
-                    Box::new(Arc::clone(&policy));
+                let policy_capsule: Box<dyn std::any::Any + Send + Sync> = Box::new(Arc::clone(&policy));
                 let completion = AsyncCleanupCompletion {
                     outcome: None,
                     evidence: None,
@@ -461,10 +461,7 @@ pub(crate) struct CleanupTransferReceiver {
 
 impl Drop for CleanupTransferReceiver {
     fn drop(&mut self) {
-        let state = self
-            .state
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self.state.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (_, job) in state.pending.drain(..) {
             // Accepted work must remain owned by a live manager/receiver.
             // Preserve it if the receiver is dropped prematurely.
@@ -599,10 +596,7 @@ struct CleanupDispatcherInner {
 
 impl Drop for CleanupDispatcherInner {
     fn drop(&mut self) {
-        let state = self
-            .state
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self.state.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
         for job in state.pending.drain(..) {
             // A dispatcher must be retained by its manager while pending is
             // nonzero. Preserve owners if that lifetime invariant is broken.
@@ -688,7 +682,8 @@ impl CleanupDispatcher {
     /// Schedules up to `limit` pending jobs. If the T05 executor has no slot,
     /// the first rejected job remains at the front of the queue with its
     /// resource owner intact. T11 drives this method from manager progress and
-    /// shutdown polling; the method never blocks or invokes user cleanup inline.
+    /// shutdown polling; the method never blocks or invokes user cleanup
+    /// inline.
     pub(crate) fn drive(&self, limit: usize) -> usize {
         Self::drive_inner(&self.inner, limit)
     }
@@ -789,24 +784,34 @@ impl Drop for DispatchPermit {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AsyncCleanup, AsyncCleanupJob, CleanupDispatch, CleanupDispatcher, CleanupJob,
-        CleanupOutcome, CleanupTransferError, CleanupTransferReceiver, DefaultDropJob,
-    };
-    use crate::v02::executor::CleanupExecutor;
-    use crate::v02::report::{
-        CleanupFailure, CleanupStage, ContextOptions, DiagnosticSummary, ManagerId,
-        PortableExecutorOptions, ResourceId, ResourceScopeId, ThreadPoolExecutorOptions,
-    };
-    use std::sync::{Arc, mpsc};
+    use std::sync::Arc;
+    use std::sync::mpsc;
     use std::time::Duration;
+
+    use super::AsyncCleanup;
+    use super::AsyncCleanupJob;
+    use super::CleanupDispatch;
+    use super::CleanupDispatcher;
+    use super::CleanupJob;
+    use super::CleanupOutcome;
+    use super::CleanupTransferError;
+    use super::CleanupTransferReceiver;
+    use super::DefaultDropJob;
+    use crate::v02::executor::CleanupExecutor;
+    use crate::v02::report::CleanupFailure;
+    use crate::v02::report::CleanupStage;
+    use crate::v02::report::ContextOptions;
+    use crate::v02::report::DiagnosticSummary;
+    use crate::v02::report::ManagerId;
+    use crate::v02::report::PortableExecutorOptions;
+    use crate::v02::report::ResourceId;
+    use crate::v02::report::ResourceScopeId;
+    use crate::v02::report::ThreadPoolExecutorOptions;
 
     fn executor() -> Arc<CleanupExecutor> {
         Arc::new(
@@ -878,10 +883,7 @@ mod tests {
         }
     }
     impl CleanupJob for DropOnSchedule {
-        fn schedule(
-            self: Box<Self>,
-            executor: Arc<CleanupExecutor>,
-        ) -> Result<(), Box<dyn CleanupJob>> {
+        fn schedule(self: Box<Self>, executor: Arc<CleanupExecutor>) -> Result<(), Box<dyn CleanupJob>> {
             match executor.reserve_drop() {
                 Ok(permit) => {
                     permit.drop_value(self);
@@ -904,10 +906,7 @@ mod tests {
             }
         }
         let job = DefaultDropJob::new(Probe(drop_send), None, move |evidence| {
-            let thread = std::thread::current()
-                .name()
-                .unwrap_or("unnamed")
-                .to_owned();
+            let thread = std::thread::current().name().unwrap_or("unnamed").to_owned();
             if let Ok(evidence) = evidence {
                 let _ = complete_send.send((evidence, thread));
             }
@@ -917,9 +916,7 @@ mod tests {
         // no remaining pending work.
         assert_eq!(dispatcher.drive(1), 0);
         drop_receive.recv_timeout(Duration::from_secs(1)).unwrap();
-        let (evidence, thread_name) = complete_receive
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        let (evidence, thread_name) = complete_receive.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(evidence, crate::v02::report::CleanupEvidence::DropCompleted);
         assert!(thread_name.starts_with("qubit-operation-"));
     }
@@ -980,9 +977,7 @@ mod tests {
             .reserve_drop()
             .unwrap()
             .drop_value(SignalThenHold(started_send, release_receive));
-        started_receive
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        started_receive.recv_timeout(Duration::from_secs(1)).unwrap();
         executor
             .reserve_drop()
             .unwrap()
@@ -1092,16 +1087,11 @@ mod tests {
         let manager = ManagerId::new_unique();
         let source_scope = ResourceScopeId::new_unique();
         let receiver_scope = ResourceScopeId::new_unique();
-        let first_receiver =
-            CleanupTransferReceiver::new(manager, receiver_scope, 1, executor()).unwrap();
+        let first_receiver = CleanupTransferReceiver::new(manager, receiver_scope, 1, executor()).unwrap();
         let first_id = ResourceId::new(manager, 1, 1);
         assert!(
             first_receiver
-                .accept(
-                    first_id,
-                    source_scope,
-                    Box::new(DropOnSchedule(mpsc::channel().0)),
-                )
+                .accept(first_id, source_scope, Box::new(DropOnSchedule(mpsc::channel().0)),)
                 .is_ok()
         );
 
@@ -1113,11 +1103,7 @@ mod tests {
             }
         }
         let second_id = ResourceId::new(manager, 2, 1);
-        let job: Box<dyn CleanupJob> = Box::new(DefaultDropJob::new(
-            Probe(drop_send),
-            None,
-            |_| {},
-        ));
+        let job: Box<dyn CleanupJob> = Box::new(DefaultDropJob::new(Probe(drop_send), None, |_| {}));
         let (error, returned_job) = match first_receiver.accept(second_id, source_scope, job) {
             Ok(_) => panic!("a full receiver must not sign a transfer"),
             Err(failure) => failure,
@@ -1126,8 +1112,7 @@ mod tests {
         assert!(drop_receive.try_recv().is_err());
 
         let second_receiver =
-            CleanupTransferReceiver::new(manager, ResourceScopeId::new_unique(), 1, executor())
-                .unwrap();
+            CleanupTransferReceiver::new(manager, ResourceScopeId::new_unique(), 1, executor()).unwrap();
         let receipt = match second_receiver.accept(second_id, source_scope, returned_job) {
             Ok(receipt) => receipt,
             Err(_) => panic!("open receiver with capacity must accept owner"),
@@ -1164,11 +1149,7 @@ mod tests {
         );
         *holder.lock().unwrap() = Some(Arc::clone(&receiver));
         let resource = ResourceId::new(manager, 19, 1);
-        let receipt = match receiver.accept(
-            resource,
-            source_scope,
-            Box::new(DropOnSchedule(mpsc::channel().0)),
-        ) {
+        let receipt = match receiver.accept(resource, source_scope, Box::new(DropOnSchedule(mpsc::channel().0))) {
             Ok(receipt) => receipt,
             Err(_) => panic!("open receiver should accept transfer"),
         };
@@ -1195,11 +1176,7 @@ mod tests {
         )
         .unwrap();
         let resource = ResourceId::new(manager, 21, 1);
-        let receipt = match receiver.accept(
-            resource,
-            source_scope,
-            Box::new(DropOnSchedule(mpsc::channel().0)),
-        ) {
+        let receipt = match receiver.accept(resource, source_scope, Box::new(DropOnSchedule(mpsc::channel().0))) {
             Ok(receipt) => receipt,
             Err(_) => panic!("open receiver should accept transfer"),
         };

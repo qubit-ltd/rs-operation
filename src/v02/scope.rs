@@ -1,17 +1,32 @@
 //! Non-cloneable operation scope views and execution-frame lifetime.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
+
 use crate::v02::context::OperationContext;
 use crate::v02::internal::notify::Notify;
 use crate::v02::manager::capacity::ScopeCapacity;
-use crate::v02::manager::core::{ManagerCore, OperationManager};
-use crate::v02::report::{
-    ChildFailurePolicy, ChildFailureSummary, ChildOutcomeKind, ChildOutcomeSummary,
-    ChildRequirement, ChildSettlement, CleanupFailure, OperationId, OperationOptions,
-    OperationOutcome, RecoveryHandle, ResourceCleanupReport, ResourceScopeReport, SettlementReport,
-    StopReason, StopReport, TransferReceipt,
-};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use crate::v02::manager::core::ManagerCore;
+use crate::v02::manager::core::OperationManager;
+use crate::v02::report::ChildFailurePolicy;
+use crate::v02::report::ChildFailureSummary;
+use crate::v02::report::ChildOutcomeKind;
+use crate::v02::report::ChildOutcomeSummary;
+use crate::v02::report::ChildRequirement;
+use crate::v02::report::ChildSettlement;
+use crate::v02::report::CleanupFailure;
+use crate::v02::report::OperationId;
+use crate::v02::report::OperationOptions;
+use crate::v02::report::OperationOutcome;
+use crate::v02::report::RecoveryHandle;
+use crate::v02::report::ResourceCleanupReport;
+use crate::v02::report::ResourceScopeReport;
+use crate::v02::report::SettlementReport;
+use crate::v02::report::StopReason;
+use crate::v02::report::StopReport;
+use crate::v02::report::TransferReceipt;
 
 /// Internal scope state referenced weakly by child-bound manager views.
 pub(crate) struct ScopeCore {
@@ -27,8 +42,7 @@ pub(crate) struct ScopeCore {
     group: Option<Arc<crate::v02::manager::group::GroupCore>>,
     children_changed: Notify,
     state: Mutex<ScopeState>,
-    resource_progress:
-        Mutex<HashMap<crate::v02::report::ResourceScopeId, crate::v02::report::ResourceProgress>>,
+    resource_progress: Mutex<HashMap<crate::v02::report::ResourceScopeId, crate::v02::report::ResourceProgress>>,
     operation_core: Mutex<Option<Weak<crate::v02::operation::OperationCore>>>,
 }
 
@@ -76,7 +90,8 @@ struct ChildRecord {
     input_released: bool,
 }
 
-/// An owner that receives the scope-end event independently of child settlement.
+/// An owner that receives the scope-end event independently of child
+/// settlement.
 pub(crate) trait ScopeResourceOwner: Send + Sync + 'static {
     fn end(&self);
 }
@@ -180,10 +195,7 @@ impl ScopeCore {
         &self.resource_scope
     }
 
-    pub(crate) fn bind_operation_core(
-        &self,
-        operation: &Arc<crate::v02::operation::OperationCore>,
-    ) {
+    pub(crate) fn bind_operation_core(&self, operation: &Arc<crate::v02::operation::OperationCore>) {
         *lock(&self.operation_core) = Some(Arc::downgrade(operation));
         let progress = lock(&self.resource_progress)
             .values()
@@ -211,22 +223,13 @@ impl ScopeCore {
         }
     }
 
-    pub(crate) fn mark_child(
-        &self,
-        id: OperationId,
-        scope: Weak<ScopeCore>,
-        requirement: ChildRequirement,
-    ) -> bool {
+    pub(crate) fn mark_child(&self, id: OperationId, scope: Weak<ScopeCore>, requirement: ChildRequirement) -> bool {
         let mut state = lock(&self.state);
         if !state.open || state.stopping || self.context.check().is_err() {
             return false;
         }
         let (children_total, overflowed) = state.children_total.overflowing_add(1);
-        state.children_total = if overflowed {
-            usize::MAX
-        } else {
-            children_total
-        };
+        state.children_total = if overflowed { usize::MAX } else { children_total };
         state.children_truncated |= overflowed;
         state.active_children.insert(
             id,
@@ -263,9 +266,7 @@ impl ScopeCore {
                 return Err(resource_scope);
             }
             state.pending_resource_scopes = state.pending_resource_scopes.saturating_add(1);
-            state
-                .resources
-                .push(Box::new(resource_scope.internal_clone()));
+            state.resources.push(Box::new(resource_scope.internal_clone()));
         }
         let weak = Arc::downgrade(self);
         let progress_scope = Arc::downgrade(self);
@@ -287,9 +288,7 @@ impl ScopeCore {
         let callback = {
             let mut state = lock(&self.state);
             state.pending_resource_scopes = state.pending_resource_scopes.saturating_sub(1);
-            state.resource_reports_total = state
-                .resource_reports_total
-                .saturating_add(report.resources.len());
+            state.resource_reports_total = state.resource_reports_total.saturating_add(report.resources.len());
             for resource in report.resources.iter().cloned() {
                 if state.resource_reports.len() < self.diagnostic_limit {
                     state.resource_reports.push(resource);
@@ -297,9 +296,7 @@ impl ScopeCore {
                     state.resource_reports_truncated = true;
                 }
             }
-            state.cleanup_failures_total = state
-                .cleanup_failures_total
-                .saturating_add(report.failures.len());
+            state.cleanup_failures_total = state.cleanup_failures_total.saturating_add(report.failures.len());
             for failure in report.failures.iter().cloned() {
                 if state.cleanup_failures.len() < self.diagnostic_limit {
                     state.cleanup_failures.push(failure);
@@ -307,9 +304,7 @@ impl ScopeCore {
                     state.cleanup_failures_truncated = true;
                 }
             }
-            state.recoveries_total = state
-                .recoveries_total
-                .saturating_add(report.recoveries.len());
+            state.recoveries_total = state.recoveries_total.saturating_add(report.recoveries.len());
             for recovery in report.recoveries.iter().cloned() {
                 if state.recoveries.len() < self.diagnostic_limit {
                     state.recoveries.push(recovery);
@@ -332,10 +327,7 @@ impl ScopeCore {
         invoke_callback(callback);
     }
 
-    pub(crate) fn record_child_outcome(
-        &self,
-        outcome: ChildOutcomeSummary,
-    ) -> Result<(), ChildOutcomeSummary> {
+    pub(crate) fn record_child_outcome(&self, outcome: ChildOutcomeSummary) -> Result<(), ChildOutcomeSummary> {
         let id = outcome.operation_id;
         let stop_siblings = {
             let mut state = lock(&self.state);
@@ -406,9 +398,10 @@ impl ScopeCore {
 
     fn outcomes_ready(state: &ScopeState) -> bool {
         state.body_finished
-            && state.active_children.values().all(|record| {
-                record.requirement != ChildRequirement::Required || record.outcome.is_some()
-            })
+            && state
+                .active_children
+                .values()
+                .all(|record| record.requirement != ChildRequirement::Required || record.outcome.is_some())
     }
 
     fn take_outcome_callback(state: &mut ScopeState) -> Option<Box<dyn FnOnce() + Send>> {
@@ -419,11 +412,7 @@ impl ScopeCore {
         }
     }
 
-    pub(crate) fn record_child_settlement(
-        &self,
-        id: OperationId,
-        settlement: Arc<SettlementReport>,
-    ) -> bool {
+    pub(crate) fn record_child_settlement(&self, id: OperationId, settlement: Arc<SettlementReport>) -> bool {
         {
             let mut state = lock(&self.state);
             let Some(record) = state.active_children.get_mut(&id) else {
@@ -440,16 +429,14 @@ impl ScopeCore {
     fn settle_child_if_ready(&self, id: OperationId) -> bool {
         let settled = {
             let mut state = lock(&self.state);
-            let ready = state.active_children.get(&id).is_some_and(|record| {
-                record.outcome.is_some() && record.settlement.is_some() && record.input_released
-            });
+            let ready = state
+                .active_children
+                .get(&id)
+                .is_some_and(|record| record.outcome.is_some() && record.settlement.is_some() && record.input_released);
             if !ready {
                 return false;
             }
-            let record = state
-                .active_children
-                .remove(&id)
-                .expect("ready child record exists");
+            let record = state.active_children.remove(&id).expect("ready child record exists");
             let child = ChildSettlement {
                 operation_id: id,
                 outcome: record.outcome.expect("ready child has outcome"),
@@ -609,22 +596,16 @@ impl ScopeCore {
             let mut changed = Box::pin(self.children_changed.notified());
             let result = std::future::poll_fn(|cx| {
                 if !self.is_open() {
-                    return std::task::Poll::Ready(Some(
-                        crate::v02::report::AdmissionError::ScopeEnded,
-                    ));
+                    return std::task::Poll::Ready(Some(crate::v02::report::AdmissionError::ScopeEnded));
                 }
                 if self.context.check().is_err() {
-                    return std::task::Poll::Ready(Some(
-                        crate::v02::report::AdmissionError::Stopped,
-                    ));
+                    return std::task::Poll::Ready(Some(crate::v02::report::AdmissionError::Stopped));
                 }
                 if changed.as_mut().poll(cx).is_ready() {
                     return std::task::Poll::Ready(None);
                 }
                 if stopped.as_mut().poll(cx).is_ready() {
-                    return std::task::Poll::Ready(Some(
-                        crate::v02::report::AdmissionError::Stopped,
-                    ));
+                    return std::task::Poll::Ready(Some(crate::v02::report::AdmissionError::Stopped));
                 }
                 std::task::Poll::Pending
             })
@@ -637,11 +618,7 @@ impl ScopeCore {
 
     pub(crate) fn child_reports(&self) -> (Vec<ChildSettlement>, usize, bool) {
         let state = lock(&self.state);
-        (
-            state.children.clone(),
-            state.children_total,
-            state.children_truncated,
-        )
+        (state.children.clone(), state.children_total, state.children_truncated)
     }
 
     pub(crate) fn resource_reports(
@@ -690,8 +667,7 @@ impl ScopeCore {
         let callback = {
             let mut state = lock(&self.state);
             assert!(state.settlement_callback.is_none());
-            if !state.open && state.active_children.is_empty() && state.pending_resource_scopes == 0
-            {
+            if !state.open && state.active_children.is_empty() && state.pending_resource_scopes == 0 {
                 Some(Box::new(callback) as Box<dyn FnOnce() + Send>)
             } else {
                 state.settlement_callback = Some(Box::new(callback));
@@ -836,11 +812,7 @@ impl OperationScope {
 
     /// Creates an owned manager view bound to this operation's direct children.
     pub fn manager(&self) -> OperationManager {
-        let manager = self
-            .core
-            .manager
-            .upgrade()
-            .unwrap_or_else(|| Arc::clone(&self.manager));
+        let manager = self.core.manager.upgrade().unwrap_or_else(|| Arc::clone(&self.manager));
         OperationManager::bound(manager, &self.core)
     }
 
@@ -857,8 +829,7 @@ impl OperationScope {
     pub fn manage<T: Send + Sync + 'static>(
         &self,
         resource: T,
-    ) -> Result<crate::v02::resource::ResourceRef<T>, crate::v02::resource::ManageResourceError<T>>
-    {
+    ) -> Result<crate::v02::resource::ResourceRef<T>, crate::v02::resource::ManageResourceError<T>> {
         let reservation = match self.reserve_resource() {
             Ok(reservation) => reservation,
             Err(error) => {
@@ -873,9 +844,7 @@ impl OperationScope {
                         crate::v02::report::ResourceManageErrorKind::CapacityExceeded
                     }
                 };
-                return Err(crate::v02::resource::ManageResourceError::new(
-                    kind, resource,
-                ));
+                return Err(crate::v02::resource::ManageResourceError::new(kind, resource));
             }
         };
         reservation.commit(resource).map_err(|error| {
@@ -888,10 +857,7 @@ impl OperationScope {
     /// Reserves scope capacity and cleanup storage before creating a resource.
     pub fn reserve_resource(
         &self,
-    ) -> Result<
-        crate::v02::resource::ResourceReservation,
-        crate::v02::resource::ResourceCapacityError,
-    > {
+    ) -> Result<crate::v02::resource::ResourceReservation, crate::v02::resource::ResourceCapacityError> {
         let result = self
             .core
             .with_resource_lifecycle(|| self.core.resource_scope().reserve());
@@ -963,16 +929,15 @@ impl ScopeResourceOwner for crate::v02::resource::ResourceScope {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::v02::manager::core::ManagerCore;
     use std::sync::Arc;
     use std::sync::Mutex;
+
+    use crate::v02::manager::core::ManagerCore;
 
     #[test]
     fn scope_manager_is_owned_and_frame_bound() {
@@ -991,22 +956,32 @@ mod tests {
 
 #[cfg(test)]
 mod lifecycle_tests {
-    use super::{ScopeCore, ScopeResourceOwner};
-    use crate::v02::context::OperationContext;
-    use crate::v02::manager::capacity::{ManagerCapacityPools, ScopeCapacity};
-    use crate::v02::manager::core::ManagerCore;
-    use crate::v02::report::{
-        ChildOutcomeKind, ChildOutcomeSummary, DiagnosticSummary, OperationId, OperationOptions,
-        SettlementReport, SettlementStatus, StopReason,
-    };
-    use crate::v02::report::{
-        ContextOptions, ManagerId, ManagerLimits, ResourceScopeId, ScopeLimits,
-    };
-    use crate::v02::resource::cleanup_port::{
-        CleanupDispatch, CleanupDispatchPermit, CleanupQueueError,
-    };
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use super::ScopeCore;
+    use super::ScopeResourceOwner;
+    use crate::v02::context::OperationContext;
+    use crate::v02::manager::capacity::ManagerCapacityPools;
+    use crate::v02::manager::capacity::ScopeCapacity;
+    use crate::v02::manager::core::ManagerCore;
+    use crate::v02::report::ChildOutcomeKind;
+    use crate::v02::report::ChildOutcomeSummary;
+    use crate::v02::report::ContextOptions;
+    use crate::v02::report::DiagnosticSummary;
+    use crate::v02::report::ManagerId;
+    use crate::v02::report::ManagerLimits;
+    use crate::v02::report::OperationId;
+    use crate::v02::report::OperationOptions;
+    use crate::v02::report::ResourceScopeId;
+    use crate::v02::report::ScopeLimits;
+    use crate::v02::report::SettlementReport;
+    use crate::v02::report::SettlementStatus;
+    use crate::v02::report::StopReason;
+    use crate::v02::resource::cleanup_port::CleanupDispatch;
+    use crate::v02::resource::cleanup_port::CleanupDispatchPermit;
+    use crate::v02::resource::cleanup_port::CleanupQueueError;
 
     struct NoCleanup;
     impl CleanupDispatch for NoCleanup {
@@ -1069,10 +1044,7 @@ mod lifecycle_tests {
         manager
             .try_submit_body(move |scope| {
                 let core = Arc::clone(&scope.core);
-                assert!(
-                    core.register_resource_owner(Box::new(EndProbe(counter)))
-                        .is_ok()
-                );
+                assert!(core.register_resource_owner(Box::new(EndProbe(counter))).is_ok());
                 scope.manager().try_submit_body(|_| {}).unwrap();
                 *saved_in_body.lock().unwrap() = Some(core);
             })
@@ -1187,10 +1159,7 @@ mod lifecycle_tests {
             })
             .unwrap();
         let sibling = sibling.lock().unwrap().take().unwrap();
-        assert_eq!(
-            sibling.context.stop_reason(),
-            Some(StopReason::RequiredChildFailed)
-        );
+        assert_eq!(sibling.context.stop_reason(), Some(StopReason::RequiredChildFailed));
         assert!(!sibling.mark_child(
             OperationId::new_unique(),
             std::sync::Weak::new(),
@@ -1205,24 +1174,13 @@ mod lifecycle_tests {
                 let core = Arc::clone(&scope.core);
                 let mut options = OperationOptions::default();
                 options.requirement = crate::v02::report::ChildRequirement::Optional;
-                let id = scope
-                    .manager()
-                    .try_submit_body_with(options, |_| {})
-                    .unwrap();
+                let id = scope.manager().try_submit_body_with(options, |_| {}).unwrap();
                 core.record_child_outcome(outcome(id, ChildOutcomeKind::Failed))
                     .unwrap();
                 *parent_in_body.lock().unwrap() = Some(core);
             })
             .unwrap();
-        assert!(
-            parent
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .required_failure()
-                .is_none()
-        );
+        assert!(parent.lock().unwrap().as_ref().unwrap().required_failure().is_none());
     }
 
     #[test]

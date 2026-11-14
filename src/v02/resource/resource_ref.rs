@@ -1,8 +1,11 @@
-use super::core::Owner;
-use super::resource_key::ResourceKey;
-use crate::v02::report::{ManagerId, ResourceId, ResourceScopeId};
 use std::ops::Deref;
 use std::sync::Arc;
+
+use super::core::Owner;
+use super::resource_key::ResourceKey;
+use crate::v02::report::ManagerId;
+use crate::v02::report::ResourceId;
+use crate::v02::report::ResourceScopeId;
 
 /// A strong user reference. Each clone independently delays scope cleanup.
 pub struct ResourceRef<T: Send + Sync + 'static> {
@@ -32,9 +35,7 @@ impl<T: Send + Sync + 'static> Clone for ResourceRef<T> {
 impl<T: Send + Sync + 'static> Deref for ResourceRef<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        self.value
-            .as_deref()
-            .expect("live ResourceRef owns its resource")
+        self.value.as_deref().expect("live ResourceRef owns its resource")
     }
 }
 impl<T: Send + Sync + 'static> Drop for ResourceRef<T> {

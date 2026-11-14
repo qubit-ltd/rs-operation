@@ -1,18 +1,25 @@
 //! Admission and lifecycle ports for externally executed child operations.
 
-use crate::v02::operation::OperationCore;
-use crate::v02::protocol::OperationControl;
-use crate::v02::report::OperationId;
-use crate::v02::report::{
-    ChildOutcomeSummary, ChildRelease, ChildSnapshot, SettlementReport, StopReason, StopReport,
-};
-use crate::v02::resource::ResourceRef;
-use crate::v02::scope::ScopeCore;
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
+
+use crate::v02::operation::OperationCore;
+use crate::v02::protocol::OperationControl;
+use crate::v02::report::ChildOutcomeSummary;
+use crate::v02::report::ChildRelease;
+use crate::v02::report::ChildSnapshot;
+use crate::v02::report::OperationId;
+use crate::v02::report::SettlementReport;
+use crate::v02::report::StopReason;
+use crate::v02::report::StopReport;
+use crate::v02::resource::ResourceRef;
+use crate::v02::scope::ScopeCore;
 
 #[cfg(test)]
 #[path = "adapter/tests.rs"]
@@ -68,14 +75,7 @@ impl AdapterReservation {
         activate: impl FnOnce(Box<dyn Any + Send>) + Send + 'static,
         abandon: impl FnOnce() + Send + 'static,
     ) -> Self {
-        Self::build(
-            admission,
-            commit_gate,
-            activation_gate,
-            true,
-            activate,
-            abandon,
-        )
+        Self::build(admission, commit_gate, activation_gate, true, activate, abandon)
     }
 
     fn build(
@@ -181,16 +181,12 @@ impl AttachedChild {
         debug_assert!(can_commit);
         let gate_result = (self.commit_gate)();
         let rejected = gate_result.err().or_else(|| {
-            (!self.gate_is_authoritative
-                && (stop_requested || self.control.snapshot().stop.is_some()))
-            .then_some(AdapterErrorKind::Stopped)
+            (!self.gate_is_authoritative && (stop_requested || self.control.snapshot().stop.is_some()))
+                .then_some(AdapterErrorKind::Stopped)
         });
         if let Some(reason) = rejected {
             self.abandon_once();
-            return Err(AdapterError {
-                reason,
-                payload: self,
-            });
+            return Err(AdapterError { reason, payload: self });
         }
         lock(&self.lifecycle).phase = ChildPhase::Committed;
         Ok(ChildStartPermit {
@@ -283,24 +279,16 @@ impl ChildStartPermit {
         };
         let gate_result = (self.activation_gate)();
         let activation_error = gate_result.err().or_else(|| {
-            (!self.gate_is_authoritative
-                && (stop_requested || self.control.snapshot().stop.is_some()))
-            .then_some(AdapterErrorKind::Stopped)
+            (!self.gate_is_authoritative && (stop_requested || self.control.snapshot().stop.is_some()))
+                .then_some(AdapterErrorKind::Stopped)
         });
         if let Some(reason) = activation_error {
             self.abandon_once();
-            return Err(AdapterError {
-                reason,
-                payload: self,
-            });
+            return Err(AdapterError { reason, payload: self });
         }
         lock(&self.lifecycle).phase = ChildPhase::Activated;
         if let Some(activate) = self.activate.take() {
-            activate(
-                self.payload
-                    .take()
-                    .expect("committed child owns its payload"),
-            );
+            activate(self.payload.take().expect("committed child owns its payload"));
         }
         drop(self.admission.take());
         self.abandon.take();
@@ -444,10 +432,7 @@ impl ManagedOperationControl {
                 {
                     (
                         false,
-                        Some(std::mem::replace(
-                            &mut facts.settlement_waiters[index],
-                            candidate,
-                        )),
+                        Some(std::mem::replace(&mut facts.settlement_waiters[index], candidate)),
                     )
                 } else {
                     facts.settlement_waiters.push(candidate);
@@ -522,10 +507,7 @@ fn poll_managed_fact<V: Clone>(
         } else {
             let waiters = waiters(&mut facts);
             if let Some(index) = waiters.iter().position(|old| old.will_wake(&candidate)) {
-                (
-                    Poll::Pending,
-                    Some(std::mem::replace(&mut waiters[index], candidate)),
-                )
+                (Poll::Pending, Some(std::mem::replace(&mut waiters[index], candidate)))
             } else {
                 waiters.push(candidate);
                 (Poll::Pending, None)
@@ -536,7 +518,8 @@ fn poll_managed_fact<V: Clone>(
     result
 }
 
-/// External work together with the resource reference that keeps its input alive.
+/// External work together with the resource reference that keeps its input
+/// alive.
 pub(crate) struct ExternalTask<T: Send + Sync + 'static> {
     state: Arc<Mutex<TaskState<T>>>,
 }
@@ -562,31 +545,27 @@ impl<T: Send + Sync + 'static> Drop for TaskState<T> {
     fn drop(&mut self) {
         if self.runtime_lost {
             if let Some(input) = self.input.take() {
-                lock(LOST_INPUTS.get_or_init(|| Mutex::new(HashMap::new())))
-                    .insert(self.operation_id, Box::new(input));
+                lock(LOST_INPUTS.get_or_init(|| Mutex::new(HashMap::new()))).insert(self.operation_id, Box::new(input));
             }
         }
     }
 }
 
-/// Releases a retained lost-runtime input after independent release evidence arrives.
+/// Releases a retained lost-runtime input after independent release evidence
+/// arrives.
 ///
-/// The reference is removed under the registry lock and dropped after unlocking so
-/// normal resource cleanup can continue without running user destructors in the lock.
+/// The reference is removed under the registry lock and dropped after unlocking
+/// so normal resource cleanup can continue without running user destructors in
+/// the lock.
 pub(crate) fn recover_lost_input(operation_id: OperationId) -> bool {
-    let input = LOST_INPUTS
-        .get()
-        .and_then(|inputs| lock(inputs).remove(&operation_id));
+    let input = LOST_INPUTS.get().and_then(|inputs| lock(inputs).remove(&operation_id));
     let found = input.is_some();
     drop(input);
     found
 }
 
 impl<T: Send + Sync + 'static> ExternalTask<T> {
-    pub(crate) fn new(
-        operation_id: OperationId,
-        input: ResourceRef<T>,
-    ) -> (Self, Arc<ExternalTaskControl<T>>) {
+    pub(crate) fn new(operation_id: OperationId, input: ResourceRef<T>) -> (Self, Arc<ExternalTaskControl<T>>) {
         let state = Arc::new(Mutex::new(TaskState {
             operation_id,
             execution: crate::v02::report::ExecutionPhase::Queued,
@@ -622,10 +601,7 @@ impl<T: Send + Sync + 'static> ExternalTask<T> {
         wake_all(waiters);
     }
 
-    pub(crate) fn confirm_input_release(
-        &self,
-        release: ChildRelease,
-    ) -> Result<(), AdapterError<ChildRelease>> {
+    pub(crate) fn confirm_input_release(&self, release: ChildRelease) -> Result<(), AdapterError<ChildRelease>> {
         let (input, waiters) = {
             let mut state = lock(&self.state);
             if release.operation_id != state.operation_id || state.release.is_some() {
@@ -635,10 +611,7 @@ impl<T: Send + Sync + 'static> ExternalTask<T> {
                 });
             }
             state.release = Some(release);
-            (
-                state.input.take(),
-                std::mem::take(&mut state.release_waiters),
-            )
+            (state.input.take(), std::mem::take(&mut state.release_waiters))
         };
         drop(input);
         wake_all(waiters);
@@ -714,9 +687,7 @@ impl<T: Send + Sync + 'static> OperationControl for ExternalTaskControl<T> {
     fn request_stop(&self, reason: StopReason) {
         let waiters = {
             let mut state = lock(&self.state);
-            if state.stop.is_some()
-                || state.execution == crate::v02::report::ExecutionPhase::Finished
-            {
+            if state.stop.is_some() || state.execution == crate::v02::report::ExecutionPhase::Finished {
                 return;
             }
             state.stop = Some(StopReport {
@@ -788,10 +759,7 @@ where
         } else {
             let waiters = waiters(&mut state);
             if let Some(index) = waiters.iter().position(|old| old.will_wake(&candidate)) {
-                (
-                    Poll::Pending,
-                    Some(std::mem::replace(&mut waiters[index], candidate)),
-                )
+                (Poll::Pending, Some(std::mem::replace(&mut waiters[index], candidate)))
             } else {
                 waiters.push(candidate);
                 (Poll::Pending, None)
@@ -809,7 +777,5 @@ fn wake_all(waiters: Vec<Waker>) {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

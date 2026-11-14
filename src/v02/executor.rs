@@ -3,14 +3,24 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::panic::{self, AssertUnwindSafe};
+use std::panic::AssertUnwindSafe;
+use std::panic::{self};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::task::{Context, Wake, Waker};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Wake;
+use std::task::Waker;
+use std::thread::JoinHandle;
+use std::thread::{self};
 
-use super::report::{PortableExecutorOptions, ThreadPoolExecutorOptions};
+use super::report::PortableExecutorOptions;
+use super::report::ThreadPoolExecutorOptions;
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -240,9 +250,7 @@ impl PortableExecutor {
 
     /// Polls at most the configured number of tasks for one scheduling turn.
     pub(crate) fn poll_turn(&self) -> usize {
-        (0..self.inner.polls_per_turn)
-            .take_while(|_| self.poll_once())
-            .count()
+        (0..self.inner.polls_per_turn).take_while(|_| self.poll_once()).count()
     }
 
     pub(crate) fn close_admission(&self) {
@@ -489,9 +497,7 @@ impl CleanupExecutor {
 
     /// Reserves bounded capacity before removing a resource owner.
     pub(crate) fn reserve_drop(&self) -> Result<CleanupPermit, ExecutorError> {
-        self.blocking
-            .reserve()
-            .map(|permit| CleanupPermit { permit })
+        self.blocking.reserve().map(|permit| CleanupPermit { permit })
     }
 
     /// Reserves a slot for asynchronous cleanup without polling user code.
@@ -654,9 +660,7 @@ fn pool_worker(inner: Arc<PoolInner>) {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn notify_capacity(callback: &Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>) {
@@ -668,14 +672,23 @@ fn notify_capacity(callback: &Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::v02::report::{PortableExecutorOptions, ThreadPoolExecutorOptions};
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
-    use std::task::{Context, Poll, Waker};
-    use std::time::{Duration, Instant};
+    use std::sync::Arc;
+    use std::sync::Condvar;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Waker;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::v02::report::PortableExecutorOptions;
+    use crate::v02::report::ThreadPoolExecutorOptions;
 
     struct Gate {
         state: Mutex<(bool, bool)>,
@@ -759,10 +772,7 @@ mod tests {
 
         assert_eq!(executor.poll_turn(), 1);
         assert_eq!(polls.load(Ordering::SeqCst), 1);
-        assert!(
-            !executor.poll_once(),
-            "a pending future must not be busy-polled"
-        );
+        assert!(!executor.poll_once(), "a pending future must not be busy-polled");
         saved.0.lock().unwrap().take().unwrap().wake();
         assert!(executor.poll_once());
         assert_eq!(polls.load(Ordering::SeqCst), 2);
@@ -811,8 +821,7 @@ mod tests {
         let pool = ThreadPoolExecutor::new(options(1, 1)).unwrap();
         let gate = Arc::new(Gate::new());
         let worker_gate = Arc::clone(&gate);
-        pool.try_submit(move || worker_gate.enter_and_wait())
-            .unwrap();
+        pool.try_submit(move || worker_gate.enter_and_wait()).unwrap();
         gate.wait_started();
 
         let queued = Arc::new(AtomicBool::new(false));
@@ -838,8 +847,7 @@ mod tests {
         let pool = ThreadPoolExecutor::new(options(1, 1)).unwrap();
         let gate = Arc::new(Gate::new());
         let worker_gate = Arc::clone(&gate);
-        pool.try_submit(move || worker_gate.enter_and_wait())
-            .unwrap();
+        pool.try_submit(move || worker_gate.enter_and_wait()).unwrap();
         gate.wait_started();
         let shutdown = pool.shutdown();
 
@@ -857,8 +865,7 @@ mod tests {
         let pool = ThreadPoolExecutor::new(options(1, 1)).unwrap();
         let gate = Arc::new(Gate::new());
         let worker_gate = Arc::clone(&gate);
-        pool.try_submit(move || worker_gate.enter_and_wait())
-            .unwrap();
+        pool.try_submit(move || worker_gate.enter_and_wait()).unwrap();
         gate.wait_started();
         let shutdown = pool.shutdown();
         let waiter = shutdown.clone();
@@ -949,9 +956,7 @@ mod tests {
         impl Drop for Probe {
             fn drop(&mut self) {
                 let current = thread::current();
-                let _ = self
-                    .0
-                    .send((current.id(), current.name().map(str::to_owned)));
+                let _ = self.0.send((current.id(), current.name().map(str::to_owned)));
             }
         }
 

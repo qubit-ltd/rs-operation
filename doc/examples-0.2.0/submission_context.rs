@@ -1,4 +1,7 @@
-use qubit_operation::{AdmissionError, OperationHandle, OperationManager, OperationOptions};
+use qubit_operation::AdmissionError;
+use qubit_operation::OperationHandle;
+use qubit_operation::OperationManager;
+use qubit_operation::OperationOptions;
 
 pub fn submit_scan(
     manager: &OperationManager,
@@ -6,9 +9,7 @@ pub fn submit_scan(
 ) -> Result<OperationHandle<usize, String>, AdmissionError> {
     manager
         .try_submit(OperationOptions::default(), move |scope| {
-            let input = scope
-                .manage(bytes)
-                .map_err(|error| format!("{:?}", error.kind()))?;
+            let input = scope.manage(bytes).map_err(|error| format!("{:?}", error.kind()))?;
             Ok::<_, String>(input.len())
         })
         .map_err(|error| error.into_parts().0)

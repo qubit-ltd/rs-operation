@@ -1,7 +1,9 @@
-use qubit_operation::{
-    AdmissionError, AsyncOperationHandle, AsyncOperationManager, ManagerOptions, OperationOptions,
-    OperationOutcome,
-};
+use qubit_operation::AdmissionError;
+use qubit_operation::AsyncOperationHandle;
+use qubit_operation::AsyncOperationManager;
+use qubit_operation::ManagerOptions;
+use qubit_operation::OperationOptions;
+use qubit_operation::OperationOutcome;
 
 #[derive(Debug)]
 struct FileSummary {
@@ -14,32 +16,29 @@ fn submit_file_summary(
     bytes: Vec<u8>,
 ) -> Result<AsyncOperationHandle<FileSummary, String>, AdmissionError> {
     manager
-        .try_submit(
-            OperationOptions::default(),
-            move |parent_scope| async move {
-                let input = parent_scope
-                    .manage(bytes)
-                    .map_err(|error| format!("{:?}", error.kind()))?;
-                let child = parent_scope
-                    .manager()
-                    .try_submit(OperationOptions::default(), move |child_scope| {
-                        let header_bytes = input.iter().take(5).copied().collect::<Vec<u8>>();
-                        let header = child_scope
-                            .manage(header_bytes)
-                            .map_err(|error| format!("{:?}", error.kind()))?;
-                        Ok::<_, String>(FileSummary {
-                            byte_count: input.len(),
-                            mime: (header.as_slice() == b"%PDF-").then_some("application/pdf"),
-                        })
+        .try_submit(OperationOptions::default(), move |parent_scope| async move {
+            let input = parent_scope
+                .manage(bytes)
+                .map_err(|error| format!("{:?}", error.kind()))?;
+            let child = parent_scope
+                .manager()
+                .try_submit(OperationOptions::default(), move |child_scope| {
+                    let header_bytes = input.iter().take(5).copied().collect::<Vec<u8>>();
+                    let header = child_scope
+                        .manage(header_bytes)
+                        .map_err(|error| format!("{:?}", error.kind()))?;
+                    Ok::<_, String>(FileSummary {
+                        byte_count: input.len(),
+                        mime: (header.as_slice() == b"%PDF-").then_some("application/pdf"),
                     })
-                    .map_err(|e| e.to_string())?;
-                let mut child = child.into_async();
-                match child.wait_outcome().await.map_err(|e| e.to_string())? {
-                    OperationOutcome::Succeeded(summary) => Ok(summary),
-                    other => Err(format!("summary child failed: {other:?}")),
-                }
-            },
-        )
+                })
+                .map_err(|e| e.to_string())?;
+            let mut child = child.into_async();
+            match child.wait_outcome().await.map_err(|e| e.to_string())? {
+                OperationOutcome::Succeeded(summary) => Ok(summary),
+                other => Err(format!("summary child failed: {other:?}")),
+            }
+        })
         .map_err(|error| error.into_parts().0)
 }
 

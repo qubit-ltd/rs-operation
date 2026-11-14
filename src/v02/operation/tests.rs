@@ -1,16 +1,25 @@
-use super::*;
-use crate::v02::protocol::{
-    ClockDomainId, ClockSource, Deadline, MonotonicTime, TimerRegistration,
-};
-use crate::v02::report::{
-    OperationId, OperationOutcome, ResourceProgress, SettlementReport, SettlementStatus, StopReason,
-};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 use std::time::Duration;
+
+use super::*;
+use crate::v02::protocol::ClockDomainId;
+use crate::v02::protocol::ClockSource;
+use crate::v02::protocol::Deadline;
+use crate::v02::protocol::MonotonicTime;
+use crate::v02::protocol::TimerRegistration;
+use crate::v02::report::OperationId;
+use crate::v02::report::OperationOutcome;
+use crate::v02::report::ResourceProgress;
+use crate::v02::report::SettlementReport;
+use crate::v02::report::SettlementStatus;
+use crate::v02::report::StopReason;
 
 fn settlement(operation_id: OperationId, status: SettlementStatus) -> SettlementReport {
     SettlementReport {
@@ -45,20 +54,17 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     future.poll(&mut context)
 }
 
-fn handle<T: Send + 'static, E: Send + 'static>() -> (OperationHandle<T, E>, Arc<OutcomeSlot<T, E>>)
-{
+fn handle<T: Send + 'static, E: Send + 'static>() -> (OperationHandle<T, E>, Arc<OutcomeSlot<T, E>>) {
     let core = OperationCore::new(OperationId::new_unique());
     let slot = Arc::new(OutcomeSlot::new(Arc::clone(&core)));
     let handle = OperationHandle::new(Arc::clone(&core), Arc::clone(&slot), Arc::new(NoopStop));
     (handle, slot)
 }
 
-fn async_handle<T: Send + 'static, E: Send + 'static>()
--> (AsyncOperationHandle<T, E>, Arc<OutcomeSlot<T, E>>) {
+fn async_handle<T: Send + 'static, E: Send + 'static>() -> (AsyncOperationHandle<T, E>, Arc<OutcomeSlot<T, E>>) {
     let core = OperationCore::new(OperationId::new_unique());
     let slot = Arc::new(OutcomeSlot::new(Arc::clone(&core)));
-    let handle =
-        AsyncOperationHandle::new(Arc::clone(&core), Arc::clone(&slot), Arc::new(NoopStop));
+    let handle = AsyncOperationHandle::new(Arc::clone(&core), Arc::clone(&slot), Arc::new(NoopStop));
     (handle, slot)
 }
 
@@ -158,11 +164,7 @@ fn unfinished_handle_drop_requests_stop() {
     let observer = handle.observer();
     drop(handle);
     assert_eq!(
-        observer
-            .snapshot()
-            .stop
-            .as_ref()
-            .map(|report| report.reason),
+        observer.snapshot().stop.as_ref().map(|report| report.reason),
         Some(StopReason::UserCancelled)
     );
     assert_eq!(observer.snapshot().outcome, OutcomeAvailability::Discarded);
@@ -179,13 +181,7 @@ fn settlement_is_published_once_and_stays_immutable() {
         .publish_settlement(settlement(id, SettlementStatus::Transferred))
         .unwrap();
     let second_candidate = settlement(id, SettlementStatus::Released);
-    assert!(
-        handle
-            .parts()
-            .core
-            .publish_settlement(second_candidate)
-            .is_err()
-    );
+    assert!(handle.parts().core.publish_settlement(second_candidate).is_err());
     assert!(Arc::ptr_eq(&first, &handle.snapshot().settlement.unwrap()));
     assert_eq!(first.status, SettlementStatus::Transferred);
 }
@@ -203,10 +199,7 @@ fn outcome_and_settlement_are_independent_facts() {
 
     assert!(slot.publish(OperationOutcome::Failed(())).is_ok());
     assert_eq!(handle.snapshot().outcome, OutcomeAvailability::Available);
-    assert_eq!(
-        handle.snapshot().settlement.unwrap().status,
-        SettlementStatus::Released
-    );
+    assert_eq!(handle.snapshot().settlement.unwrap().status, SettlementStatus::Released);
 }
 
 #[test]
@@ -233,10 +226,7 @@ fn observer_conversion_and_resource_progress_keep_the_untyped_core() {
         .parts()
         .core
         .set_resource_progress(Some(ResourceProgress::WaitingForUsers));
-    assert_eq!(
-        observer.snapshot().resources,
-        Some(ResourceProgress::WaitingForUsers)
-    );
+    assert_eq!(observer.snapshot().resources, Some(ResourceProgress::WaitingForUsers));
 }
 
 #[test]
@@ -258,11 +248,7 @@ fn async_settlement_deadline_only_limits_observation() {
             self.0
         }
 
-        fn register_deadline(
-            &self,
-            _at: MonotonicTime,
-            _wake: Waker,
-        ) -> Box<dyn TimerRegistration> {
+        fn register_deadline(&self, _at: MonotonicTime, _wake: Waker) -> Box<dyn TimerRegistration> {
             Box::new(NoopTimer)
         }
     }
@@ -298,15 +284,9 @@ fn outcome_delivery_hook_notifies_take_and_discard_once() {
     let observed = Arc::clone(&deliveries);
     slot.set_delivery_hook(move |delivery| observed.lock().unwrap().push(delivery));
     slot.publish(OperationOutcome::Succeeded(7)).unwrap();
-    assert!(matches!(
-        slot.take_if_ready(),
-        Ok(Some(OperationOutcome::Succeeded(7)))
-    ));
+    assert!(matches!(slot.take_if_ready(), Ok(Some(OperationOutcome::Succeeded(7)))));
     slot.discard();
-    assert_eq!(
-        *deliveries.lock().unwrap(),
-        vec![OutcomeDelivery::Delivered]
-    );
+    assert_eq!(*deliveries.lock().unwrap(), vec![OutcomeDelivery::Delivered]);
 
     let discarded = OutcomeSlot::<u8, ()>::new(OperationCore::new(OperationId::new_unique()));
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));

@@ -2,25 +2,34 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use crate::v02::report::{
-    CleanupFailure, RecoveryId, RecoveryPhase, RecoverySnapshot, RecoveryStoreCreateError,
-    RecoveryStoreId, RecoveryStoreOptions, RecoveryStoreSnapshot, RecoveryTransfer,
-    RecoveryTransferError, RecoveryTransferReceipt, ResourceId,
-};
-use std::fmt;
+use crate::v02::report::CleanupFailure;
+use crate::v02::report::RecoveryId;
+use crate::v02::report::RecoveryPhase;
+use crate::v02::report::RecoverySnapshot;
+use crate::v02::report::RecoveryStoreCreateError;
+use crate::v02::report::RecoveryStoreId;
+use crate::v02::report::RecoveryStoreOptions;
+use crate::v02::report::RecoveryStoreSnapshot;
+use crate::v02::report::RecoveryTransfer;
+use crate::v02::report::RecoveryTransferError;
+use crate::v02::report::RecoveryTransferReceipt;
+use crate::v02::report::ResourceId;
 
 static NEXT_RECOVERY_TRANSFER: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) type RecoveryPayload = Arc<dyn Any + Send + Sync + 'static>;
-pub(crate) type RecoveryFuture =
-    Pin<Box<dyn Future<Output = Result<(), CleanupFailure>> + Send + 'static>>;
+pub(crate) type RecoveryFuture = Pin<Box<dyn Future<Output = Result<(), CleanupFailure>> + Send + 'static>>;
 
 /// Retry strategy operates through a shared retained owner capsule. The
 /// capsule remains in `RecoveryCore` across failures and future cancellation.
@@ -44,16 +53,13 @@ impl<T: Send + Sync + 'static> RecoveryAction for AsyncRecoveryAction<T> {
             let resource = lock(&owner.resource).take().ok_or_else(|| CleanupFailure {
                 resource_id: owner.resource_id,
                 stage: crate::v02::report::CleanupStage::AsyncRelease,
-                summary: crate::v02::report::DiagnosticSummary::new(
-                    "recovery owner is unavailable",
-                ),
+                summary: crate::v02::report::DiagnosticSummary::new("recovery owner is unavailable"),
                 source: None,
             })?;
-            let context = crate::v02::context::CleanupContext::new(Default::default())
-                .expect("empty cleanup context is valid");
+            let context =
+                crate::v02::context::CleanupContext::new(Default::default()).expect("empty cleanup context is valid");
             match Arc::clone(&owner.policy).cleanup(resource, context).await {
-                super::cleanup::CleanupOutcome::Released
-                | super::cleanup::CleanupOutcome::Transferred(_) => {
+                super::cleanup::CleanupOutcome::Released | super::cleanup::CleanupOutcome::Transferred(_) => {
                     drop(lock(&owner.registration).take());
                     Ok(())
                 }
@@ -101,23 +107,13 @@ pub(crate) struct RecoveryCore {
     state: Mutex<State>,
     terminal: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync + 'static>>>,
     executor: Mutex<Option<Arc<crate::v02::executor::CleanupExecutor>>>,
-    retry_route: Mutex<
-        Option<
-            Arc<
-                dyn Fn(RecoveryId) -> Result<RecoveryAttempt, crate::v02::report::RetryError>
-                    + Send
-                    + Sync,
-            >,
-        >,
-    >,
+    retry_route:
+        Mutex<Option<Arc<dyn Fn(RecoveryId) -> Result<RecoveryAttempt, crate::v02::report::RetryError> + Send + Sync>>>,
 }
 
 impl Drop for RecoveryCore {
     fn drop(&mut self) {
-        let state = self
-            .state
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self.state.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.phase != RecoveryPhase::Resolved {
             if let Some(payload) = state.payload.take() {
                 std::mem::forget(payload);
@@ -130,11 +126,7 @@ impl Drop for RecoveryCore {
 }
 
 impl RecoveryCore {
-    pub(crate) fn new(
-        resources: Vec<ResourceId>,
-        payload: RecoveryPayload,
-        action: Arc<dyn RecoveryAction>,
-    ) -> Self {
+    pub(crate) fn new(resources: Vec<ResourceId>, payload: RecoveryPayload, action: Arc<dyn RecoveryAction>) -> Self {
         Self {
             id: RecoveryId::new_unique(),
             resources: resources.into(),
@@ -181,9 +173,7 @@ impl RecoveryCore {
         }
     }
 
-    pub(crate) fn try_retry(
-        self: &Arc<Self>,
-    ) -> Result<RecoveryAttempt, crate::v02::report::RetryError> {
+    pub(crate) fn try_retry(self: &Arc<Self>) -> Result<RecoveryAttempt, crate::v02::report::RetryError> {
         let route = {
             let state = lock(&self.state);
             if state.phase == RecoveryPhase::Transferred {
@@ -254,10 +244,7 @@ impl RecoveryCore {
         true
     }
 
-    pub(crate) fn set_terminal_callback(
-        &self,
-        callback: Arc<dyn Fn(bool) + Send + Sync + 'static>,
-    ) {
+    pub(crate) fn set_terminal_callback(&self, callback: Arc<dyn Fn(bool) + Send + Sync + 'static>) {
         *lock(&self.terminal) = Some(callback);
     }
 
@@ -313,10 +300,7 @@ impl RecoveryHandle {
         self.core.try_retry()
     }
 
-    pub fn transfer_to(
-        &self,
-        destination: &RecoveryStore,
-    ) -> Result<RecoveryTransfer, RecoveryTransferError> {
+    pub fn transfer_to(&self, destination: &RecoveryStore) -> Result<RecoveryTransfer, RecoveryTransferError> {
         destination
             .accept(Arc::clone(&self.core))
             .map_err(|(error, _owner)| match error {
@@ -391,9 +375,7 @@ impl RecoveryStore {
                 field: "cleanup_concurrency",
             });
         }
-        if options.cleanup_executor.worker_count == 0
-            || options.cleanup_executor.queue_capacity == 0
-        {
+        if options.cleanup_executor.worker_count == 0 || options.cleanup_executor.queue_capacity == 0 {
             return Err(RecoveryStoreCreateError::InvalidOptions {
                 field: "cleanup_executor",
             });
@@ -431,15 +413,8 @@ impl RecoveryStore {
             )
             .ok()?,
         );
-        let workers = executor
-            .start_async_workers(1, "qubit-operation-recovery-test")
-            .ok()?;
-        Some(Self::from_parts(
-            group_capacity,
-            resource_capacity,
-            executor,
-            workers,
-        ))
+        let workers = executor.start_async_workers(1, "qubit-operation-recovery-test").ok()?;
+        Some(Self::from_parts(group_capacity, resource_capacity, executor, workers))
     }
 
     fn from_parts(
@@ -469,10 +444,7 @@ impl RecoveryStore {
         }
     }
 
-    fn accept(
-        &self,
-        group: Arc<RecoveryCore>,
-    ) -> Result<RecoveryTransfer, (RecoveryStoreError, Arc<RecoveryCore>)> {
+    fn accept(&self, group: Arc<RecoveryCore>) -> Result<RecoveryTransfer, (RecoveryStoreError, Arc<RecoveryCore>)> {
         self.prune_resolved();
         let mut state = lock(&self.state);
         if !state.accepting {
@@ -546,10 +518,7 @@ impl RecoveryStore {
         lock(&self.state).groups.contains_key(&id)
     }
 
-    pub fn try_retry(
-        &self,
-        id: RecoveryId,
-    ) -> Result<RecoveryAttempt, crate::v02::report::RetryError> {
+    pub fn try_retry(&self, id: RecoveryId) -> Result<RecoveryAttempt, crate::v02::report::RetryError> {
         let group = lock(&self.state)
             .groups
             .get(&id)
@@ -565,9 +534,7 @@ impl RecoveryStore {
 
     pub fn request_shutdown(&self) -> RecoveryStoreShutdownHandle {
         self.close_admission();
-        RecoveryStoreShutdownHandle {
-            store: self.clone(),
-        }
+        RecoveryStoreShutdownHandle { store: self.clone() }
     }
 
     pub fn snapshot(&self) -> RecoveryStoreSnapshot {
@@ -592,9 +559,7 @@ impl RecoveryStore {
             let resolved = state
                 .groups
                 .iter()
-                .filter_map(|(id, group)| {
-                    (group.snapshot().phase == RecoveryPhase::Resolved).then_some(*id)
-                })
+                .filter_map(|(id, group)| (group.snapshot().phase == RecoveryPhase::Resolved).then_some(*id))
                 .collect::<Vec<_>>();
             resolved
                 .into_iter()
@@ -635,9 +600,7 @@ impl RecoveryStoreShutdownHandle {
         }
         if state.started {
             while !state.finished {
-                state = changed
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = changed.wait(state).unwrap_or_else(std::sync::PoisonError::into_inner);
             }
             return Ok(());
         }
@@ -681,9 +644,7 @@ impl RecoveryStoreShutdownHandle {
             if Instant::now() >= deadline {
                 return Ok(false);
             }
-            std::thread::sleep(
-                Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())),
-            );
+            std::thread::sleep(Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now())));
         }
         self.wait()?;
         Ok(true)
@@ -720,10 +681,7 @@ struct AttemptObservation {
 }
 
 impl RecoveryAttempt {
-    pub fn wait(
-        &self,
-    ) -> Result<crate::v02::report::RecoveryAttemptReport, crate::v02::report::ObservationError>
-    {
+    pub fn wait(&self) -> Result<crate::v02::report::RecoveryAttemptReport, crate::v02::report::ObservationError> {
         Ok(block_on(self.wait_async()))
     }
 
@@ -832,9 +790,7 @@ impl Drop for RecoveryRun {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn publish_attempt(observation: &AttemptObservation, snapshot: RecoverySnapshot) {
@@ -847,9 +803,7 @@ fn publish_attempt(observation: &AttemptObservation, snapshot: RecoverySnapshot)
     }
 }
 
-async fn wait_attempt_async(
-    observation: &AttemptObservation,
-) -> crate::v02::report::RecoveryAttemptReport {
+async fn wait_attempt_async(observation: &AttemptObservation) -> crate::v02::report::RecoveryAttemptReport {
     std::future::poll_fn(|cx| {
         if let Some(report) = lock(&observation.report).clone() {
             return std::task::Poll::Ready(report);
@@ -892,10 +846,7 @@ fn store_usage(state: &RecoveryStoreState) -> (usize, usize) {
         .map(|group| {
             let phase = group.snapshot().phase;
             let active = phase != RecoveryPhase::Resolved;
-            (
-                usize::from(active),
-                if active { group.resource_count() } else { 0 },
-            )
+            (usize::from(active), if active { group.resource_count() } else { 0 })
         })
         .fold((0, 0), |(groups, resources), (group, resource)| {
             (groups + group, resources + resource)
@@ -904,16 +855,26 @@ fn store_usage(state: &RecoveryStoreState) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{RecoveryAction, RecoveryCore, RecoveryPhase, lock};
-    use crate::v02::report::{
-        CleanupFailure, CleanupStage, DiagnosticSummary, ManagerId, ResourceId,
-    };
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Waker};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Waker;
     use std::time::Duration;
+
+    use super::RecoveryAction;
+    use super::RecoveryCore;
+    use super::RecoveryPhase;
+    use super::lock;
+    use crate::v02::report::CleanupFailure;
+    use crate::v02::report::CleanupStage;
+    use crate::v02::report::DiagnosticSummary;
+    use crate::v02::report::ManagerId;
+    use crate::v02::report::ResourceId;
 
     struct Noop;
     impl RecoveryAction for Noop {
@@ -988,8 +949,10 @@ mod tests {
 
     #[test]
     fn cancelled_retry_observer_keeps_real_owner_and_policy_on_store_worker() {
-        use crate::v02::manager::capacity::{ManagerCapacityPools, ScopeCapacity};
-        use crate::v02::report::{ManagerLimits, ScopeLimits};
+        use crate::v02::manager::capacity::ManagerCapacityPools;
+        use crate::v02::manager::capacity::ScopeCapacity;
+        use crate::v02::report::ManagerLimits;
+        use crate::v02::report::ScopeLimits;
 
         struct NoopWake;
         impl std::task::Wake for NoopWake {
@@ -1014,8 +977,7 @@ mod tests {
         let registration = ScopeCapacity::root(&pools, 81, ScopeLimits::default())
             .resource_registration()
             .unwrap();
-        let (payload, action) =
-            super::async_owner(resource_id, Probe(Arc::clone(&drops)), policy, registration);
+        let (payload, action) = super::async_owner(resource_id, Probe(Arc::clone(&drops)), policy, registration);
         let group = Arc::new(RecoveryCore::new(vec![resource_id], payload, action));
         let handle = super::RecoveryHandle::new(Arc::clone(&group));
         let store = super::RecoveryStore::new(super::RecoveryStoreOptions::default()).unwrap();
@@ -1040,20 +1002,12 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while group.snapshot().phase != RecoveryPhase::Resolved {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "store retry did not finish"
-            );
+            assert!(std::time::Instant::now() < deadline, "store retry did not finish");
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(policy_owner.calls.load(Ordering::SeqCst), 2);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert!(
-            store
-                .request_shutdown()
-                .wait_for(Duration::from_secs(2))
-                .unwrap()
-        );
+        assert!(store.request_shutdown().wait_for(Duration::from_secs(2)).unwrap());
     }
 
     struct ErrCleanup;
@@ -1088,19 +1042,13 @@ mod tests {
         assert_eq!(transfer.recovery, id);
         assert_eq!(transfer.receipt.recovery(), id);
         assert!(store.contains(id));
-        assert_eq!(
-            handle.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Transferred
-        );
+        assert_eq!(handle.snapshot().phase, crate::v02::report::RecoveryPhase::Transferred);
         assert_eq!(store.snapshot().groups, 1);
         let shutdown = store.request_shutdown();
         assert!(!shutdown.wait_for(Duration::ZERO).unwrap());
         let attempt = store.try_retry(id).unwrap();
         let report = attempt.wait().unwrap();
-        assert_eq!(
-            report.recovery.phase,
-            crate::v02::report::RecoveryPhase::Resolved
-        );
+        assert_eq!(report.recovery.phase, crate::v02::report::RecoveryPhase::Resolved);
         assert!(shutdown.wait_for(Duration::from_secs(2)).unwrap());
         assert!(shutdown.is_complete());
     }
@@ -1135,20 +1083,14 @@ mod tests {
         let group = group();
         let attempt = group.try_retry().unwrap();
         drop(attempt);
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Unconfirmed
-        );
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Unconfirmed);
     }
 
     #[test]
     fn recovery_store_handoff_is_bounded_and_signed() {
         let manager = ManagerId::new_unique();
         let group = Arc::new(RecoveryCore::new(
-            vec![
-                ResourceId::new(manager, 1, 1),
-                ResourceId::new(manager, 2, 1),
-            ],
+            vec![ResourceId::new(manager, 1, 1), ResourceId::new(manager, 2, 1)],
             Arc::new(()),
             Arc::new(Noop),
         ));
@@ -1159,10 +1101,7 @@ mod tests {
             handle.transfer_to(&too_small),
             Err(crate::v02::report::RecoveryTransferError::CapacityExceeded)
         );
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Pending
-        );
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Pending);
 
         let store = super::RecoveryStore::with_capacity(1, 2).unwrap();
         let transfer = match store.accept(Arc::clone(&group)) {
@@ -1172,20 +1111,11 @@ mod tests {
         assert_eq!(transfer.recovery, group.id());
         assert_eq!(transfer.receiver, transfer.receipt.receiver());
         assert!(store.contains(group.id()));
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Transferred
-        );
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Transferred);
 
         let attempt = store.try_retry(group.id()).unwrap();
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Running
-        );
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Running);
         attempt.finish(Ok(()));
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Resolved
-        );
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Resolved);
     }
 }

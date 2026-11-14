@@ -1,8 +1,12 @@
-use qubit_operation::{
-    ManagerOptions, OperationManager, OperationOptions, OperationOutcome, ShutdownMode,
-};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
+use qubit_operation::ManagerOptions;
+use qubit_operation::OperationManager;
+use qubit_operation::OperationOptions;
+use qubit_operation::OperationOutcome;
+use qubit_operation::ShutdownMode;
 
 #[test]
 fn body_result_and_resource_settlement_are_separate_facts() {
@@ -29,8 +33,5 @@ fn body_result_and_resource_settlement_are_separate_facts() {
     let settlement = handle.wait_settlement().unwrap();
     assert!(settlement.all_released());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }

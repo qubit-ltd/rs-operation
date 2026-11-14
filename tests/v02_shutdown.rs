@@ -1,9 +1,13 @@
-use qubit_operation::{
-    AdmissionError, ManagerOptions, OperationManager, OperationOptions, OperationOutcome,
-    ShutdownMode, ShutdownWait,
-};
 use std::sync::mpsc;
 use std::time::Duration;
+
+use qubit_operation::AdmissionError;
+use qubit_operation::ManagerOptions;
+use qubit_operation::OperationManager;
+use qubit_operation::OperationOptions;
+use qubit_operation::OperationOutcome;
+use qubit_operation::ShutdownMode;
+use qubit_operation::ShutdownWait;
 
 #[test]
 fn drain_closes_roots_and_completes_when_idle() {
@@ -35,10 +39,7 @@ fn drain_rejects_new_roots_but_keeps_open_descendants_admissible() {
     let mut child = bound
         .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()))
         .unwrap();
-    assert!(matches!(
-        child.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(())
-    ));
+    assert!(matches!(child.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
     release_tx.send(()).unwrap();
     assert!(matches!(
         parent.wait_outcome().unwrap(),

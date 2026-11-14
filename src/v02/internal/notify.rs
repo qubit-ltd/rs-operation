@@ -111,19 +111,11 @@ impl Future for Notified {
         let changed = {
             let mut state = lock(&inner.state);
             if state.generation != self.generation {
-                if let Some(index) = state
-                    .waiters
-                    .iter()
-                    .position(|(waiter_id, _)| *waiter_id == id)
-                {
+                if let Some(index) = state.waiters.iter().position(|(waiter_id, _)| *waiter_id == id) {
                     removed_waker = Some(state.waiters.swap_remove(index).1);
                 }
                 true
-            } else if let Some((_, existing)) = state
-                .waiters
-                .iter_mut()
-                .find(|(waiter_id, _)| *waiter_id == id)
-            {
+            } else if let Some((_, existing)) = state.waiters.iter_mut().find(|(waiter_id, _)| *waiter_id == id) {
                 if !existing.will_wake(new_waker.as_ref().expect("new waker is present")) {
                     removed_waker = Some(std::mem::replace(
                         existing,
@@ -171,18 +163,20 @@ impl Drop for Notified {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::task::{RawWaker, RawWakerVTable, Waker};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::task::RawWaker;
+    use std::task::RawWakerVTable;
+    use std::task::Waker;
+
+    use super::*;
 
     /// Two-phase gate for controlling a publisher without timing assumptions.
     #[derive(Default)]
@@ -272,10 +266,7 @@ mod tests {
 
     impl ReentrantWaker {
         fn check(&self) {
-            let inner = self
-                .inner
-                .upgrade()
-                .expect("notification should remain alive");
+            let inner = self.inner.upgrade().expect("notification should remain alive");
             let readable = match inner.state.try_lock() {
                 Ok(state) => {
                     let _observed_generation = state.generation;
@@ -289,8 +280,7 @@ mod tests {
 
     unsafe fn clone_waker(data: *const ()) -> RawWaker {
         // SAFETY: the RawWaker vtable receives the live Arc pointer installed below.
-        let arc =
-            std::mem::ManuallyDrop::new(unsafe { Arc::<ReentrantWaker>::from_raw(data.cast()) });
+        let arc = std::mem::ManuallyDrop::new(unsafe { Arc::<ReentrantWaker>::from_raw(data.cast()) });
         arc.check();
         let cloned = Arc::clone(&arc);
         RawWaker::new(Arc::into_raw(cloned).cast(), &VTABLE)
@@ -304,8 +294,7 @@ mod tests {
 
     unsafe fn wake_by_ref_waker(data: *const ()) {
         // SAFETY: by-ref wake borrows the live pointer installed in the RawWaker.
-        let arc =
-            std::mem::ManuallyDrop::new(unsafe { Arc::<ReentrantWaker>::from_raw(data.cast()) });
+        let arc = std::mem::ManuallyDrop::new(unsafe { Arc::<ReentrantWaker>::from_raw(data.cast()) });
         arc.check();
     }
 
@@ -315,8 +304,7 @@ mod tests {
         arc.check();
     }
 
-    static VTABLE: RawWakerVTable =
-        RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref_waker, drop_waker);
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref_waker, drop_waker);
 
     #[test]
     fn reentrant_waker_runs_outside_lock() {
@@ -335,10 +323,7 @@ mod tests {
         );
         probe.outside_lock.store(true, Ordering::SeqCst);
         notify.notify_waiters();
-        assert!(
-            probe.outside_lock.load(Ordering::SeqCst),
-            "wake must run outside lock"
-        );
+        assert!(probe.outside_lock.load(Ordering::SeqCst), "wake must run outside lock");
         drop(notified);
 
         let mut cancelled = Box::pin(notify.notified());

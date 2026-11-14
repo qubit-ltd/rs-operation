@@ -1,6 +1,8 @@
-use qubit_operation::{
-    ManagerOptions, OperationManager, OperationOptions, OperationOutcome, ShutdownMode,
-};
+use qubit_operation::ManagerOptions;
+use qubit_operation::OperationManager;
+use qubit_operation::OperationOptions;
+use qubit_operation::OperationOutcome;
+use qubit_operation::ShutdownMode;
 
 #[test]
 fn scope_manager_submits_a_direct_child_and_cannot_reopen_after_body() {
@@ -20,13 +22,8 @@ fn scope_manager_submits_a_direct_child_and_cannot_reopen_after_body() {
     parent.wait_settlement().unwrap();
     let bound = saved.lock().unwrap().take().unwrap();
     let rejected = bound.try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()));
-    assert!(
-        matches!(rejected, Err(error) if error.reason() == qubit_operation::AdmissionError::ScopeEnded)
-    );
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    assert!(matches!(rejected, Err(error) if error.reason() == qubit_operation::AdmissionError::ScopeEnded));
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }
 
 #[test]
@@ -47,28 +44,19 @@ fn required_child_failure_is_not_hidden_by_parent_success() {
         OperationOutcome::ChildFailed(_)
     ));
     parent.wait_settlement().unwrap();
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }
 
 #[test]
 fn manager_helper_creates_a_root_child_and_grandchild_at_the_callers_depth() {
-    fn submit_value(
-        manager: &OperationManager,
-        value: usize,
-    ) -> qubit_operation::OperationHandle<usize, ()> {
+    fn submit_value(manager: &OperationManager, value: usize) -> qubit_operation::OperationHandle<usize, ()> {
         manager
             .try_submit(OperationOptions::default(), move |_| Ok::<_, ()>(value))
             .unwrap()
     }
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let mut root = submit_value(&manager, 1);
-    assert!(matches!(
-        root.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(1)
-    ));
+    assert!(matches!(root.wait_outcome().unwrap(), OperationOutcome::Succeeded(1)));
     root.wait_settlement().unwrap();
 
     let mut parent = manager
@@ -95,15 +83,9 @@ fn manager_helper_creates_a_root_child_and_grandchild_at_the_callers_depth() {
             }
         })
         .unwrap();
-    assert!(matches!(
-        parent.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(3)
-    ));
+    assert!(matches!(parent.wait_outcome().unwrap(), OperationOutcome::Succeeded(3)));
     parent.wait_settlement().unwrap();
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }
 
 #[test]
@@ -118,10 +100,7 @@ fn serial_children_keep_cumulative_history_beyond_the_retained_report_limit() {
                     .manager()
                     .try_submit(OperationOptions::default(), move |_| Ok::<_, ()>(value))
                     .unwrap();
-                assert!(matches!(
-                    child.wait_outcome().unwrap(),
-                    OperationOutcome::Succeeded(_)
-                ));
+                assert!(matches!(child.wait_outcome().unwrap(), OperationOutcome::Succeeded(_)));
                 child.wait_settlement().unwrap();
             }
             Ok::<_, ()>(())
@@ -135,8 +114,5 @@ fn serial_children_keep_cumulative_history_beyond_the_retained_report_limit() {
     assert_eq!(report.children_total, 8);
     assert!(report.children_truncated);
     assert!(report.children.len() <= 1);
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }

@@ -1,11 +1,21 @@
 //! Context cancellation, deadlines, clock-domain validation, and budget checks.
 
-use crate::v02::protocol::{BudgetPolicy, ClockSource, Deadline, TimerRegistration};
-use crate::v02::report::{ContextError, ContextOptions, StopReason};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, Weak};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Weak;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
+
+use crate::v02::protocol::BudgetPolicy;
+use crate::v02::protocol::ClockSource;
+use crate::v02::protocol::Deadline;
+use crate::v02::protocol::TimerRegistration;
+use crate::v02::report::ContextError;
+use crate::v02::report::ContextOptions;
+use crate::v02::report::StopReason;
 
 /// A cancellation node shared with its descendants.
 struct StopNode {
@@ -43,11 +53,7 @@ impl StopNode {
             }
             state.reason = Some(reason);
             state.children.retain(|child| child.strong_count() != 0);
-            let children = state
-                .children
-                .iter()
-                .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>();
+            let children = state.children.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
             let waiters = std::mem::take(&mut state.waiters);
             (children, waiters)
         };
@@ -101,11 +107,7 @@ impl OperationContext {
             }
         }
         let deadline = match (self.deadline, options.deadline) {
-            (Some(parent), Some(child)) => Some(
-                parent
-                    .earliest(child)
-                    .map_err(|_| ContextError::ClockDomainMismatch)?,
-            ),
+            (Some(parent), Some(child)) => Some(parent.earliest(child).map_err(|_| ContextError::ClockDomainMismatch)?),
             (Some(parent), None) => Some(parent),
             (None, child) => child,
         };
@@ -158,19 +160,20 @@ impl OperationContext {
         self.clock.clone()
     }
 
-    /// Returns true when the configured clock has reached this context's deadline.
+    /// Returns true when the configured clock has reached this context's
+    /// deadline.
     pub fn is_expired(&self) -> bool {
         match (self.clock.as_deref(), self.deadline) {
             (Some(clock), Some(deadline)) => {
                 let now = clock.now();
-                now.domain() == deadline.time_point().domain()
-                    && now.ticks() >= deadline.time_point().ticks()
+                now.domain() == deadline.time_point().domain() && now.ticks() >= deadline.time_point().ticks()
             }
             _ => false,
         }
     }
 
-    /// Checks stop, deadline, and every inherited policy without reserving capacity.
+    /// Checks stop, deadline, and every inherited policy without reserving
+    /// capacity.
     pub fn check(&self) -> Result<(), ContextError> {
         if self.node.reason().is_some() {
             return Err(ContextError::Stopped);
@@ -234,9 +237,7 @@ impl CleanupContext {
     pub fn check(&self) -> Result<(), ContextError> {
         if let (Some(clock), Some(deadline)) = (self.clock.as_deref(), self.deadline) {
             let now = clock.now();
-            if now.domain() != deadline.time_point().domain()
-                || now.ticks() >= deadline.time_point().ticks()
-            {
+            if now.domain() != deadline.time_point().domain() || now.ticks() >= deadline.time_point().ticks() {
                 return Err(ContextError::Stopped);
             }
         }
@@ -273,23 +274,15 @@ impl Future for StopSignal {
             let mut state = lock(&node.state);
             if let Some(reason) = state.reason {
                 if let Some(id) = this.waiter.take()
-                    && let Some(index) = state
-                        .waiters
-                        .iter()
-                        .position(|(candidate, _)| *candidate == id)
+                    && let Some(index) = state.waiters.iter().position(|(candidate, _)| *candidate == id)
                 {
                     let (_, waker) = state.waiters.swap_remove(index);
                     removed = Some(waker);
                 }
                 result = Some(reason);
             } else if let Some(id) = this.waiter {
-                if let Some((_, registered)) = state
-                    .waiters
-                    .iter_mut()
-                    .find(|(candidate, _)| *candidate == id)
-                {
-                    if !registered.will_wake(replacement.as_ref().expect("replacement is present"))
-                    {
+                if let Some((_, registered)) = state.waiters.iter_mut().find(|(candidate, _)| *candidate == id) {
+                    if !registered.will_wake(replacement.as_ref().expect("replacement is present")) {
                         removed = Some(std::mem::replace(
                             registered,
                             replacement.take().expect("replacement is present"),
@@ -324,11 +317,7 @@ impl Drop for StopSignal {
     fn drop(&mut self) {
         let removed = if let Some(id) = self.waiter.take() {
             let mut state = lock(&self.node.state);
-            if let Some(index) = state
-                .waiters
-                .iter()
-                .position(|(candidate, _)| *candidate == id)
-            {
+            if let Some(index) = state.waiters.iter().position(|(candidate, _)| *candidate == id) {
                 let (_, waker) = state.waiters.swap_remove(index);
                 Some(waker)
             } else {
@@ -410,10 +399,7 @@ fn deadline_reached(clock: &dyn ClockSource, deadline: Deadline) -> bool {
     now.domain() != deadline.time_point().domain() || now.ticks() >= deadline.time_point().ticks()
 }
 
-fn validate_clock(
-    clock: Option<&dyn ClockSource>,
-    deadline: Option<Deadline>,
-) -> Result<(), ContextError> {
+fn validate_clock(clock: Option<&dyn ClockSource>, deadline: Option<Deadline>) -> Result<(), ContextError> {
     if let Some(deadline) = deadline {
         let Some(clock) = clock else {
             return Err(ContextError::ClockUnavailable);
@@ -426,25 +412,34 @@ fn validate_clock(
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::OperationContext;
-    use crate::v02::protocol::{
-        BudgetError, BudgetPolicy, ClockDomainId, ClockSource, Deadline, MonotonicTime,
-        TimerRegistration,
-    };
-    use crate::v02::report::{ContextError, ContextOptions, DiagnosticSummary, StopReason};
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{RawWaker, RawWakerVTable, Wake, Waker};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::RawWaker;
+    use std::task::RawWakerVTable;
+    use std::task::Wake;
+    use std::task::Waker;
     use std::thread::JoinHandle;
+
+    use super::OperationContext;
+    use crate::v02::protocol::BudgetError;
+    use crate::v02::protocol::BudgetPolicy;
+    use crate::v02::protocol::ClockDomainId;
+    use crate::v02::protocol::ClockSource;
+    use crate::v02::protocol::Deadline;
+    use crate::v02::protocol::MonotonicTime;
+    use crate::v02::protocol::TimerRegistration;
+    use crate::v02::report::ContextError;
+    use crate::v02::report::ContextOptions;
+    use crate::v02::report::DiagnosticSummary;
+    use crate::v02::report::StopReason;
 
     struct ManualClock {
         domain: ClockDomainId,
@@ -549,9 +544,7 @@ mod tests {
     }
 
     unsafe fn wake_reentrant_waker_by_ref(data: *const ()) {
-        let probe = std::mem::ManuallyDrop::new(unsafe {
-            Arc::from_raw(data.cast::<ReentrantWakerProbe>())
-        });
+        let probe = std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(data.cast::<ReentrantWakerProbe>()) });
         probe.callback(false);
     }
 
@@ -580,11 +573,7 @@ mod tests {
         }
     }
 
-    fn options(
-        clock: Arc<dyn ClockSource>,
-        domain: ClockDomainId,
-        deadline: u64,
-    ) -> ContextOptions {
+    fn options(clock: Arc<dyn ClockSource>, domain: ClockDomainId, deadline: u64) -> ContextOptions {
         ContextOptions {
             clock: Some(clock),
             deadline: Some(Deadline::at(MonotonicTime::new(domain, deadline))),
@@ -636,10 +625,7 @@ mod tests {
         use std::future::Future;
         use std::task::Poll;
 
-        assert!(matches!(
-            Pin::as_mut(&mut signal).poll(&mut task),
-            Poll::Pending
-        ));
+        assert!(matches!(Pin::as_mut(&mut signal).poll(&mut task), Poll::Pending));
         drop(signal);
         drop(waker);
         probe.join_reentries();
@@ -660,10 +646,7 @@ mod tests {
         let mut task = std::task::Context::from_waker(&waker);
         use std::future::Future;
         use std::task::Poll;
-        assert!(matches!(
-            Pin::as_mut(&mut signal).poll(&mut task),
-            Poll::Ready(())
-        ));
+        assert!(matches!(Pin::as_mut(&mut signal).poll(&mut task), Poll::Ready(())));
 
         assert_eq!(wake.0.load(Ordering::SeqCst), 1);
         assert_eq!(clock.registration_wakes.load(Ordering::SeqCst), 1);
@@ -720,10 +703,7 @@ mod tests {
             })
             .unwrap();
 
-        assert!(matches!(
-            child.check(),
-            Err(ContextError::BudgetRejected(_))
-        ));
+        assert!(matches!(child.check(), Err(ContextError::BudgetRejected(_))));
         assert_eq!(parent_policy.calls.load(Ordering::SeqCst), 1);
         assert_eq!(child_policy.calls.load(Ordering::SeqCst), 1);
     }

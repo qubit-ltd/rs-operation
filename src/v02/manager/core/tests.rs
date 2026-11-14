@@ -1,28 +1,47 @@
-use super::{
-    ExecutionKind, ManagerCore, OperationJob, OperationManager, ScopeCore, SubmissionLease,
-    SubmissionPermit, SubmissionPort, SubmissionReservation,
-};
-use crate::v02::adapter::ManagedOperationControl;
-use crate::v02::executor::CleanupExecutor;
-use crate::v02::manager::capacity::{ManagerCapacityPools, ScopeCapacity};
-use crate::v02::operation::{
-    OperationCore, OperationHandle, OutcomeDelivery, OutcomeSlot, StopControl,
-};
-use crate::v02::protocol::OperationControl;
-use crate::v02::report::{AdmissionError, OperationOptions};
-use crate::v02::report::{ContextOptions, ManagerOptions, ScopeLimits, ShutdownMode, StopReason};
-use crate::v02::report::{
-    ManagerId, ManagerLimits, PortableExecutorOptions, ResourceId, ResourceScopeId,
-    ThreadPoolExecutorOptions,
-};
-use crate::v02::resource::cleanup::CleanupTransferReceiver;
-use crate::v02::resource::cleanup_port::{
-    CleanupDispatch, CleanupDispatchPermit, CleanupJob, CleanupQueueError,
-};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
+use std::sync::Barrier;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
+use super::ExecutionKind;
+use super::ManagerCore;
+use super::OperationJob;
+use super::OperationManager;
+use super::ScopeCore;
+use super::SubmissionLease;
+use super::SubmissionPermit;
+use super::SubmissionPort;
+use super::SubmissionReservation;
+use crate::v02::adapter::ManagedOperationControl;
+use crate::v02::executor::CleanupExecutor;
+use crate::v02::manager::capacity::ManagerCapacityPools;
+use crate::v02::manager::capacity::ScopeCapacity;
+use crate::v02::operation::OperationCore;
+use crate::v02::operation::OperationHandle;
+use crate::v02::operation::OutcomeDelivery;
+use crate::v02::operation::OutcomeSlot;
+use crate::v02::operation::StopControl;
+use crate::v02::protocol::OperationControl;
+use crate::v02::report::AdmissionError;
+use crate::v02::report::ContextOptions;
+use crate::v02::report::ManagerId;
+use crate::v02::report::ManagerLimits;
+use crate::v02::report::ManagerOptions;
+use crate::v02::report::OperationOptions;
+use crate::v02::report::PortableExecutorOptions;
+use crate::v02::report::ResourceId;
+use crate::v02::report::ResourceScopeId;
+use crate::v02::report::ScopeLimits;
+use crate::v02::report::ShutdownMode;
+use crate::v02::report::StopReason;
+use crate::v02::report::ThreadPoolExecutorOptions;
+use crate::v02::resource::cleanup::CleanupTransferReceiver;
+use crate::v02::resource::cleanup_port::CleanupDispatch;
+use crate::v02::resource::cleanup_port::CleanupDispatchPermit;
+use crate::v02::resource::cleanup_port::CleanupJob;
+use crate::v02::resource::cleanup_port::CleanupQueueError;
 
 struct PayloadDropFlag(Arc<std::sync::atomic::AtomicBool>);
 
@@ -159,13 +178,10 @@ fn async_submit_is_lazy_and_cancel_releases_waiter() {
     let async_manager = root.as_async();
     let body_calls = Arc::new(AtomicUsize::new(0));
     let body_counter = Arc::clone(&body_calls);
-    let mut submit = Box::pin(async_manager.submit(
-        OperationOptions::default(),
-        move |_| async move {
-            body_counter.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, ()>(())
-        },
-    ));
+    let mut submit = Box::pin(async_manager.submit(OperationOptions::default(), move |_| async move {
+        body_counter.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, ()>(())
+    }));
     assert_eq!(port.attempts.load(Ordering::SeqCst), 0);
     assert_eq!(port.waiters.load(Ordering::SeqCst), 0);
     assert!(poll_once(submit.as_mut()).is_pending());
@@ -184,13 +200,10 @@ fn async_submit_retries_after_capacity_wake_without_losing_notification() {
     let async_manager = root.as_async();
     let body_calls = Arc::new(AtomicUsize::new(0));
     let body_counter = Arc::clone(&body_calls);
-    let mut submit = Box::pin(async_manager.submit(
-        OperationOptions::default(),
-        move |_| async move {
-            body_counter.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, ()>(8usize)
-        },
-    ));
+    let mut submit = Box::pin(async_manager.submit(OperationOptions::default(), move |_| async move {
+        body_counter.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, ()>(8usize)
+    }));
     assert!(poll_once(submit.as_mut()).is_pending());
     assert_eq!(port.waiters.load(Ordering::SeqCst), 1);
     port.make_ready();
@@ -232,14 +245,13 @@ fn async_submit_parent_close_and_stop_interrupt_wait_and_preserve_body() {
         let body_calls = Arc::new(AtomicUsize::new(0));
         let body_counter = Arc::clone(&body_calls);
         let captured = DropCounter(Arc::clone(&body_calls));
-        let mut submit = Box::pin(async_child_manager.submit(
-            OperationOptions::default(),
-            move |_| async move {
+        let mut submit = Box::pin(
+            async_child_manager.submit(OperationOptions::default(), move |_| async move {
                 let _captured = captured;
                 body_counter.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, ()>(())
-            },
-        ));
+            }),
+        );
         assert!(poll_once(submit.as_mut()).is_pending());
         assert_eq!(port.waiters.load(Ordering::SeqCst), 1);
         port.make_ready();
@@ -293,7 +305,8 @@ fn sync_submit_waits_without_busy_retry_and_resumes_on_capacity() {
         Some(crate::v02::report::OperationOutcome::Succeeded(5))
     ));
 }
-use std::sync::{Mutex, mpsc};
+use std::sync::Mutex;
+use std::sync::mpsc;
 
 #[test]
 fn typed_sync_submission_publishes_outcome_and_settlement() {
@@ -419,11 +432,10 @@ fn recovery_required_overrides_real_transfer_in_operation_settlement() {
             )
             .unwrap();
             let transferred_id = ResourceId::new(manager_id, 1, 1);
-            let receipt =
-                match receiver.accept(transferred_id, source_scope_id, Box::new(TransferOwner)) {
-                    Ok(receipt) => receipt,
-                    Err(_) => panic!("receiver should accept committed transfer"),
-                };
+            let receipt = match receiver.accept(transferred_id, source_scope_id, Box::new(TransferOwner)) {
+                Ok(receipt) => receipt,
+                Err(_) => panic!("receiver should accept committed transfer"),
+            };
             assert_eq!(receipt.resource(), transferred_id);
 
             let failing_resource = reporting_scope.manage(PanicsOnDrop).unwrap();
@@ -447,10 +459,7 @@ fn recovery_required_overrides_real_transfer_in_operation_settlement() {
 
 struct TransferOwner;
 impl CleanupJob for TransferOwner {
-    fn schedule(
-        self: Box<Self>,
-        executor: Arc<CleanupExecutor>,
-    ) -> Result<(), Box<dyn CleanupJob>> {
+    fn schedule(self: Box<Self>, executor: Arc<CleanupExecutor>) -> Result<(), Box<dyn CleanupJob>> {
         match executor.reserve_drop() {
             Ok(permit) => {
                 permit.drop_value(self);
@@ -500,11 +509,10 @@ fn accepted_cleanup_transfer_is_in_operation_settlement() {
             )
             .unwrap();
             let resource_id = ResourceId::new(manager_id, 1, 1);
-            let receipt =
-                match receiver.accept(resource_id, source_scope_id, Box::new(TransferOwner)) {
-                    Ok(receipt) => receipt,
-                    Err(_) => panic!("receiver should accept committed transfer"),
-                };
+            let receipt = match receiver.accept(resource_id, source_scope_id, Box::new(TransferOwner)) {
+                Ok(receipt) => receipt,
+                Err(_) => panic!("receiver should accept committed transfer"),
+            };
             assert_eq!(receipt.resource(), resource_id);
             assert_eq!(receiver.drive(1), 1);
             executor.shutdown().wait().unwrap();
@@ -516,10 +524,7 @@ fn accepted_cleanup_transfer_is_in_operation_settlement() {
         Some(crate::v02::report::OperationOutcome::Succeeded(()))
     ));
     let settlement = handle.wait_settlement().unwrap();
-    assert_eq!(
-        settlement.status,
-        crate::v02::report::SettlementStatus::Transferred
-    );
+    assert_eq!(settlement.status, crate::v02::report::SettlementStatus::Transferred);
     assert_eq!(settlement.transferred_count, 1);
     assert_eq!(settlement.transfers_total, 1);
     assert_eq!(settlement.transfers.len(), 1);
@@ -530,9 +535,7 @@ fn typed_async_submission_preserves_target_and_publishes_lifecycle() {
     let (_, root) = ManagerCore::for_test();
     let mut handle = root
         .as_async()
-        .try_submit(OperationOptions::default(), |_| async {
-            Ok::<_, ()>(24usize)
-        })
+        .try_submit(OperationOptions::default(), |_| async { Ok::<_, ()>(24usize) })
         .unwrap()
         .into_sync();
     assert!(matches!(
@@ -739,10 +742,7 @@ fn required_child_failure_changes_parent_outcome_but_not_settlement_fact() {
         crate::v02::report::OperationOutcome::ChildFailed(_)
     ));
     let settlement = parent.wait_settlement().unwrap();
-    assert_eq!(
-        settlement.status,
-        crate::v02::report::SettlementStatus::Released
-    );
+    assert_eq!(settlement.status, crate::v02::report::SettlementStatus::Released);
     assert_eq!(settlement.children_total, 1);
     drop(parent);
     drop(root);
@@ -807,12 +807,7 @@ fn manager_conversion_preserves_parent() {
     let (core, root) = ManagerCore::for_test();
     root.try_submit_body(|scope| {
         let parent = scope.id();
-        scope
-            .manager()
-            .as_async()
-            .as_sync()
-            .try_submit_body(|_| {})
-            .unwrap();
+        scope.manager().as_async().as_sync().try_submit_body(|_| {}).unwrap();
         assert_eq!(parent, scope.id());
     })
     .unwrap();
@@ -862,11 +857,7 @@ fn frame_end_closes_scope_even_when_scope_moves_out() {
     let scope = escaped.lock().unwrap().take().unwrap();
     assert!(!scope.is_open());
     assert_eq!(
-        scope
-            .manager()
-            .try_submit_body(|_| {})
-            .unwrap_err()
-            .reason(),
+        scope.manager().try_submit_body(|_| {}).unwrap_err().reason(),
         AdmissionError::ScopeEnded
     );
 }
@@ -900,12 +891,7 @@ fn reserve_production_root(
     SubmissionReservation,
 ) {
     let core = manager.core_arc();
-    let reserved = core.reserve_scope(
-        &manager.target,
-        OperationOptions::default(),
-        ExecutionKind::Sync,
-        || {},
-    );
+    let reserved = core.reserve_scope(&manager.target, OperationOptions::default(), ExecutionKind::Sync, || {});
     let (_, id, scope, reservation) = match reserved {
         Ok(reserved) => reserved,
         Err(_) => panic!("default production manager should reserve a root"),
@@ -941,10 +927,7 @@ fn production_cancel_abandons_adapter_without_running_unstarted_body() {
         core.request_shutdown(ShutdownMode::Cancel),
         super::ManagerPhase::Cancelling
     );
-    assert_eq!(
-        scope.context().stop_reason(),
-        Some(StopReason::ManagerShutdown)
-    );
+    assert_eq!(scope.context().stop_reason(), Some(StopReason::ManagerShutdown));
     let ran_body = Arc::new(AtomicUsize::new(0));
     let payload_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let abandon_count = Arc::new(AtomicUsize::new(0));

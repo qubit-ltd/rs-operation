@@ -1,9 +1,15 @@
-use qubit_operation::{
-    ManagerOptions, OperationManager, OperationOptions, OperationOutcome, ShutdownMode, StopReason,
-};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::time::Duration;
+
+use qubit_operation::ManagerOptions;
+use qubit_operation::OperationManager;
+use qubit_operation::OperationOptions;
+use qubit_operation::OperationOutcome;
+use qubit_operation::ShutdownMode;
+use qubit_operation::StopReason;
 
 struct Input(Arc<AtomicUsize>);
 impl Drop for Input {
@@ -46,8 +52,5 @@ fn stopping_sync_work_keeps_input_until_the_body_really_returns() {
     ));
     assert!(operation.wait_settlement().unwrap().all_released());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }

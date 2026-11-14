@@ -1,10 +1,19 @@
-use qubit_operation::{
-    AsyncCleanup, CleanupContext, CleanupFuture, CleanupOutcome, ManagerOptions, OperationManager,
-    OperationOptions, OperationOutcome, ResourceRef, SettlementWait, ShutdownMode,
-};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+use qubit_operation::AsyncCleanup;
+use qubit_operation::CleanupContext;
+use qubit_operation::CleanupFuture;
+use qubit_operation::CleanupOutcome;
+use qubit_operation::ManagerOptions;
+use qubit_operation::OperationManager;
+use qubit_operation::OperationOptions;
+use qubit_operation::OperationOutcome;
+use qubit_operation::ResourceRef;
+use qubit_operation::SettlementWait;
+use qubit_operation::ShutdownMode;
 
 struct Probe(Arc<AtomicUsize>);
 impl Drop for Probe {
@@ -19,11 +28,7 @@ struct ChildPayload {
 struct GatedCleanup(crate::support::Gate);
 
 impl AsyncCleanup<ChildPayload> for GatedCleanup {
-    fn cleanup(
-        self: Arc<Self>,
-        resource: ChildPayload,
-        _context: CleanupContext,
-    ) -> CleanupFuture<ChildPayload> {
+    fn cleanup(self: Arc<Self>, resource: ChildPayload, _context: CleanupContext) -> CleanupFuture<ChildPayload> {
         let gate = self.0.clone();
         Box::pin(async move {
             gate.wait().await;
@@ -56,9 +61,7 @@ fn open_zero_can_get_again_then_settle_releases_once() {
     let mut operation = manager
         .try_submit(OperationOptions::default(), move |scope| {
             let key = {
-                let input = scope
-                    .manage(Probe(Arc::clone(&body_drops)))
-                    .map_err(|_| "manage")?;
+                let input = scope.manage(Probe(Arc::clone(&body_drops))).map_err(|_| "manage")?;
                 input.key()
             };
             assert_eq!(body_drops.load(Ordering::SeqCst), 0);
@@ -76,10 +79,7 @@ fn open_zero_can_get_again_then_settle_releases_once() {
     ));
     assert!(operation.wait_settlement().unwrap().all_released());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }
 
 #[test]
@@ -98,10 +98,7 @@ fn resource_ref_shares_mutex_protected_value() {
         OperationOutcome::Succeeded(2)
     ));
     operation.wait_settlement().unwrap();
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }
 
 #[test]
@@ -125,10 +122,7 @@ fn moving_scope_out_of_body_does_not_extend_its_authority() {
         Ok(_) => panic!("ended scope unexpectedly accepted a resource"),
         Err(error) => error,
     };
-    assert_eq!(
-        error.kind(),
-        qubit_operation::ResourceManageErrorKind::ScopeEnded
-    );
+    assert_eq!(error.kind(), qubit_operation::ResourceManageErrorKind::ScopeEnded);
     let rejected = scope
         .manager()
         .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()));
@@ -136,10 +130,7 @@ fn moving_scope_out_of_body_does_not_extend_its_authority() {
         rejected,
         Err(error) if error.reason() == qubit_operation::AdmissionError::ScopeEnded
     ));
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }
 
 #[test]
@@ -162,12 +153,7 @@ fn child_cleanup_keeps_parent_resource_until_its_last_parent_ref_is_released() {
                         .resource_scope(qubit_operation::ResourceScopeOptions { capacity: 1 })
                         .unwrap();
                     let child = child_resources
-                        .manage_with(
-                            ChildPayload {
-                                _parent_ref: child_ref,
-                            },
-                            cleanup,
-                        )
+                        .manage_with(ChildPayload { _parent_ref: child_ref }, cleanup)
                         .unwrap();
                     drop(child);
                     child_resources.end();
@@ -196,10 +182,7 @@ fn child_cleanup_keeps_parent_resource_until_its_last_parent_ref_is_released() {
     gate.release();
     assert!(parent.wait_settlement().unwrap().all_released());
     assert_eq!(drops.load(Ordering::SeqCst), 1);
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }
 
 #[test]
@@ -246,8 +229,5 @@ fn unrelated_child_cleanup_does_not_delay_parent_resource_release() {
     ));
     gate.release();
     assert!(parent.wait_settlement().unwrap().all_released());
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }

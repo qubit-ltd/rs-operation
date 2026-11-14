@@ -1,19 +1,37 @@
 //! Typed, single-consumer outcomes and untyped lifecycle observation.
 
-use crate::v02::internal::notify::{Notified, Notify};
-use crate::v02::internal::state::StateCell;
-use crate::v02::protocol::{ClockSource, Deadline, TimerRegistration};
-use crate::v02::report::{
-    ExecutionPhase, ObservationError, OperationId, OperationOutcome, OperationSnapshot,
-    OutcomeAvailability, OutcomeError, ResourceProgress, SettlementReport, SettlementWait,
-    StopReason, StopReport, StopRequestStatus,
-};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::time::Duration;
+use std::time::Instant;
+
+use crate::v02::internal::notify::Notified;
+use crate::v02::internal::notify::Notify;
+use crate::v02::internal::state::StateCell;
+use crate::v02::protocol::ClockSource;
+use crate::v02::protocol::Deadline;
+use crate::v02::protocol::TimerRegistration;
+use crate::v02::report::ExecutionPhase;
+use crate::v02::report::ObservationError;
+use crate::v02::report::OperationId;
+use crate::v02::report::OperationOutcome;
+use crate::v02::report::OperationSnapshot;
+use crate::v02::report::OutcomeAvailability;
+use crate::v02::report::OutcomeError;
+use crate::v02::report::ResourceProgress;
+use crate::v02::report::SettlementReport;
+use crate::v02::report::SettlementWait;
+use crate::v02::report::StopReason;
+use crate::v02::report::StopReport;
+use crate::v02::report::StopRequestStatus;
 
 const AVAILABILITY_PENDING: u8 = 0;
 const AVAILABILITY_AVAILABLE: u8 = 1;
@@ -128,14 +146,12 @@ impl OperationCore {
     }
 
     fn mark_taken(&self) {
-        self.availability
-            .store(AVAILABILITY_TAKEN, Ordering::Release);
+        self.availability.store(AVAILABILITY_TAKEN, Ordering::Release);
         self.notify_change();
     }
 
     fn mark_discarded(&self) {
-        self.availability
-            .store(AVAILABILITY_DISCARDED, Ordering::Release);
+        self.availability.store(AVAILABILITY_DISCARDED, Ordering::Release);
         self.notify_change();
     }
 
@@ -298,10 +314,7 @@ impl<T, E> OutcomeSlot<T, E> {
         }
     }
 
-    pub(crate) fn publish(
-        &self,
-        outcome: OperationOutcome<T, E>,
-    ) -> Result<(), OperationOutcome<T, E>> {
+    pub(crate) fn publish(&self, outcome: OperationOutcome<T, E>) -> Result<(), OperationOutcome<T, E>> {
         match self.cell.publish(outcome) {
             Ok(()) => {
                 self.core.mark_available();
@@ -383,11 +396,7 @@ pub(crate) trait StopControl: Send + Sync {
 }
 
 impl<T: Send + 'static, E: Send + 'static> OperationHandle<T, E> {
-    pub(crate) fn new(
-        core: Arc<OperationCore>,
-        slot: Arc<OutcomeSlot<T, E>>,
-        stop: Arc<dyn StopControl>,
-    ) -> Self {
+    pub(crate) fn new(core: Arc<OperationCore>, slot: Arc<OutcomeSlot<T, E>>, stop: Arc<dyn StopControl>) -> Self {
         Self {
             parts: Some(HandleParts { core, slot, stop }),
         }
@@ -448,11 +457,9 @@ impl<T: Send + 'static, E: Send + 'static> OperationHandle<T, E> {
         Ok(core.wait_settlement_blocking())
     }
 
-    /// Waits for settlement for at most `timeout`, returning the current snapshot on timeout.
-    pub fn wait_settlement_for(
-        &self,
-        timeout: Duration,
-    ) -> Result<SettlementWait, ObservationError> {
+    /// Waits for settlement for at most `timeout`, returning the current
+    /// snapshot on timeout.
+    pub fn wait_settlement_for(&self, timeout: Duration) -> Result<SettlementWait, ObservationError> {
         let core = &self.parts().core;
         if core.is_blocking_worker() {
             return Err(ObservationError::WouldDeadlock);
@@ -460,14 +467,16 @@ impl<T: Send + 'static, E: Send + 'static> OperationHandle<T, E> {
         Ok(core.wait_settlement_for(timeout))
     }
 
-    /// Moves the unique outcome receiver into its async view without stopping the operation.
+    /// Moves the unique outcome receiver into its async view without stopping
+    /// the operation.
     pub fn into_async(mut self) -> AsyncOperationHandle<T, E> {
         AsyncOperationHandle {
             parts: self.parts.take(),
         }
     }
 
-    /// Discards the typed outcome and returns a read-only observer without requesting stop.
+    /// Discards the typed outcome and returns a read-only observer without
+    /// requesting stop.
     pub fn into_observer(mut self) -> OperationObserver {
         let parts = self.parts.take().expect("handle parts are present");
         parts.slot.discard();
@@ -480,11 +489,7 @@ impl<T: Send + 'static, E: Send + 'static> OperationHandle<T, E> {
 }
 
 impl<T: Send + 'static, E: Send + 'static> AsyncOperationHandle<T, E> {
-    pub(crate) fn new(
-        core: Arc<OperationCore>,
-        slot: Arc<OutcomeSlot<T, E>>,
-        stop: Arc<dyn StopControl>,
-    ) -> Self {
+    pub(crate) fn new(core: Arc<OperationCore>, slot: Arc<OutcomeSlot<T, E>>, stop: Arc<dyn StopControl>) -> Self {
         Self {
             parts: Some(HandleParts { core, slot, stop }),
         }
@@ -541,14 +546,16 @@ impl<T: Send + 'static, E: Send + 'static> AsyncOperationHandle<T, E> {
         self.parts().core.wait_settlement_async().await
     }
 
-    /// Moves the unique outcome receiver into its sync view without stopping the operation.
+    /// Moves the unique outcome receiver into its sync view without stopping
+    /// the operation.
     pub fn into_sync(mut self) -> OperationHandle<T, E> {
         OperationHandle {
             parts: self.parts.take(),
         }
     }
 
-    /// Discards the typed outcome and returns a read-only observer without requesting stop.
+    /// Discards the typed outcome and returns a read-only observer without
+    /// requesting stop.
     pub fn into_observer(mut self) -> AsyncOperationObserver {
         let parts = self.parts.take().expect("handle parts are present");
         parts.slot.discard();
@@ -619,11 +626,9 @@ impl OperationObserver {
         Ok(self.core.wait_settlement_blocking())
     }
 
-    /// Waits for settlement for at most `timeout`, returning the current snapshot on timeout.
-    pub fn wait_settlement_for(
-        &self,
-        timeout: Duration,
-    ) -> Result<SettlementWait, ObservationError> {
+    /// Waits for settlement for at most `timeout`, returning the current
+    /// snapshot on timeout.
+    pub fn wait_settlement_for(&self, timeout: Duration) -> Result<SettlementWait, ObservationError> {
         if self.core.is_blocking_worker() {
             return Err(ObservationError::WouldDeadlock);
         }
@@ -654,11 +659,9 @@ impl AsyncOperationObserver {
         self.core.wait_settlement_async().await
     }
 
-    /// Waits until the deadline, returning a pending snapshot if settlement is not ready.
-    pub async fn wait_settlement_until(
-        &self,
-        deadline: Deadline,
-    ) -> Result<SettlementWait, ObservationError> {
+    /// Waits until the deadline, returning a pending snapshot if settlement is
+    /// not ready.
+    pub async fn wait_settlement_until(&self, deadline: Deadline) -> Result<SettlementWait, ObservationError> {
         self.core.wait_settlement_until(deadline).await
     }
 
@@ -687,8 +690,7 @@ impl Future for SettlementFuture<'_> {
             if self.notification.is_none() {
                 self.notification = Some(self.core.changed.notified_since(generation));
             }
-            match Pin::new(self.notification.as_mut().expect("notification was set")).poll(context)
-            {
+            match Pin::new(self.notification.as_mut().expect("notification was set")).poll(context) {
                 Poll::Ready(()) => self.notification = None,
                 Poll::Pending => return Poll::Pending,
             }
@@ -734,9 +736,7 @@ impl Future for SettlementUntil<'_> {
                 self.notification = Some(self.core.changed.notified_since(generation));
             }
             if self.timer.is_none() {
-                self.timer = Some(
-                    clock.register_deadline(self.deadline.time_point(), context.waker().clone()),
-                );
+                self.timer = Some(clock.register_deadline(self.deadline.time_point(), context.waker().clone()));
                 // Registration may race the clock reaching its deadline.
                 let now = clock.now();
                 if now.domain() != self.deadline.time_point().domain() {
@@ -749,8 +749,7 @@ impl Future for SettlementUntil<'_> {
                 }
             }
 
-            match Pin::new(self.notification.as_mut().expect("notification was set")).poll(context)
-            {
+            match Pin::new(self.notification.as_mut().expect("notification was set")).poll(context) {
                 Poll::Ready(()) => {
                     self.notification = None;
                     continue;
@@ -779,7 +778,5 @@ impl Drop for SettlementUntil<'_> {
 mod tests;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }

@@ -1,15 +1,23 @@
 //! Explicit global manager shutdown and observation handles.
 
-use crate::v02::manager::core::{ManagerCore, ManagerPhase};
-use crate::v02::protocol::{ClockSource, Deadline, TimerRegistration};
-use crate::v02::report::{
-    ObservationError, ShutdownMode, ShutdownReport, ShutdownSnapshot, ShutdownWait,
-};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 use std::time::Duration;
+
+use crate::v02::manager::core::ManagerCore;
+use crate::v02::manager::core::ManagerPhase;
+use crate::v02::protocol::ClockSource;
+use crate::v02::protocol::Deadline;
+use crate::v02::protocol::TimerRegistration;
+use crate::v02::report::ObservationError;
+use crate::v02::report::ShutdownMode;
+use crate::v02::report::ShutdownReport;
+use crate::v02::report::ShutdownSnapshot;
+use crate::v02::report::ShutdownWait;
 
 /// A durable observer for the manager-wide shutdown already in progress.
 #[derive(Clone)]
@@ -91,9 +99,7 @@ impl ShutdownHandle {
     }
 
     pub fn as_async(&self) -> AsyncShutdownHandle {
-        AsyncShutdownHandle {
-            handle: self.clone(),
-        }
+        AsyncShutdownHandle { handle: self.clone() }
     }
 }
 
@@ -190,9 +196,7 @@ impl Future for ShutdownDeadline {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let now = self.clock.now();
-        if now.domain() != self.deadline.time_point().domain()
-            || now.ticks() >= self.deadline.time_point().ticks()
-        {
+        if now.domain() != self.deadline.time_point().domain() || now.ticks() >= self.deadline.time_point().ticks() {
             if let Some(registration) = self.registration.take() {
                 registration.cancel();
             }
@@ -209,9 +213,7 @@ impl Future for ShutdownDeadline {
             );
         }
         let now = self.clock.now();
-        if now.domain() != self.deadline.time_point().domain()
-            || now.ticks() >= self.deadline.time_point().ticks()
-        {
+        if now.domain() != self.deadline.time_point().domain() || now.ticks() >= self.deadline.time_point().ticks() {
             if let Some(registration) = self.registration.take() {
                 registration.cancel();
             }
@@ -232,16 +234,27 @@ impl Drop for ShutdownDeadline {
 
 #[cfg(test)]
 mod tests {
-    use crate::v02::manager::core::OperationManager;
-    use crate::v02::report::{
-        AdmissionError, CleanupFailure, CleanupStage, DiagnosticSummary, ManagerId, ManagerOptions,
-        OperationOptions, ResourceId, ResourceScopeOptions, ShutdownMode, ShutdownWait,
-    };
-    use crate::v02::resource::{AsyncCleanup, CleanupOutcome, RecoveryStore, RecoveryStoreOptions};
     use std::future;
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    use crate::v02::manager::core::OperationManager;
+    use crate::v02::report::AdmissionError;
+    use crate::v02::report::CleanupFailure;
+    use crate::v02::report::CleanupStage;
+    use crate::v02::report::DiagnosticSummary;
+    use crate::v02::report::ManagerId;
+    use crate::v02::report::ManagerOptions;
+    use crate::v02::report::OperationOptions;
+    use crate::v02::report::ResourceId;
+    use crate::v02::report::ResourceScopeOptions;
+    use crate::v02::report::ShutdownMode;
+    use crate::v02::report::ShutdownWait;
+    use crate::v02::resource::AsyncCleanup;
+    use crate::v02::resource::CleanupOutcome;
+    use crate::v02::resource::RecoveryStore;
+    use crate::v02::resource::RecoveryStoreOptions;
 
     struct FailingCleanup;
 
@@ -268,12 +281,8 @@ mod tests {
         let manager = OperationManager::new(ManagerOptions::default()).unwrap();
         let completion = manager
             .run_and_settle(OperationOptions::default(), |scope| {
-                let resources = scope
-                    .resource_scope(ResourceScopeOptions { capacity: 1 })
-                    .unwrap();
-                let resource = resources
-                    .manage_with(17usize, Arc::new(FailingCleanup))
-                    .unwrap();
+                let resources = scope.resource_scope(ResourceScopeOptions { capacity: 1 }).unwrap();
+                let resource = resources.manage_with(17usize, Arc::new(FailingCleanup)).unwrap();
                 drop(resource);
                 Ok::<_, ()>(())
             })

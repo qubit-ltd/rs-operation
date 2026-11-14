@@ -1,6 +1,8 @@
-use qubit_operation::{
-    ManagerOptions, OperationManager, OperationOptions, OperationOutcome, ShutdownMode,
-};
+use qubit_operation::ManagerOptions;
+use qubit_operation::OperationManager;
+use qubit_operation::OperationOptions;
+use qubit_operation::OperationOutcome;
+use qubit_operation::ShutdownMode;
 
 #[path = "v02_api_negative/mod.rs"]
 mod api_negative;
@@ -48,10 +50,7 @@ fn sync_and_async_views_share_one_result_delivery() {
         _ => panic!("expected the single successful outcome"),
     }
     assert!(sync_handle.wait_settlement().unwrap().all_released());
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }
 
 #[test]
@@ -76,10 +75,7 @@ fn root_and_scope_manager_run_the_same_submission_function() {
         OperationOutcome::Succeeded(42)
     ));
     parent.wait_settlement().unwrap();
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }
 
 #[test]
@@ -96,10 +92,7 @@ fn async_manager_runs_a_non_clone_non_debug_result_and_settles_it() {
         _ => panic!("async operation did not produce its single success outcome"),
     }
     assert!(block_on(operation.wait_settlement()).all_released());
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }
 
 #[test]
@@ -115,9 +108,7 @@ fn converting_to_observer_preserves_execution_but_dropping_handle_requests_stop(
         })
         .unwrap();
     let observer = handle.observer();
-    entered_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
+    entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
     let observer_only = handle.into_observer();
     assert!(observer.snapshot().stop.is_none());
     release_tx.send(()).unwrap();
@@ -134,9 +125,7 @@ fn converting_to_observer_preserves_execution_but_dropping_handle_requests_stop(
         })
         .unwrap();
     let observer = handle.observer();
-    entered_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap();
+    entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
     drop(handle);
     assert_eq!(
         observer.snapshot().stop.unwrap().reason,
@@ -144,8 +133,5 @@ fn converting_to_observer_preserves_execution_but_dropping_handle_requests_stop(
     );
     release_tx.send(()).unwrap();
     observer.wait_settlement().unwrap();
-    manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
 }

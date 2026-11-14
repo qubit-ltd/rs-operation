@@ -1,6 +1,7 @@
 include!("../doc/examples-0.2.0/inference.rs");
 
-use qubit_operation::{ManagerOptions, ShutdownMode};
+use qubit_operation::ManagerOptions;
+use qubit_operation::ShutdownMode;
 
 struct DemoModel;
 
@@ -20,9 +21,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let settlement = handle.wait_settlement()?;
     println!("all resources released: {}", settlement.all_released());
-    manager
-        .as_sync()
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()?;
+    manager.as_sync().request_shutdown(ShutdownMode::Drain).wait()?;
     Ok(())
 }

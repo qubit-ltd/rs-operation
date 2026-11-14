@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 static NEXT_CASE: AtomicUsize = AtomicUsize::new(0);
 
@@ -17,9 +18,7 @@ fn public_api_rejects_the_removed_or_forbidden_capabilities() {
         .find(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("libqubit_operation-") && name.ends_with(".rlib")
-                })
+                .is_some_and(|name| name.starts_with("libqubit_operation-") && name.ends_with(".rlib"))
         })
         .expect("cargo test built qubit_operation rlib");
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
@@ -56,11 +55,7 @@ fn public_api_rejects_the_removed_or_forbidden_capabilities() {
             .output()
             .expect("run rustc for API contract fixture");
         let stderr = String::from_utf8_lossy(&result.stderr);
-        assert!(
-            !result.status.success(),
-            "{} unexpectedly compiled",
-            source.display()
-        );
+        assert!(!result.status.success(), "{} unexpectedly compiled", source.display());
         assert!(
             stderr.contains(expected),
             "{} failed for an unrelated reason; expected diagnostic fragment {expected:?}, got:\n{stderr}",

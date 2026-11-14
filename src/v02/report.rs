@@ -3,9 +3,11 @@
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use super::protocol::{Deadline, MonotonicTime};
+use super::protocol::Deadline;
+use super::protocol::MonotonicTime;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -580,9 +582,7 @@ pub struct SettlementReport {
 }
 impl SettlementReport {
     pub fn all_released(&self) -> bool {
-        self.status == SettlementStatus::Released
-            && self.transferred_count == 0
-            && self.recovery_count == 0
+        self.status == SettlementStatus::Released && self.transferred_count == 0 && self.recovery_count == 0
     }
 }
 
@@ -780,13 +780,9 @@ impl Error for ContextError {}
 
 #[derive(Clone, Debug)]
 pub enum RecoveryStoreCreateError {
-    InvalidOptions {
-        field: &'static str,
-    },
+    InvalidOptions { field: &'static str },
     ExecutorUnavailable,
-    ThreadSpawn {
-        source: Arc<dyn Error + Send + Sync>,
-    },
+    ThreadSpawn { source: Arc<dyn Error + Send + Sync> },
 }
 impl fmt::Display for RecoveryStoreCreateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -817,7 +813,8 @@ impl Default for RecoveryStoreOptions {
     }
 }
 
-/// Type and manager credential for reacquiring a resource from its owning scope.
+/// Type and manager credential for reacquiring a resource from its owning
+/// scope.
 pub struct ResourceKey<T: Send + Sync + 'static> {
     manager: ManagerId,
     resource: ResourceId,
@@ -850,13 +847,9 @@ impl<T: Send + Sync + 'static> ResourceKey<T> {
 
 #[derive(Clone, Debug)]
 pub enum ManagerCreateError {
-    InvalidOptions {
-        field: &'static str,
-    },
+    InvalidOptions { field: &'static str },
     ExecutorUnavailable,
-    ThreadSpawn {
-        source: Arc<dyn Error + Send + Sync>,
-    },
+    ThreadSpawn { source: Arc<dyn Error + Send + Sync> },
 }
 impl fmt::Display for ManagerCreateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1005,7 +998,11 @@ impl Error for RecoveryTransferError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{DiagnosticSummary, ManagerLimits, ManagerOptions, OperationOptions, ScopeLimits};
+    use super::DiagnosticSummary;
+    use super::ManagerLimits;
+    use super::ManagerOptions;
+    use super::OperationOptions;
+    use super::ScopeLimits;
     use crate::v02::protocol::ClockDomainId;
 
     #[test]
@@ -1028,18 +1025,9 @@ mod tests {
     #[test]
     fn default_limits_match_the_contract() {
         let manager = ManagerLimits::default();
-        assert_eq!(
-            (manager.active_operations, manager.queued_operations),
-            (4, 64)
-        );
-        assert_eq!(
-            (manager.admission_waiters, manager.unconsumed_outcomes),
-            (64, 64)
-        );
-        assert_eq!(
-            (manager.cleanup_concurrency, manager.diagnostic_events),
-            (4, 256)
-        );
+        assert_eq!((manager.active_operations, manager.queued_operations), (4, 64));
+        assert_eq!((manager.admission_waiters, manager.unconsumed_outcomes), (64, 64));
+        assert_eq!((manager.cleanup_concurrency, manager.diagnostic_events), (4, 256));
         assert_eq!(
             ScopeLimits::default(),
             ScopeLimits {

@@ -1,12 +1,14 @@
+use std::sync::Arc;
+
 use super::core::ScopeCore;
-use super::resource_error::{ResourceCommitError, ResourceCommitWithError};
+use super::resource_error::ResourceCommitError;
+use super::resource_error::ResourceCommitWithError;
 use crate::v02::manager::capacity::ResourceRegistration;
 use crate::v02::report::ResourceId;
 use crate::v02::resource::AsyncCleanup;
 use crate::v02::resource::ResourceRef;
 use crate::v02::resource::cleanup_port::CleanupDispatchPermit;
 use crate::v02::scope::ScopeCore as OperationScopeCore;
-use std::sync::Arc;
 
 /// Capacity and cleanup queue storage reserved for one resource in one scope.
 pub struct ResourceReservation {
@@ -37,10 +39,7 @@ impl ResourceReservation {
     }
 
     /// Commit a resource to the scope that created this reservation.
-    pub fn commit<T: Send + Sync + 'static>(
-        self,
-        value: T,
-    ) -> Result<ResourceRef<T>, ResourceCommitError<T>> {
+    pub fn commit<T: Send + Sync + 'static>(self, value: T) -> Result<ResourceRef<T>, ResourceCommitError<T>> {
         let scope = Arc::clone(&self.scope);
         if let Some(operation_scope) = self.operation_scope.as_ref().cloned() {
             let mut value = Some(value);
@@ -63,11 +62,7 @@ impl ResourceReservation {
         }
     }
 
-    pub fn commit_with<T, C>(
-        self,
-        value: T,
-        cleanup: C,
-    ) -> Result<ResourceRef<T>, ResourceCommitWithError<T, C>>
+    pub fn commit_with<T, C>(self, value: T, cleanup: C) -> Result<ResourceRef<T>, ResourceCommitWithError<T, C>>
     where
         T: Send + Sync + 'static,
         C: AsyncCleanup<T>,

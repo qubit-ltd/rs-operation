@@ -13,23 +13,48 @@
 
 mod v02;
 
-pub use v02::context::{CleanupContext, DeadlineSignal, OperationContext, StopSignal};
-pub use v02::manager::core::{AsyncOperationManager, OperationManager};
-pub use v02::manager::group::{AsyncOperationGroup, OperationGroup};
-pub use v02::manager::shutdown::{AsyncShutdownHandle, ShutdownHandle};
-pub use v02::operation::{
-    AsyncOperationHandle, AsyncOperationObserver, OperationHandle, OperationObserver,
-};
-pub use v02::protocol::{
-    BudgetError, BudgetPolicy, ClockDomainId, ClockDomainMismatch, ClockSource, Deadline,
-    MonotonicTime, OperationControl, TimerRegistration,
-};
+pub use v02::context::CleanupContext;
+pub use v02::context::DeadlineSignal;
+pub use v02::context::OperationContext;
+pub use v02::context::StopSignal;
+pub use v02::manager::core::AsyncOperationManager;
+pub use v02::manager::core::OperationManager;
+pub use v02::manager::group::AsyncOperationGroup;
+pub use v02::manager::group::OperationGroup;
+pub use v02::manager::shutdown::AsyncShutdownHandle;
+pub use v02::manager::shutdown::ShutdownHandle;
+pub use v02::operation::AsyncOperationHandle;
+pub use v02::operation::AsyncOperationObserver;
+pub use v02::operation::OperationHandle;
+pub use v02::operation::OperationObserver;
+pub use v02::protocol::BudgetError;
+pub use v02::protocol::BudgetPolicy;
+pub use v02::protocol::ClockDomainId;
+pub use v02::protocol::ClockDomainMismatch;
+pub use v02::protocol::ClockSource;
+pub use v02::protocol::Deadline;
+pub use v02::protocol::MonotonicTime;
+pub use v02::protocol::OperationControl;
+pub use v02::protocol::TimerRegistration;
 pub use v02::report::*;
-pub use v02::resource::{
-    AsyncCleanup, AsyncRecoveryAttempt, CleanupFuture, CleanupOutcome, ManageResourceError,
-    ManageWithError, RecoveryAttempt, RecoveryHandle, RecoveryStore, RecoveryStoreOptions,
-    RecoveryStoreShutdownError, RecoveryStoreShutdownHandle, ResourceCapacityError,
-    ResourceCommitError, ResourceCommitWithError, ResourceKey, ResourceRef, ResourceReservation,
-    ResourceScope, ServiceResourceScope,
-};
+pub use v02::resource::AsyncCleanup;
+pub use v02::resource::AsyncRecoveryAttempt;
+pub use v02::resource::CleanupFuture;
+pub use v02::resource::CleanupOutcome;
+pub use v02::resource::ManageResourceError;
+pub use v02::resource::ManageWithError;
+pub use v02::resource::RecoveryAttempt;
+pub use v02::resource::RecoveryHandle;
+pub use v02::resource::RecoveryStore;
+pub use v02::resource::RecoveryStoreOptions;
+pub use v02::resource::RecoveryStoreShutdownError;
+pub use v02::resource::RecoveryStoreShutdownHandle;
+pub use v02::resource::ResourceCapacityError;
+pub use v02::resource::ResourceCommitError;
+pub use v02::resource::ResourceCommitWithError;
+pub use v02::resource::ResourceKey;
+pub use v02::resource::ResourceRef;
+pub use v02::resource::ResourceReservation;
+pub use v02::resource::ResourceScope;
+pub use v02::resource::ServiceResourceScope;
 pub use v02::scope::OperationScope;

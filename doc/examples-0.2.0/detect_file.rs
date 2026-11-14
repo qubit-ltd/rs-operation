@@ -1,14 +1,17 @@
 use std::error::Error;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::Read;
+use std::io::{self};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use qubit_operation::{
-    ManagerOptions, OperationManager, OperationOptions, OperationOutcome, ShutdownMode,
-    ShutdownWait,
-};
+use qubit_operation::ManagerOptions;
+use qubit_operation::OperationManager;
+use qubit_operation::OperationOptions;
+use qubit_operation::OperationOutcome;
+use qubit_operation::ShutdownMode;
+use qubit_operation::ShutdownWait;
 
 struct InputFile {
     file: Mutex<File>,
@@ -22,10 +25,7 @@ impl InputFile {
     }
 
     fn detect(&self) -> io::Result<Option<&'static str>> {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| io::Error::other("input lock poisoned"))?;
+        let mut file = self.file.lock().map_err(|_| io::Error::other("input lock poisoned"))?;
         let mut header = [0_u8; 5];
         file.read_exact(&mut header)?;
         Ok((header == *b"%PDF-").then_some("application/pdf"))
@@ -41,9 +41,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut operation = manager.try_submit(OperationOptions::default(), move |scope| {
         let file = InputFile::open(path).map_err(|e| e.to_string())?;
-        let input = scope
-            .manage(file)
-            .map_err(|error| format!("{:?}", error.kind()))?;
+        let input = scope.manage(file).map_err(|error| format!("{:?}", error.kind()))?;
         input.detect().map_err(|e| e.to_string())
     })?;
 

@@ -1,6 +1,8 @@
-use crate::v02::report::{ManagerId, ResourceScopeId};
 use std::any::TypeId;
 use std::marker::PhantomData;
+
+use crate::v02::report::ManagerId;
+use crate::v02::report::ResourceScopeId;
 
 /// A typed, scope-bound lookup key. It does not keep the resource alive.
 pub struct ResourceKey<T: Send + Sync + 'static> {

@@ -5,13 +5,20 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::task::{Context, Poll, Waker};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
 
-use qubit_budget::{ManagedResourcePermit, ManagedResourcePool};
+use qubit_budget::ManagedResourcePermit;
+use qubit_budget::ManagedResourcePool;
 
-use crate::v02::report::{ManagerLimits, ScopeLimits};
+use crate::v02::report::ManagerLimits;
+use crate::v02::report::ScopeLimits;
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_WAITER_ID: AtomicU64 = AtomicU64::new(1);
@@ -104,31 +111,17 @@ impl AdmissionCoordinator {
     fn register(&self, id: u64, observed_generation: u64, waker: &Waker) {
         let replacement = waker.clone();
         let (old_waker, should_wake) = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.generation != observed_generation {
                 (Some(replacement), true)
-            } else if let Some(waiter) = state
-                .waiters
-                .iter_mut()
-                .flatten()
-                .find(|item| item.id == id)
-            {
+            } else if let Some(waiter) = state.waiters.iter_mut().flatten().find(|item| item.id == id) {
                 if waiter.waker.will_wake(waker) {
                     (Some(replacement), false)
                 } else {
-                    (
-                        Some(std::mem::replace(&mut waiter.waker, replacement)),
-                        false,
-                    )
+                    (Some(std::mem::replace(&mut waiter.waker, replacement)), false)
                 }
             } else if let Some(slot) = state.waiters.iter_mut().find(|slot| slot.is_none()) {
-                *slot = Some(Waiter {
-                    id,
-                    waker: replacement,
-                });
+                *slot = Some(Waiter { id, waker: replacement });
                 (None, false)
             } else {
                 // The waiter permit pool bounds this list. If that invariant is
@@ -145,10 +138,7 @@ impl AdmissionCoordinator {
 
     fn unregister(&self, id: u64) {
         let removed = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             state
                 .waiters
                 .iter_mut()
@@ -160,18 +150,12 @@ impl AdmissionCoordinator {
 
     fn notify(&self) {
         {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             state.generation = state.generation.wrapping_add(1);
         }
         loop {
             let waiter = {
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.waiters.iter_mut().find_map(Option::take)
             };
             let Some(waiter) = waiter else {
@@ -208,11 +192,7 @@ impl CapacityPool {
         Self::with_coordinator(label, limit, default_coordinator())
     }
 
-    fn with_coordinator(
-        label: impl Into<ResourceLabel>,
-        limit: usize,
-        coordinator: Arc<AdmissionCoordinator>,
-    ) -> Self {
+    fn with_coordinator(label: impl Into<ResourceLabel>, limit: usize, coordinator: Arc<AdmissionCoordinator>) -> Self {
         Self {
             inner: Arc::new(PoolInner {
                 id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
@@ -287,9 +267,7 @@ impl PermitBundle {
         ordered.sort_unstable_by_key(|pool| pool.id());
         ordered.dedup_by_key(|pool| pool.id());
 
-        let coordinator = ordered
-            .first()
-            .map(|pool| Arc::clone(&pool.inner.coordinator));
+        let coordinator = ordered.first().map(|pool| Arc::clone(&pool.inner.coordinator));
         if let Some(coordinator) = &coordinator {
             if ordered
                 .iter()
@@ -324,10 +302,7 @@ impl PermitBundle {
         for permit in &mut permits {
             permit.notify_on_drop = true;
         }
-        Ok(Self {
-            permits,
-            coordinator,
-        })
+        Ok(Self { permits, coordinator })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -378,21 +353,14 @@ pub(crate) struct AdmissionRequest {
 }
 
 impl AdmissionRequest {
-    pub(crate) fn new(
-        pools: Vec<CapacityPool>,
-        waiter_pool: Option<CapacityPool>,
-    ) -> Result<Self, CapacityError> {
+    pub(crate) fn new(pools: Vec<CapacityPool>, waiter_pool: Option<CapacityPool>) -> Result<Self, CapacityError> {
         let mut pools = pools;
         pools.sort_unstable_by_key(CapacityPool::id);
         pools.dedup_by_key(|pool| pool.id());
         let coordinator = pools
             .first()
             .map(|pool| Arc::clone(&pool.inner.coordinator))
-            .or_else(|| {
-                waiter_pool
-                    .as_ref()
-                    .map(|pool| Arc::clone(&pool.inner.coordinator))
-            })
+            .or_else(|| waiter_pool.as_ref().map(|pool| Arc::clone(&pool.inner.coordinator)))
             .unwrap_or_else(default_coordinator);
         if pools
             .iter()
@@ -404,11 +372,7 @@ impl AdmissionRequest {
             let resource = waiter_pool
                 .as_ref()
                 .map(|pool| pool.inner.budget.resource().clone())
-                .or_else(|| {
-                    pools
-                        .first()
-                        .map(|pool| pool.inner.budget.resource().clone())
-                })
+                .or_else(|| pools.first().map(|pool| pool.inner.budget.resource().clone()))
                 .unwrap_or(ResourceLabel::Named("capacity coordinator"));
             return Err(CapacityError { resource });
         }
@@ -481,24 +445,14 @@ impl ManagerCapacityPools {
     pub(crate) fn new(limits: ManagerLimits) -> Self {
         let coordinator = AdmissionCoordinator::new(limits.admission_waiters);
         let pool = |capacity, label| {
-            CapacityPool::with_coordinator(
-                ResourceLabel::Manager(label),
-                capacity,
-                Arc::clone(&coordinator),
-            )
+            CapacityPool::with_coordinator(ResourceLabel::Manager(label), capacity, Arc::clone(&coordinator))
         };
         Self {
             active_roots: pool(limits.active_operations, ManagerCapacity::ActiveRoots),
             queued_roots: pool(limits.queued_operations, ManagerCapacity::QueuedRoots),
             admission_waiters: pool(limits.admission_waiters, ManagerCapacity::AdmissionWaiters),
-            unconsumed_outcomes: pool(
-                limits.unconsumed_outcomes,
-                ManagerCapacity::UnconsumedOutcomes,
-            ),
-            cleanup_concurrency: pool(
-                limits.cleanup_concurrency,
-                ManagerCapacity::CleanupConcurrency,
-            ),
+            unconsumed_outcomes: pool(limits.unconsumed_outcomes, ManagerCapacity::UnconsumedOutcomes),
+            cleanup_concurrency: pool(limits.cleanup_concurrency, ManagerCapacity::CleanupConcurrency),
             diagnostic_events: pool(limits.diagnostic_events, ManagerCapacity::DiagnosticEvents),
             coordinator,
         }
@@ -511,20 +465,11 @@ impl ManagerCapacityPools {
     /// Reserves root execution and outcome capacity atomically, but returns
     /// the permits separately so their lifecycle owners can release them at
     /// different operation facts.
-    pub(crate) fn root_lifecycle_permits(
-        &self,
-    ) -> Result<(CapacityPermit, CapacityPermit), CapacityError> {
-        let mut permits = PermitBundle::try_acquire(&[
-            self.active_roots.clone(),
-            self.unconsumed_outcomes.clone(),
-        ])?;
+    pub(crate) fn root_lifecycle_permits(&self) -> Result<(CapacityPermit, CapacityPermit), CapacityError> {
+        let mut permits = PermitBundle::try_acquire(&[self.active_roots.clone(), self.unconsumed_outcomes.clone()])?;
         Ok((
-            permits
-                .take(&self.active_roots)
-                .expect("active root permit"),
-            permits
-                .take(&self.unconsumed_outcomes)
-                .expect("outcome permit"),
+            permits.take(&self.active_roots).expect("active root permit"),
+            permits.take(&self.unconsumed_outcomes).expect("outcome permit"),
         ))
     }
 
@@ -542,23 +487,14 @@ impl ManagerCapacityPools {
     }
 
     pub(crate) fn root_admission_request(&self) -> Result<AdmissionRequest, CapacityError> {
-        self.admission_request(vec![
-            self.active_roots.clone(),
-            self.unconsumed_outcomes.clone(),
-        ])
+        self.admission_request(vec![self.active_roots.clone(), self.unconsumed_outcomes.clone()])
     }
 
-    pub(crate) fn admission_request(
-        &self,
-        pools: Vec<CapacityPool>,
-    ) -> Result<AdmissionRequest, CapacityError> {
+    pub(crate) fn admission_request(&self, pools: Vec<CapacityPool>) -> Result<AdmissionRequest, CapacityError> {
         AdmissionRequest::new(pools, Some(self.admission_waiters.clone()))
     }
 
-    pub(crate) fn child_admission_request(
-        &self,
-        scope: &ScopeCapacity,
-    ) -> Result<AdmissionRequest, CapacityError> {
+    pub(crate) fn child_admission_request(&self, scope: &ScopeCapacity) -> Result<AdmissionRequest, CapacityError> {
         let mut pools = scope.child_operation_pools.clone();
         pools.push(self.unconsumed_outcomes.clone());
         self.admission_request(pools)
@@ -575,9 +511,7 @@ impl ManagerCapacityPools {
             ]
             .concat(),
         )?;
-        let outcome = permits
-            .take(&self.unconsumed_outcomes)
-            .expect("outcome permit");
+        let outcome = permits.take(&self.unconsumed_outcomes).expect("outcome permit");
         Ok((permits, outcome))
     }
 
@@ -633,15 +567,9 @@ impl ScopeCapacity {
         };
         Self {
             limits,
-            child_operation_pools: vec![pool(
-                limits.child_operations,
-                ScopeCapacityKind::ChildOperations,
-            )],
+            child_operation_pools: vec![pool(limits.child_operations, ScopeCapacityKind::ChildOperations)],
             resource_pools: vec![pool(limits.resources, ScopeCapacityKind::Resources)],
-            effect_record_pools: vec![pool(
-                limits.effect_records,
-                ScopeCapacityKind::EffectRecords,
-            )],
+            effect_record_pools: vec![pool(limits.effect_records, ScopeCapacityKind::EffectRecords)],
         }
     }
 
@@ -653,11 +581,7 @@ impl ScopeCapacity {
         Self::root_with_identity(manager, scope_id.raw(), limits)
     }
 
-    pub(crate) fn root_with_identity(
-        manager: &ManagerCapacityPools,
-        scope_id: u128,
-        limits: ScopeLimits,
-    ) -> Self {
+    pub(crate) fn root_with_identity(manager: &ManagerCapacityPools, scope_id: u128, limits: ScopeLimits) -> Self {
         let coordinator = manager.coordinator();
         let pool = |capacity, kind| {
             CapacityPool::with_coordinator(
@@ -671,15 +595,9 @@ impl ScopeCapacity {
         };
         Self {
             limits,
-            child_operation_pools: vec![pool(
-                limits.child_operations,
-                ScopeCapacityKind::ChildOperations,
-            )],
+            child_operation_pools: vec![pool(limits.child_operations, ScopeCapacityKind::ChildOperations)],
             resource_pools: vec![pool(limits.resources, ScopeCapacityKind::Resources)],
-            effect_record_pools: vec![pool(
-                limits.effect_records,
-                ScopeCapacityKind::EffectRecords,
-            )],
+            effect_record_pools: vec![pool(limits.effect_records, ScopeCapacityKind::EffectRecords)],
         }
     }
 
@@ -695,11 +613,7 @@ impl ScopeCapacity {
         self.child_with_identity(scope_id.raw(), requested)
     }
 
-    pub(crate) fn resource_scope_for(
-        &self,
-        scope_id: crate::v02::report::ResourceScopeId,
-        capacity: usize,
-    ) -> Self {
+    pub(crate) fn resource_scope_for(&self, scope_id: crate::v02::report::ResourceScopeId, capacity: usize) -> Self {
         let limits = ScopeLimits {
             child_operations: self.limits.child_operations,
             resources: self.limits.resources.min(capacity),
@@ -726,17 +640,11 @@ impl ScopeCapacity {
             )
         };
         let mut child_operation_pools = self.child_operation_pools.clone();
-        child_operation_pools.push(pool(
-            limits.child_operations,
-            ScopeCapacityKind::ChildOperations,
-        ));
+        child_operation_pools.push(pool(limits.child_operations, ScopeCapacityKind::ChildOperations));
         let mut resource_pools = self.resource_pools.clone();
         resource_pools.push(pool(limits.resources, ScopeCapacityKind::Resources));
         let mut effect_record_pools = self.effect_record_pools.clone();
-        effect_record_pools.push(pool(
-            limits.effect_records,
-            ScopeCapacityKind::EffectRecords,
-        ));
+        effect_record_pools.push(pool(limits.effect_records, ScopeCapacityKind::EffectRecords));
         Self {
             limits,
             child_operation_pools,
@@ -798,16 +706,24 @@ impl ResourceRegistration {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AdmissionRequest, CapacityPool, ManagerCapacityPools, PermitBundle, ResourceRegistration,
-        ScopeCapacity,
-    };
-    use crate::v02::report::{ManagerLimits, ScopeLimits};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Wake;
+    use std::task::Waker;
+
+    use super::AdmissionRequest;
+    use super::CapacityPool;
+    use super::ManagerCapacityPools;
+    use super::PermitBundle;
+    use super::ResourceRegistration;
+    use super::ScopeCapacity;
+    use crate::v02::report::ManagerLimits;
+    use crate::v02::report::ScopeLimits;
 
     struct WakeCount(AtomicUsize);
 
@@ -899,9 +815,7 @@ mod tests {
         assert_eq!(child.effective_limits().resources, 3);
         assert_eq!(grandchild.effective_limits().effect_records, 2);
         assert_eq!(root.child_capacity_available(), 2);
-        let first = grandchild
-            .child_operation_permits()
-            .expect("first grandchild");
+        let first = grandchild.child_operation_permits().expect("first grandchild");
         assert_eq!(root.child_capacity_available(), 1);
         assert_eq!(child.child_capacity_available(), 0);
         assert!(grandchild.child_operation_permits().is_err());
@@ -914,9 +828,7 @@ mod tests {
     fn resource_ref_clone_is_not_registration() {
         let manager = ManagerCapacityPools::new(ManagerLimits::default());
         let scope = ScopeCapacity::root(&manager, 10, ScopeLimits::default());
-        let registration: ResourceRegistration = scope
-            .resource_registration()
-            .expect("resource registration succeeds");
+        let registration: ResourceRegistration = scope.resource_registration().expect("resource registration succeeds");
         let clone = registration.clone();
         assert_eq!(clone.permit_count(), 1);
 
@@ -930,18 +842,14 @@ mod tests {
             ScopeLimits::default().resources - 1
         );
         drop(clone);
-        assert_eq!(
-            scope.resource_capacity_available(),
-            ScopeLimits::default().resources
-        );
+        assert_eq!(scope.resource_capacity_available(), ScopeLimits::default().resources);
     }
 
     #[test]
     fn release_notifies_registered_waiter() {
         let pool = CapacityPool::new("one", 1);
         let held = pool.try_acquire().expect("hold the only slot");
-        let mut waiting = AdmissionRequest::new(vec![pool.clone()], None)
-            .expect("waiter registration has capacity");
+        let mut waiting = AdmissionRequest::new(vec![pool.clone()], None).expect("waiter registration has capacity");
         let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
         let waker = Waker::from(Arc::clone(&wakes));
 
@@ -957,9 +865,8 @@ mod tests {
         let second = CapacityPool::new("second", 1);
         let waiters = CapacityPool::new("waiter", 1);
         let held_second = second.try_acquire().expect("hold second pool");
-        let mut waiting =
-            AdmissionRequest::new(vec![first.clone(), second.clone()], Some(waiters.clone()))
-                .expect("waiter slot is available");
+        let mut waiting = AdmissionRequest::new(vec![first.clone(), second.clone()], Some(waiters.clone()))
+            .expect("waiter slot is available");
         let waker = Waker::from(Arc::new(WakeCount(AtomicUsize::new(0))));
 
         assert!(poll(&mut waiting, &waker).is_pending());

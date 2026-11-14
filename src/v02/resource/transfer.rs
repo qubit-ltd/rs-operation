@@ -2,13 +2,17 @@
 #![allow(dead_code)] // Public scope and RecoveryStore wiring is completed by T11.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use crate::v02::report::{
-    ManagerId, ResourceId, ResourceScopeId, ResourceTransfer, ResourceTransferError,
-    TransferReceipt,
-};
+use crate::v02::report::ManagerId;
+use crate::v02::report::ResourceId;
+use crate::v02::report::ResourceScopeId;
+use crate::v02::report::ResourceTransfer;
+use crate::v02::report::ResourceTransferError;
+use crate::v02::report::TransferReceipt;
 use crate::v02::resource::dependency::DependencyGraph;
 
 static TRANSFER_TRANSACTION: Mutex<()> = Mutex::new(());
@@ -26,10 +30,7 @@ pub(crate) struct TransferRegistry<T> {
 
 impl<T> Drop for TransferRegistry<T> {
     fn drop(&mut self) {
-        let owners = self
-            .owners
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owners = self.owners.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (_, owner) in owners.drain() {
             // The owning manager must end these resources through cleanup.
             // If its registry is dropped too early, do not run T::drop here.
@@ -99,10 +100,7 @@ impl<T> TransferRegistry<T> {
         if members.iter().any(|id| target.contains_key(id)) {
             return Err(ResourceTransferError::IncompleteDependencyGroup);
         }
-        let unique = members
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
+        let unique = members.iter().copied().collect::<std::collections::HashSet<_>>();
         if unique.len() != members.len() {
             return Err(ResourceTransferError::IncompleteDependencyGroup);
         }
@@ -137,17 +135,19 @@ impl<T> TransferRegistry<T> {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TransferRegistry;
-    use crate::v02::report::{ManagerId, ResourceId, ResourceScopeId, ResourceTransferError};
-    use crate::v02::resource::dependency::DependencyGraph;
     use std::sync::Arc;
+
+    use super::TransferRegistry;
+    use crate::v02::report::ManagerId;
+    use crate::v02::report::ResourceId;
+    use crate::v02::report::ResourceScopeId;
+    use crate::v02::report::ResourceTransferError;
+    use crate::v02::resource::dependency::DependencyGraph;
 
     fn id(manager: ManagerId, slot: u64) -> ResourceId {
         ResourceId::new(manager, slot, 1)
@@ -161,18 +161,11 @@ mod tests {
         let dependencies = Arc::new(DependencyGraph::default());
         assert!(
             dependencies
-                .add(
-                    id(manager, 2),
-                    source_scope,
-                    id(manager, 1),
-                    source_scope,
-                    Box::new(())
-                )
+                .add(id(manager, 2), source_scope, id(manager, 1), source_scope, Box::new(()))
                 .is_ok()
         );
         let source = TransferRegistry::new(manager, source_scope, 2, Arc::clone(&dependencies));
-        let destination =
-            TransferRegistry::new(manager, destination_scope, 1, Arc::clone(&dependencies));
+        let destination = TransferRegistry::new(manager, destination_scope, 1, Arc::clone(&dependencies));
         source.insert(id(manager, 1), "parent").unwrap();
         source.insert(id(manager, 2), "child").unwrap();
 
@@ -183,8 +176,7 @@ mod tests {
         assert_eq!(source.len(), 2);
         assert_eq!(destination.len(), 0);
 
-        let destination =
-            TransferRegistry::new(manager, destination_scope, 2, Arc::clone(&dependencies));
+        let destination = TransferRegistry::new(manager, destination_scope, 2, Arc::clone(&dependencies));
         let transfer = source
             .transfer_group_to(&destination, &[id(manager, 1), id(manager, 2)])
             .unwrap();
@@ -207,12 +199,7 @@ mod tests {
                 .is_ok()
         );
         let source = TransferRegistry::new(manager, scope, 2, Arc::clone(&dependencies));
-        let destination = TransferRegistry::new(
-            manager,
-            ResourceScopeId::new_unique(),
-            2,
-            Arc::clone(&dependencies),
-        );
+        let destination = TransferRegistry::new(manager, ResourceScopeId::new_unique(), 2, Arc::clone(&dependencies));
         source.insert(id(manager, 1), "only member").unwrap();
         assert_eq!(
             source.transfer_group_to(&destination, &[id(manager, 1), id(manager, 2)]),
@@ -229,12 +216,7 @@ mod tests {
         let dependencies = Arc::new(DependencyGraph::default());
         let resource = id(manager, 1);
         let source = TransferRegistry::new(manager, scope, 1, Arc::clone(&dependencies));
-        let destination = TransferRegistry::new(
-            manager,
-            ResourceScopeId::new_unique(),
-            1,
-            Arc::clone(&dependencies),
-        );
+        let destination = TransferRegistry::new(manager, ResourceScopeId::new_unique(), 1, Arc::clone(&dependencies));
         source.insert(resource, "owner").unwrap();
         assert!(dependencies.try_start(resource));
         assert_eq!(
