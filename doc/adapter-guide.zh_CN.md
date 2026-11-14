@@ -11,7 +11,7 @@
 `scope.manage(value)` 将资源登记到当前操作的资源范围，并返回 `ResourceRef<T>`。该引用同时提供共享访问并计入使用者数量；clone 增加一份使用引用，move 不增加，Drop 归还一份。资源只会在**所属范围结束且所有 `ResourceRef` 都已归还**后进入清理。父子关系本身不会推迟无关父资源的释放；子工作要继续访问父资源，必须拿到并持有该资源的引用。
 
 ```rust,ignore
-let input = scope.manage(staged_file).map_err(|error| error.to_string())?;
+let input = scope.manage(staged_file).map_err(|error| format!("{:?}", error.kind()))?;
 let child_input = input.clone();
 let child = scope.manager().try_submit(OperationOptions::default(), move |_child_scope| {
     run_command(&child_input)

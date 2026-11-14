@@ -17,14 +17,16 @@ fn submit_file_summary(
         .try_submit(
             OperationOptions::default(),
             move |parent_scope| async move {
-                let input = parent_scope.manage(bytes).map_err(|e| e.to_string())?;
+                let input = parent_scope
+                    .manage(bytes)
+                    .map_err(|error| format!("{:?}", error.kind()))?;
                 let child = parent_scope
                     .manager()
                     .try_submit(OperationOptions::default(), move |child_scope| {
                         let header_bytes = input.iter().take(5).copied().collect::<Vec<u8>>();
                         let header = child_scope
                             .manage(header_bytes)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|error| format!("{:?}", error.kind()))?;
                         Ok::<_, String>(FileSummary {
                             byte_count: input.len(),
                             mime: (header.as_slice() == b"%PDF-").then_some("application/pdf"),
@@ -59,16 +61,16 @@ fn submit_capacity_demo(
         .try_submit(options, |parent_scope| async move {
             let input = parent_scope
                 .manage(vec![1_u8, 2, 3])
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| format!("{:?}", error.kind()))?;
             let _request_metadata = parent_scope
                 .manage(String::from("document-42"))
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| format!("{:?}", error.kind()))?;
             let child = parent_scope
                 .manager()
                 .try_submit(OperationOptions::default(), move |child_scope| {
                     let _header = child_scope
                         .manage(input.iter().take(2).copied().collect::<Vec<_>>())
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|error| format!("{:?}", error.kind()))?;
                     Ok::<(), String>(())
                 })
                 .map_err(|e| e.to_string())?;

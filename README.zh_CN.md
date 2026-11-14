@@ -29,7 +29,7 @@ use qubit_operation::{ManagerOptions, OperationManager, OperationOptions, Operat
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manager = OperationManager::new(ManagerOptions::default())?;
     let mut operation = manager.try_submit(OperationOptions::default(), |scope| {
-        let input = scope.manage(b"%PDF-1.7\n".to_vec()).map_err(|e| e.to_string())?;
+        let input = scope.manage(b"%PDF-1.7\n".to_vec()).map_err(|error| format!("{:?}", error.kind()))?;
         Ok::<_, String>(input.starts_with(b"%PDF-").then_some("application/pdf"))
     })?;
 

@@ -19,7 +19,9 @@ pub fn submit_inference(
                 let inputs = scope
                     .resource_scope(ResourceScopeOptions { capacity: 1 })
                     .map_err(|e| e.to_string())?;
-                let input = inputs.manage(features).map_err(|e| e.to_string())?;
+                let input = inputs
+                    .manage(features)
+                    .map_err(|error| format!("{:?}", error.kind()))?;
                 scope
                     .manager()
                     .try_submit(OperationOptions::default(), move |_child_scope| {

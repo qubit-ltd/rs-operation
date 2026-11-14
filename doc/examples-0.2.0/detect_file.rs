@@ -41,7 +41,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut operation = manager.try_submit(OperationOptions::default(), move |scope| {
         let file = InputFile::open(path).map_err(|e| e.to_string())?;
-        let input = scope.manage(file).map_err(|e| e.to_string())?;
+        let input = scope
+            .manage(file)
+            .map_err(|error| format!("{:?}", error.kind()))?;
         input.detect().map_err(|e| e.to_string())
     })?;
 

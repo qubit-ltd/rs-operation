@@ -76,7 +76,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut operation = manager.try_submit(OperationOptions::default(), move |scope| {
         let file = InputFile::open(path).map_err(|e| e.to_string())?;
-        let input = scope.manage(file).map_err(|e| e.to_string())?;
+        let input = scope
+            .manage(file)
+            .map_err(|error| format!("{:?}", error.kind()))?;
         input.detect().map_err(|e| e.to_string())
     })?;
 
@@ -296,7 +298,7 @@ fn submit_background_detection(
 ) -> Result<OperationHandle<&'static str, String>, AdmissionError> {
     manager.try_submit(OperationOptions::default(), move |scope| {
         let file = InputFile::open(path).map_err(|e| e.to_string())?;
-        let input = scope.manage(file).map_err(|e| e.to_string())?;
+        let input = scope.manage(file).map_err(|error| format!("{:?}", error.kind()))?;
         let background_input = input.clone();
         let child = scope.manager().try_submit(OperationOptions::default(), move |_child_scope| {
             background_input.detect().map_err(|e| e.to_string())
@@ -427,14 +429,16 @@ fn submit_file_summary(
         .try_submit(
             OperationOptions::default(),
             move |parent_scope| async move {
-                let input = parent_scope.manage(bytes).map_err(|e| e.to_string())?;
+                let input = parent_scope
+                    .manage(bytes)
+                    .map_err(|error| format!("{:?}", error.kind()))?;
                 let child = parent_scope
                     .manager()
                     .try_submit(OperationOptions::default(), move |child_scope| {
                         let header_bytes = input.iter().take(5).copied().collect::<Vec<u8>>();
                         let header = child_scope
                             .manage(header_bytes)
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|error| format!("{:?}", error.kind()))?;
                         Ok::<_, String>(FileSummary {
                             byte_count: input.len(),
                             mime: (header.as_slice() == b"%PDF-").then_some("application/pdf"),
@@ -469,16 +473,16 @@ fn submit_capacity_demo(
         .try_submit(options, |parent_scope| async move {
             let input = parent_scope
                 .manage(vec![1_u8, 2, 3])
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| format!("{:?}", error.kind()))?;
             let _request_metadata = parent_scope
                 .manage(String::from("document-42"))
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| format!("{:?}", error.kind()))?;
             let child = parent_scope
                 .manager()
                 .try_submit(OperationOptions::default(), move |child_scope| {
                     let _header = child_scope
                         .manage(input.iter().take(2).copied().collect::<Vec<_>>())
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|error| format!("{:?}", error.kind()))?;
                     Ok::<(), String>(())
                 })
                 .map_err(|e| e.to_string())?;
@@ -537,7 +541,9 @@ pub fn submit_scan(
 ) -> Result<OperationHandle<usize, String>, AdmissionError> {
     manager
         .try_submit(OperationOptions::default(), move |scope| {
-            let input = scope.manage(bytes).map_err(|e| e.to_string())?;
+            let input = scope
+                .manage(bytes)
+                .map_err(|error| format!("{:?}", error.kind()))?;
             Ok::<_, String>(input.len())
         })
         .map_err(|error| error.into_parts().0)
@@ -590,7 +596,7 @@ async fn detect_from_async_service(
 ) -> Result<(OperationOutcome<Option<&'static str>, String>, Arc<SettlementReport>), Box<dyn Error>> {
     let handle = manager.as_sync().try_submit(OperationOptions::default(), move |scope| {
         let file = InputFile::open(path).map_err(|e| e.to_string())?;
-        let input = scope.manage(file).map_err(|e| e.to_string())?;
+        let input = scope.manage(file).map_err(|error| format!("{:?}", error.kind()))?;
         input.detect().map_err(|e| e.to_string())
     })?;
     let mut handle = handle.into_async();
@@ -628,7 +634,9 @@ pub fn submit_inference(
                 let inputs = scope
                     .resource_scope(ResourceScopeOptions { capacity: 1 })
                     .map_err(|e| e.to_string())?;
-                let input = inputs.manage(features).map_err(|e| e.to_string())?;
+                let input = inputs
+                    .manage(features)
+                    .map_err(|error| format!("{:?}", error.kind()))?;
                 scope
                     .manager()
                     .try_submit(OperationOptions::default(), move |_child_scope| {
@@ -866,7 +874,7 @@ let settlement = parent.wait_settlement()?;
 
 在没有额外取消或执行故障的情况下，父操作的两个 manage 成功后，根的资源额度已用完。_request_metadata 虽然未被读取，仍然是一个存活的资源引用；即使把该引用放进更短的 Rust 代码块，父资源范围尚未结束，资源仍被范围持有，名额也不会立即归还。
 
-子提交可以成功，因为子名额和资源名额分别计数。子操作得到自己的 scope 后，第三次 manage 返回 ManageResourceError<Vec<u8>>，其 reason() 为 ResourceManageErrorKind::CapacityExceeded。错误对象保留刚创建的 Vec；本例把错误转成 String，随后由普通 Rust 析构处理这段尚未登记的内存。特殊清理资源应采用第 6 章的预留及拒绝处理协议，不能照搬这里的转换。
+子提交可以成功，因为子名额和资源名额分别计数。子操作得到自己的 scope 后，第三次 manage 返回 ManageResourceError<Vec<u8>>，其 kind() 为 ResourceManageErrorKind::CapacityExceeded。错误对象保留刚创建的 Vec；本例把错误转成 String，随后由普通 Rust 析构处理这段尚未登记的内存。特殊清理资源应采用第 6 章的预留及拒绝处理协议，不能照搬这里的转换。
 
 父代码收到子失败后返回错误；默认 Required 也会阻止父成功。调用方观察到 Failed 或 ChildFailed 等非成功 outcome 后，仍需等待父 settlement，确认此前已登记的两个父资源完成收尾。失败的第三次登记没有新增资源记录，也没有消耗一个永远不归还的名额。
 

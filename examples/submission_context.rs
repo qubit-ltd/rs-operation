@@ -1,6 +1,6 @@
 include!("../doc/examples-0.2.0/submission_context.rs");
 
-use qubit_operation::{OperationOutcome, ShutdownMode};
+use qubit_operation::ShutdownMode;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manager = OperationManager::new(Default::default())?;
@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut request = submit_scan_request(&manager, b"nested scan".to_vec())?;
     match request.wait_outcome()? {
-        OperationOutcome::Succeeded(id) => println!("request: {id}"),
+        qubit_operation::OperationOutcome::Succeeded(id) => println!("request: {id}"),
         other => eprintln!("request failed: {other:?}"),
     }
     println!(

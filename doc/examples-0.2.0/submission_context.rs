@@ -6,7 +6,9 @@ pub fn submit_scan(
 ) -> Result<OperationHandle<usize, String>, AdmissionError> {
     manager
         .try_submit(OperationOptions::default(), move |scope| {
-            let input = scope.manage(bytes).map_err(|e| e.to_string())?;
+            let input = scope
+                .manage(bytes)
+                .map_err(|error| format!("{:?}", error.kind()))?;
             Ok::<_, String>(input.len())
         })
         .map_err(|error| error.into_parts().0)
