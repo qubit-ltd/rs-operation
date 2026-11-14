@@ -15,7 +15,10 @@ use crate::report::ResourceId;
 #[test]
 fn test_recovery_key_matches_resource_generation_and_nonce() {
     let id = ResourceId::new(OperationId::new(1), 4, 8);
-    let owner = RecoveryOwner::new(&RecoveryKey::<String>::new(1, id, 13), String::from("owned"));
+    let owner = RecoveryOwner::new(
+        &RecoveryKey::<String>::new(1, id, 13),
+        String::from("owned"),
+    );
     let wrong = RecoveryKey::<String>::new(1, ResourceId::new(OperationId::new(1), 4, 7), 13);
     let owner = owner.take(wrong).unwrap_err();
     let wrong = RecoveryKey::<String>::new(1, id, 12);
@@ -27,11 +30,17 @@ fn test_recovery_key_matches_resource_generation_and_nonce() {
 #[test]
 fn test_recovery_key_matches_erased_owner_type() {
     let id = ResourceId::new(OperationId::new(2), 1, 3);
-    let owner = RecoveryOwner::new(&RecoveryKey::<String>::new(1, id, 21), String::from("owned"));
+    let owner = RecoveryOwner::new(
+        &RecoveryKey::<String>::new(1, id, 21),
+        String::from("owned"),
+    );
     let wrong_type = RecoveryKey::<u64>::new(1, id, 21);
 
     let owner = owner.take(wrong_type).unwrap_err();
-    assert_eq!(owner.take(RecoveryKey::<String>::new(1, id, 21)).unwrap(), "owned");
+    assert_eq!(
+        owner.take(RecoveryKey::<String>::new(1, id, 21)).unwrap(),
+        "owned"
+    );
 }
 
 #[test]

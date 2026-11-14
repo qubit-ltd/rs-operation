@@ -64,7 +64,9 @@ impl ShutdownWaitRegistration {
     pub(super) fn register(&mut self, waker: &Waker) -> Result<(), ContextError> {
         let replacement = waker.clone();
         match self.source.clone() {
-            ShutdownSource::Supervisor(supervisor) => self.register_supervisor(&supervisor, waker, replacement),
+            ShutdownSource::Supervisor(supervisor) => {
+                self.register_supervisor(&supervisor, waker, replacement)
+            }
             ShutdownSource::Service(state, _) => {
                 let guard = lock(&state.0);
                 let capacity = guard.limit;
@@ -138,12 +140,22 @@ impl ShutdownWaitRegistration {
         let capacity = supervisor.inner.limits.admission_waiters;
         let id = self.waiter_id.unwrap_or_else(|| {
             let mut state = lock(&supervisor.inner.state);
-            let used = state.shutdown_waiters.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            let used = state
+                .shutdown_waiters
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
             allocate_waiter_id(&mut state.next_shutdown_waiter, &used)
         });
         let (old, result) = {
             let mut state = lock(&supervisor.inner.state);
-            update_waiter(&mut state.shutdown_waiters, id, capacity, waker, replacement)
+            update_waiter(
+                &mut state.shutdown_waiters,
+                id,
+                capacity,
+                waker,
+                replacement,
+            )
         };
         drop(old);
         if result.is_ok() {
@@ -186,12 +198,22 @@ impl ShutdownWaitRegistration {
     ) -> Result<(), ContextError> {
         let id = self.waiter_id.unwrap_or_else(|| {
             let mut guard = lock(&state.0);
-            let used = guard.shutdown_waiters.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            let used = guard
+                .shutdown_waiters
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
             allocate_waiter_id(&mut guard.next_shutdown_waiter, &used)
         });
         let (old, result) = {
             let mut guard = lock(&state.0);
-            update_waiter(&mut guard.shutdown_waiters, id, capacity, waker, replacement)
+            update_waiter(
+                &mut guard.shutdown_waiters,
+                id,
+                capacity,
+                waker,
+                replacement,
+            )
         };
         drop(old);
         if result.is_ok() {
@@ -301,14 +323,18 @@ mod tests {
             ..SupervisorLimits::default()
         });
         let group = supervisor.service_group(1).unwrap();
-        let source = ShutdownSource::Service(Arc::clone(&group.state), supervisor.internal_handle());
+        let source =
+            ShutdownSource::Service(Arc::clone(&group.state), supervisor.internal_handle());
         let waker = std::task::Waker::noop();
         let mut first = ShutdownWaitRegistration::new(source.clone());
         let mut rejected = ShutdownWaitRegistration::new(source);
 
         first.register(waker).unwrap();
         assert_eq!(lock(&group.state.0).shutdown_waiters.len(), 1);
-        assert_eq!(rejected.register(waker), Err(ContextError::WaiterCapacityExceeded));
+        assert_eq!(
+            rejected.register(waker),
+            Err(ContextError::WaiterCapacityExceeded)
+        );
 
         // An existing registration can refresh while the registry is full.
         first.register(waker).unwrap();
@@ -326,7 +352,8 @@ mod tests {
             admission_waiters: 1,
             ..SupervisorLimits::default()
         });
-        let mut registration = ShutdownWaitRegistration::new(ShutdownSource::Supervisor(supervisor.internal_handle()));
+        let mut registration =
+            ShutdownWaitRegistration::new(ShutdownSource::Supervisor(supervisor.internal_handle()));
         registration.register(std::task::Waker::noop()).unwrap();
         assert_eq!(lock(&supervisor.inner.state).shutdown_waiters.len(), 1);
         drop(registration);

@@ -215,8 +215,16 @@ impl OperationScope {
         {
             return Err(ScopeError::LimitReached);
         }
-        let child_id = OperationId::new(NEXT_SCOPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128);
-        let mut child = OperationScope::new(child_id, options.limits, options.policy, self.cleanup.clone(), context);
+        let child_id = OperationId::new(
+            NEXT_SCOPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128,
+        );
+        let mut child = OperationScope::new(
+            child_id,
+            options.limits,
+            options.policy,
+            self.cleanup.clone(),
+            context,
+        );
         child.effects = Arc::clone(&self.effects);
         if let Some(reason) = state.stop {
             child.request_cancel(reason);
@@ -268,7 +276,10 @@ impl OperationScope {
     /// # Errors
     ///
     /// Returns the registry error when registration cannot be completed.
-    pub fn register_resource<C: OwnedCleanup>(&self, owner: C) -> Result<ResourceId, RegisterError> {
+    pub fn register_resource<C: OwnedCleanup>(
+        &self,
+        owner: C,
+    ) -> Result<ResourceId, RegisterError> {
         let handle = self.resources.register(Box::new(owner))?;
         let id = handle.id();
         self.handles
@@ -338,12 +349,20 @@ impl OperationScope {
     ///
     /// Returns an error if either resource is absent or the dependency is
     /// invalid.
-    pub fn cleanup_after(&self, resource: ResourceId, prerequisite: ResourceId) -> Result<(), DependencyError> {
+    pub fn cleanup_after(
+        &self,
+        resource: ResourceId,
+        prerequisite: ResourceId,
+    ) -> Result<(), DependencyError> {
         let handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
         handles
             .get(&resource)
             .ok_or(DependencyError::NotRegistered)?
-            .cleanup_after(handles.get(&prerequisite).ok_or(DependencyError::NotRegistered)?)
+            .cleanup_after(
+                handles
+                    .get(&prerequisite)
+                    .ok_or(DependencyError::NotRegistered)?,
+            )
     }
 
     /// Transfer a resource and its connected dependency group to another scope
@@ -373,10 +392,16 @@ impl OperationScope {
         let self_first = Arc::as_ptr(&self.handles) < Arc::as_ptr(&destination.handles);
         if self_first {
             let mut source = self.handles.lock().unwrap_or_else(|e| e.into_inner());
-            let mut target = destination.handles.lock().unwrap_or_else(|e| e.into_inner());
+            let mut target = destination
+                .handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             self.transfer_with_locked_handles(id, destination, &mut source, &mut target)
         } else {
-            let mut target = destination.handles.lock().unwrap_or_else(|e| e.into_inner());
+            let mut target = destination
+                .handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut source = self.handles.lock().unwrap_or_else(|e| e.into_inner());
             self.transfer_with_locked_handles(id, destination, &mut source, &mut target)
         }
@@ -398,9 +423,16 @@ impl OperationScope {
     ///
     /// Returns an error when the receipt does not confirm this transferred
     /// resource.
-    pub fn confirm_transferred_release(&self, id: ResourceId, receipt: ReleaseReceipt) -> Result<(), RegistryError> {
+    pub fn confirm_transferred_release(
+        &self,
+        id: ResourceId,
+        receipt: ReleaseReceipt,
+    ) -> Result<(), RegistryError> {
         self.resources.confirm_transferred_released(id, receipt)?;
-        self.handles.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        self.handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
         self.resources.notify_change();
         Ok(())
     }
@@ -422,7 +454,10 @@ impl OperationScope {
     ///
     /// Returns an error when this scope is closed or its child limit is
     /// reached.
-    pub fn reserve_child(&self, requirement: ChildRequirement) -> Result<ChildReservation, ScopeError> {
+    pub fn reserve_child(
+        &self,
+        requirement: ChildRequirement,
+    ) -> Result<ChildReservation, ScopeError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !state.accepting {
             return Err(ScopeError::Closed);
@@ -493,7 +528,10 @@ impl OperationScope {
     ///
     /// Returns the next recovery key, or `None` when no key is available.
     pub fn take_recovery_key(&self) -> Option<RecoveryKey<RecoveryOwner>> {
-        self.recovery_keys.lock().unwrap_or_else(|e| e.into_inner()).pop()
+        self.recovery_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
     }
 
     /// Recover an owner only with its original registry-issued key.
@@ -510,7 +548,10 @@ impl OperationScope {
     ///
     /// Returns the owner on success, or the unchanged key when it cannot be
     /// recovered.
-    pub fn take_recovery<R: Send + 'static>(&self, key: RecoveryKey<R>) -> Result<R, RecoveryKey<R>> {
+    pub fn take_recovery<R: Send + 'static>(
+        &self,
+        key: RecoveryKey<R>,
+    ) -> Result<R, RecoveryKey<R>> {
         self.recovery.take_recovery(key)
     }
 
@@ -598,12 +639,19 @@ impl OperationScope {
     ///
     /// * `cx` - Task context used to register the deadline notification waker.
     pub(crate) fn poll_deadlines(&self, cx: &mut Context<'_>) {
-        let mut signal = self.deadline_signal.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut signal = self
+            .deadline_signal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(mut signal) = signal.take() {
             if Pin::new(&mut signal).poll(cx).is_ready() {
                 self.request_cancel(StopReason::Timeout);
             } else {
-                *self.deadline_signal.lock().unwrap_or_else(|e| e.into_inner()) = Some(signal);
+                *self
+                    .deadline_signal
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(signal);
             }
         }
         for child in self.child_scopes() {
@@ -617,7 +665,10 @@ impl OperationScope {
     ///
     /// * `key` - Recovery key issued for the owner being returned.
     pub(crate) fn save_recovery_key(&self, key: RecoveryKey<RecoveryOwner>) {
-        self.recovery_keys.lock().unwrap_or_else(|e| e.into_inner()).push(key);
+        self.recovery_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(key);
     }
     /// Wait until resources change or a cleanup becomes ready or completes.
     ///

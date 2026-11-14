@@ -31,5 +31,8 @@ pub(crate) trait ChildRegistry: Send + Sync {
     /// # Errors
     ///
     /// Returns the admission failure when no reservation can be made.
-    fn reserve_child(&self, options: ChildOptions) -> Result<Box<dyn ChildReservation>, AdmissionError>;
+    fn reserve_child(
+        &self,
+        options: ChildOptions,
+    ) -> Result<Box<dyn ChildReservation>, AdmissionError>;
 }

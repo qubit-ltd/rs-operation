@@ -25,7 +25,10 @@ use crate::scope::ScopePolicy;
 struct ReadyCleanup;
 
 impl OwnedCleanup for ReadyCleanup {
-    fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+    fn begin(
+        self: Box<Self>,
+        _: CleanupContext,
+    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
         Box::pin(std::future::ready(CleanupOutcome::Cleaned))
     }
 }
@@ -71,8 +74,14 @@ fn test_opposing_scope_resource_transfers_do_not_invert_handle_locks() {
     barrier.wait();
     let first_result = rx.recv_timeout(std::time::Duration::from_secs(1));
     let second_result = rx.recv_timeout(std::time::Duration::from_secs(1));
-    assert!(first_result.is_ok(), "first opposing transfer must complete");
-    assert!(second_result.is_ok(), "second opposing transfer must complete");
+    assert!(
+        first_result.is_ok(),
+        "first opposing transfer must complete"
+    );
+    assert!(
+        second_result.is_ok(),
+        "second opposing transfer must complete"
+    );
     assert!(first_result.unwrap().is_ok());
     assert!(second_result.unwrap().is_ok());
 }

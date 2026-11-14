@@ -26,7 +26,10 @@ use crate::report::ResourceId;
 /// `Some` contains the slot index and entry when both the slot generation and
 /// locked entry identity match; `None` indicates a missing, stale, or poisoned
 /// entry.
-pub(in crate::resource) fn lookup_slot(state: &RegistryState, resource_id: ResourceId) -> Option<(usize, &Arc<Entry>)> {
+pub(in crate::resource) fn lookup_slot(
+    state: &RegistryState,
+    resource_id: ResourceId,
+) -> Option<(usize, &Arc<Entry>)> {
     let slot_index = resource_id.slot as usize;
     let slot = state.slots.get(slot_index)?;
     if slot.generation != resource_id.generation {
@@ -49,7 +52,10 @@ pub(in crate::resource) fn lookup_slot(state: &RegistryState, resource_id: Resou
 /// `Some` borrows the matching entry; `None` indicates that the identity is
 /// absent, stale, or backed by a poisoned entry lock.
 #[inline]
-pub(in crate::resource) fn lookup_entry(state: &RegistryState, resource_id: ResourceId) -> Option<&Arc<Entry>> {
+pub(in crate::resource) fn lookup_entry(
+    state: &RegistryState,
+    resource_id: ResourceId,
+) -> Option<&Arc<Entry>> {
     lookup_slot(state, resource_id).map(|(_, entry)| entry)
 }
 
@@ -65,7 +71,10 @@ pub(in crate::resource) fn lookup_entry(state: &RegistryState, resource_id: Reso
 ///
 /// `true` when at least one dependency set contains `resource_id`.
 #[must_use]
-pub(in crate::resource) fn has_unreleased_prerequisite(state: &RegistryState, resource_id: ResourceId) -> bool {
+pub(in crate::resource) fn has_unreleased_prerequisite(
+    state: &RegistryState,
+    resource_id: ResourceId,
+) -> bool {
     state
         .dependencies
         .values()
@@ -84,7 +93,10 @@ pub(in crate::resource) fn has_unreleased_prerequisite(state: &RegistryState, re
 ///
 /// The connected resource identities in sorted, duplicate-free order.
 #[must_use]
-pub(in crate::resource) fn connected_group(state: &RegistryState, start: ResourceId) -> Vec<ResourceId> {
+pub(in crate::resource) fn connected_group(
+    state: &RegistryState,
+    start: ResourceId,
+) -> Vec<ResourceId> {
     let mut visited = BTreeSet::new();
     let mut pending = VecDeque::from([start]);
     while let Some(current) = pending.pop_front() {
@@ -139,7 +151,11 @@ pub(in crate::resource) fn free_slot_indices(state: &RegistryState, count: usize
 /// `true` when `target` is `from` or is reachable through one or more directed
 /// edges; otherwise returns `false`.
 #[must_use]
-pub(in crate::resource) fn reachable(state: &RegistryState, from: ResourceId, target: ResourceId) -> bool {
+pub(in crate::resource) fn reachable(
+    state: &RegistryState,
+    from: ResourceId,
+    target: ResourceId,
+) -> bool {
     let mut pending = vec![from];
     let mut visited = BTreeSet::new();
     while let Some(current) = pending.pop() {

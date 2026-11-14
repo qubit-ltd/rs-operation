@@ -33,7 +33,9 @@ fn test_waiters_are_bounded_cancel_safely_and_recover_rejected_input() {
     let mut waiting = Box::pin(supervisor.start_wait_body(String::from("kept")).unwrap());
     let mut context = Context::from_waker(std::task::Waker::noop());
     assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
-    let rejected = supervisor.start_wait_body(String::from("rejected")).unwrap_err();
+    let rejected = supervisor
+        .start_wait_body(String::from("rejected"))
+        .unwrap_err();
     assert_eq!(rejected.reason(), AdmissionError::Busy);
     assert_eq!(rejected.into_body(), "rejected");
     drop(waiting);
@@ -78,9 +80,15 @@ fn test_queued_task_lease_wakes_and_becomes_active_after_capacity_release() {
     let (_queued_body, queued_lease, _queued_result) = queued.into_parts();
     let mut task_context = Context::from_waker(std::task::Waker::noop());
 
-    assert!(matches!(queued_lease.poll_active(&mut task_context), Poll::Pending));
+    assert!(matches!(
+        queued_lease.poll_active(&mut task_context),
+        Poll::Pending
+    ));
     drop(active_lease);
-    assert!(matches!(queued_lease.poll_active(&mut task_context), Poll::Ready(true)));
+    assert!(matches!(
+        queued_lease.poll_active(&mut task_context),
+        Poll::Ready(true)
+    ));
 }
 
 #[test]
@@ -93,11 +101,23 @@ fn test_context_admission_errors_map_to_public_admission_categories() {
 
     let context = OperationContext::new(ContextOptions::default());
     let cases = [
-        (ContextError::DeadlineExpired, AdmissionError::DeadlineExpired),
-        (ContextError::BudgetUnavailable, AdmissionError::ReservationLimit),
+        (
+            ContextError::DeadlineExpired,
+            AdmissionError::DeadlineExpired,
+        ),
+        (
+            ContextError::BudgetUnavailable,
+            AdmissionError::ReservationLimit,
+        ),
         (ContextError::WaiterCapacityExceeded, AdmissionError::Busy),
-        (ContextError::ClockUnavailable, AdmissionError::DriverUnavailable),
-        (ContextError::ClockDomainMismatch, AdmissionError::DriverUnavailable),
+        (
+            ContextError::ClockUnavailable,
+            AdmissionError::DriverUnavailable,
+        ),
+        (
+            ContextError::ClockDomainMismatch,
+            AdmissionError::DriverUnavailable,
+        ),
         (ContextError::Stopped, AdmissionError::Stopped),
     ];
     for (context_error, expected) in cases {

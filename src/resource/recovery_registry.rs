@@ -52,7 +52,9 @@ fn next_registry_id() -> u64 {
 #[must_use]
 fn next_nonce(counter: &AtomicU64) -> u64 {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nonce| nonce.checked_add(1))
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nonce| {
+            nonce.checked_add(1)
+        })
         .expect("recovery key nonce space exhausted")
 }
 
@@ -105,7 +107,9 @@ fn recover_rejected_owners<R: Send + 'static>(
     nonce: u64,
     registry_id: u64,
 ) -> (R, R) {
-    let retained = owner.take(key).unwrap_or_else(|_| panic!("matching recovery key"));
+    let retained = owner
+        .take(key)
+        .unwrap_or_else(|_| panic!("matching recovery key"));
     let failure_key = RecoveryKey::new(registry_id, resource, nonce);
     let failure = failed
         .take(failure_key)
@@ -146,7 +150,11 @@ impl RecoveryRegistry {
     /// The number of owners, or zero if the owner lock is poisoned.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.owners.lock().map(|owners| owners.len()).unwrap_or(0)
+        self.inner
+            .owners
+            .lock()
+            .map(|owners| owners.len())
+            .unwrap_or(0)
     }
 
     /// Whether no recovery owners are currently retained.
@@ -218,18 +226,26 @@ impl RecoveryRegistry {
     ///
     /// Panics if key nonce space is exhausted or an internally constructed
     /// owner fails to match its key.
-    pub fn register<R: Send + 'static>(&self, resource: ResourceId, value: R) -> Result<RecoveryKey<R>, R> {
+    pub fn register<R: Send + 'static>(
+        &self,
+        resource: ResourceId,
+        value: R,
+    ) -> Result<RecoveryKey<R>, R> {
         let nonce = next_nonce(&self.inner.next_nonce);
         let key = RecoveryKey::new(self.inner.registry_id, resource, nonce);
         let owner = RecoveryOwner::new(&key, value);
         let mut owners = match self.inner.owners.lock() {
             Ok(owners) => owners,
             Err(_) => {
-                return Err(owner.take(key).unwrap_or_else(|_| panic!("matching recovery key")));
+                return Err(owner
+                    .take(key)
+                    .unwrap_or_else(|_| panic!("matching recovery key")));
             }
         };
         if owners.len() >= self.inner.capacity {
-            return Err(owner.take(key).unwrap_or_else(|_| panic!("matching recovery key")));
+            return Err(owner
+                .take(key)
+                .unwrap_or_else(|_| panic!("matching recovery key")));
         }
         owners.insert((self.inner.registry_id, resource, nonce), owner);
         Ok(key)
@@ -327,7 +343,10 @@ impl RecoveryRegistry {
     ///
     /// Panics if the stored owner does not match its registry-issued key, which
     /// indicates internal state corruption.
-    pub fn take_recovery<R: Send + 'static>(&self, key: RecoveryKey<R>) -> Result<R, RecoveryKey<R>> {
+    pub fn take_recovery<R: Send + 'static>(
+        &self,
+        key: RecoveryKey<R>,
+    ) -> Result<R, RecoveryKey<R>> {
         let Ok(mut owners) = self.inner.owners.lock() else {
             return Err(key);
         };

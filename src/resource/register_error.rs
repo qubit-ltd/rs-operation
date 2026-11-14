@@ -69,6 +69,8 @@ impl fmt::Debug for RegisterError {
     ///
     /// `Ok(())` when formatting succeeds, or the formatter's error otherwise.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RegisterError").field("kind", &self.kind).finish()
+        f.debug_struct("RegisterError")
+            .field("kind", &self.kind)
+            .finish()
     }
 }

@@ -136,7 +136,9 @@ impl ServiceGroup {
     ///   operation.
     fn reserve_request(&self, managed: bool) -> Result<ServiceRequest, AdmissionError> {
         let (lock, _) = &*self.state;
-        let mut state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.closed {
             return Err(AdmissionError::Closed);
         }
@@ -250,10 +252,16 @@ impl ServiceGroup {
     ///
     /// Returns counts of requests, recovery entries, and resources still
     /// pending when the wait completes or times out.
-    pub fn shutdown_blocking(&self, mode: ShutdownMode, timeout: std::time::Duration) -> ShutdownReport {
+    pub fn shutdown_blocking(
+        &self,
+        mode: ShutdownMode,
+        timeout: std::time::Duration,
+    ) -> ShutdownReport {
         self.begin_shutdown(mode);
         let (mutex, changed) = &*self.state;
-        let state = mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (state, _) = changed
             .wait_timeout_while(state, timeout, |state| {
                 !state.requests.is_empty() || !state.resource_scopes.is_empty()
@@ -305,7 +313,11 @@ impl ServiceGroup {
     /// - `mode`: Whether admitted work may drain or should receive a stop
     ///   request.
     fn begin_shutdown(&self, mode: ShutdownMode) {
-        begin_service_group_state(Arc::clone(&self.state), mode, self.supervisor.internal_handle());
+        begin_service_group_state(
+            Arc::clone(&self.state),
+            mode,
+            self.supervisor.internal_handle(),
+        );
     }
 }
 
@@ -352,7 +364,9 @@ mod tests {
         drop(group);
 
         drop(request);
-        let observation = supervisor.shutdown_observer().wait_blocking(std::time::Duration::ZERO);
+        let observation = supervisor
+            .shutdown_observer()
+            .wait_blocking(std::time::Duration::ZERO);
         assert_eq!(observation.report.pending_requests, 0);
         assert_eq!(observation.report.pending_resources, 0);
     }

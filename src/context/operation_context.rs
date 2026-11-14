@@ -114,7 +114,11 @@ impl OperationContext {
     pub fn child(&self, options: ContextOptions) -> Result<Self, ContextError> {
         let clock = options.clock.or_else(|| self.clock.clone());
         let deadline = match (self.deadline, options.deadline) {
-            (Some(parent), Some(child)) => Some(parent.earliest(child).map_err(|_| ContextError::ClockDomainMismatch)?),
+            (Some(parent), Some(child)) => Some(
+                parent
+                    .earliest(child)
+                    .map_err(|_| ContextError::ClockDomainMismatch)?,
+            ),
             (Some(parent), None) => Some(parent),
             (None, child) => child,
         };
@@ -187,7 +191,8 @@ impl OperationContext {
         match (self.deadline, self.clock.as_ref()) {
             (Some(deadline), Some(clock)) => {
                 let now = clock.now();
-                now.domain == deadline.time_point().domain && now.ticks >= deadline.time_point().ticks
+                now.domain == deadline.time_point().domain
+                    && now.ticks >= deadline.time_point().ticks
             }
             _ => false,
         }
@@ -241,7 +246,9 @@ impl OperationContext {
             return Err(ContextError::DeadlineExpired);
         }
         if let Some(budget) = &self.budget {
-            budget.check().map_err(|_| ContextError::BudgetUnavailable)?;
+            budget
+                .check()
+                .map_err(|_| ContextError::BudgetUnavailable)?;
         }
         Ok(())
     }
@@ -258,7 +265,11 @@ impl OperationContext {
         if clock.now().domain != deadline.time_point().domain {
             return None;
         }
-        Some(DeadlineSignal::new(deadline, clock, Arc::downgrade(&self.node)))
+        Some(DeadlineSignal::new(
+            deadline,
+            clock,
+            Arc::downgrade(&self.node),
+        ))
     }
 
     /// Register an observer-only timer in this context's clock domain.
@@ -282,7 +293,11 @@ impl OperationContext {
             return Err(ContextError::ClockDomainMismatch);
         }
         let observer_node = Arc::new(Node::new());
-        Ok(DeadlineSignal::new(deadline, clock, Arc::downgrade(&observer_node)))
+        Ok(DeadlineSignal::new(
+            deadline,
+            clock,
+            Arc::downgrade(&observer_node),
+        ))
     }
 }
 
@@ -297,7 +312,10 @@ impl OperationContext {
 ///
 /// Returns `ClockUnavailable` when a deadline is supplied without a clock, or
 /// `ClockDomainMismatch` when their domains differ.
-fn validate_clock(clock: Option<&dyn ClockSource>, deadline: Option<Deadline>) -> Result<(), ContextError> {
+fn validate_clock(
+    clock: Option<&dyn ClockSource>,
+    deadline: Option<Deadline>,
+) -> Result<(), ContextError> {
     if let Some(deadline) = deadline {
         let Some(clock) = clock else {
             return Err(ContextError::ClockUnavailable);

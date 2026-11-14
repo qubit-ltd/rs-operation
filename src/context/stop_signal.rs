@@ -108,11 +108,20 @@ impl Future for StopSignal {
                 let old_waker = this
                     .waiter_id
                     .take()
-                    .and_then(|id| state.stop_waiters.iter().position(|(candidate, _)| *candidate == id))
+                    .and_then(|id| {
+                        state
+                            .stop_waiters
+                            .iter()
+                            .position(|(candidate, _)| *candidate == id)
+                    })
                     .map(|index| state.stop_waiters.swap_remove(index).1);
                 (Some(Ok(reason)), old_waker, Some(replacement))
             } else if let Some(id) = this.waiter_id {
-                let Some((_, stored)) = state.stop_waiters.iter_mut().find(|(candidate, _)| *candidate == id) else {
+                let Some((_, stored)) = state
+                    .stop_waiters
+                    .iter_mut()
+                    .find(|(candidate, _)| *candidate == id)
+                else {
                     this.completed = true;
                     return Poll::Ready(Err(ContextError::Stopped));
                 };
@@ -123,7 +132,11 @@ impl Future for StopSignal {
                 }
             } else if state.stop_waiters.len() >= STOP_WAITER_CAPACITY {
                 this.completed = true;
-                (Some(Err(ContextError::WaiterCapacityExceeded)), None, Some(replacement))
+                (
+                    Some(Err(ContextError::WaiterCapacityExceeded)),
+                    None,
+                    Some(replacement),
+                )
             } else {
                 let id = state.next_waiter;
                 let Some(next) = id.checked_add(1) else {
@@ -177,5 +190,7 @@ impl Drop for StopSignal {
 ///
 /// A guard that keeps the waiter table locked for its lifetime.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

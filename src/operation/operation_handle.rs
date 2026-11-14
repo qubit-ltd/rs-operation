@@ -110,7 +110,8 @@ impl<T, E> OperationHandle<T, E> {
     ///
     /// The typed outcome after it is published.
     pub fn result_blocking(&mut self) -> Result<OperationOutcome<T, E>, ObservationError> {
-        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker() {
+        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker()
+        {
             return Err(ObservationError::WouldDeadlock);
         }
         let mut state = lock(&self.shared.state);
@@ -131,7 +132,11 @@ impl<T, E> OperationHandle<T, E> {
                 }
                 return Ok(result);
             }
-            state = self.shared.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = self
+                .shared
+                .changed
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -155,7 +160,8 @@ impl<T, E> OperationHandle<T, E> {
     ///
     /// The final settlement report after cleanup completes.
     pub fn released_blocking(&self) -> Result<SettlementReport, ObservationError> {
-        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker() {
+        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker()
+        {
             return Err(ObservationError::WouldDeadlock);
         }
         let mut state = lock(&self.shared.state);
@@ -163,7 +169,11 @@ impl<T, E> OperationHandle<T, E> {
             if let Some(report) = &state.released {
                 return Ok(report.clone());
             }
-            state = self.shared.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = self
+                .shared
+                .changed
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
 

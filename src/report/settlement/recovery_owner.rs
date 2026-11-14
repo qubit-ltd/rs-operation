@@ -105,7 +105,10 @@ impl RecoveryOwner {
     /// Returns `Err(self)` if the registry namespace, resource generation,
     /// nonce, or erased owner type does not match the supplied key.
     pub fn take<R: Send + 'static>(self, key: RecoveryKey<R>) -> Result<R, Self> {
-        if key.registry_id != self.registry_id || key.resource_id() != self.resource_id || key.nonce != self.nonce {
+        if key.registry_id != self.registry_id
+            || key.resource_id() != self.resource_id
+            || key.nonce != self.nonce
+        {
             return Err(self);
         }
         match self.value.downcast::<R>() {

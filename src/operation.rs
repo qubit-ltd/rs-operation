@@ -48,12 +48,17 @@ mod operation_observer;
 /// # Returns
 ///
 /// A snapshot combining the current result state and optional settlement.
-fn observer_snapshot<T, E>(state: &State<T, E>, settlement: Option<SettlementReport>) -> ObserverSnapshot {
+fn observer_snapshot<T, E>(
+    state: &State<T, E>,
+    settlement: Option<SettlementReport>,
+) -> ObserverSnapshot {
     ObserverSnapshot {
         resource_phase: settlement
             .as_ref()
             .map_or(ResourcePhase::Active, |report| report.resource_phase),
-        business_result_ready: state.result.is_some() || state.result_taken || state.result_discarded,
+        business_result_ready: state.result.is_some()
+            || state.result_taken
+            || state.result_discarded,
         result_taken: state.result_taken,
         result_discarded: state.result_discarded,
         settlement,
@@ -134,7 +139,11 @@ fn poll_released<T, E>(shared: &Arc<Shared<T, E>>, cx: &mut Context<'_>) -> Poll
         if let Some(report) = &state.released {
             Poll::Ready(report.clone())
         } else {
-            if !state.release_waiters.iter().any(|w| w.will_wake(cx.waker())) {
+            if !state
+                .release_waiters
+                .iter()
+                .any(|w| w.will_wake(cx.waker()))
+            {
                 state
                     .release_waiters
                     .push(candidate.take().expect("candidate waker is present"));
@@ -330,7 +339,8 @@ mod tests {
         drop(probe);
     }
 
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref, drop_waker);
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_waker, wake_waker, wake_by_ref, drop_waker);
 
     fn reentrant_waker(shared: &Arc<Shared<(), ()>>, lock_reentries: &Arc<AtomicUsize>) -> Waker {
         let probe = Arc::new(Probe {

@@ -50,7 +50,9 @@ impl Drop for ServiceRequest {
         if !self.released {
             let (lock, changed) = &*self.state;
             let (waiters, _) = {
-                let mut state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut state = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.requests.remove(&self.id);
                 self.released = true;
                 (std::mem::take(&mut state.shutdown_waiters), ())
@@ -58,7 +60,10 @@ impl Drop for ServiceRequest {
             changed.notify_all();
             wake_shutdown(waiters);
             notify_shutdown(&self.supervisor);
-            start_service_resource_cleanup(Arc::clone(&self.state), self.supervisor.internal_handle());
+            start_service_resource_cleanup(
+                Arc::clone(&self.state),
+                self.supervisor.internal_handle(),
+            );
         }
     }
 }

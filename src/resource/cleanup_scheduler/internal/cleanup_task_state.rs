@@ -37,7 +37,10 @@ impl PollGate {
     }
 
     pub(in crate::resource::cleanup_scheduler) fn wait(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.0 += 1;
         self.changed.notify_all();
         while !state.1 {
@@ -54,7 +57,10 @@ impl PollGate {
     }
 
     pub(in crate::resource::cleanup_scheduler) fn release_when_ready(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         while state.0 < 2 {
             let (next, timeout) = self
                 .changed

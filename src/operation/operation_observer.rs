@@ -88,7 +88,8 @@ impl<T, E> OperationObserver<T, E> {
     ///
     /// The final settlement report after cleanup completes.
     pub fn released_blocking(&self) -> Result<SettlementReport, ObservationError> {
-        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker() {
+        if crate::driver::is_portable_worker_thread() || crate::driver::is_thread_executor_worker()
+        {
             return Err(ObservationError::WouldDeadlock);
         }
         let mut state = lock(&self.shared.state);
@@ -96,7 +97,11 @@ impl<T, E> OperationObserver<T, E> {
             if let Some(report) = &state.released {
                 return Ok(report.clone());
             }
-            state = self.shared.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = self
+                .shared
+                .changed
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
     /// Observe the current state until a caller-owned deadline without stopping
@@ -115,26 +120,43 @@ impl<T, E> OperationObserver<T, E> {
     ///
     /// Returns an observation error if the deadline uses an unavailable or
     /// incompatible clock domain.
-    pub async fn observe_until(&self, deadline: Deadline) -> Result<ObserveUntil<T, E>, ObservationError> {
-        let mut timer = self.shared.context.signal_at(deadline).map_err(|error| match error {
-            ContextError::ClockUnavailable => ObservationError::ClockUnavailable,
-            ContextError::ClockDomainMismatch => ObservationError::ClockDomainMismatch,
-            _ => ObservationError::InvalidObserver,
-        })?;
+    pub async fn observe_until(
+        &self,
+        deadline: Deadline,
+    ) -> Result<ObserveUntil<T, E>, ObservationError> {
+        let mut timer = self
+            .shared
+            .context
+            .signal_at(deadline)
+            .map_err(|error| match error {
+                ContextError::ClockUnavailable => ObservationError::ClockUnavailable,
+                ContextError::ClockDomainMismatch => ObservationError::ClockDomainMismatch,
+                _ => ObservationError::InvalidObserver,
+            })?;
         let snapshot = std::future::poll_fn(|cx| {
             let timed_out = Pin::new(&mut timer).poll(cx).is_ready();
             let mut candidate = Some(cx.waker().clone());
             let (snapshot, remove_waiter) = {
                 let mut state = lock(&self.shared.state);
                 if let Some(report) = &state.released {
-                    (Some(super::observer_snapshot(&state, Some(report.clone()))), false)
+                    (
+                        Some(super::observer_snapshot(&state, Some(report.clone()))),
+                        false,
+                    )
                 } else {
-                    if !state.release_waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                    if !state
+                        .release_waiters
+                        .iter()
+                        .any(|w| w.will_wake(cx.waker()))
+                    {
                         state
                             .release_waiters
                             .push(candidate.take().expect("candidate waker is present"));
                     }
-                    (timed_out.then(|| super::observer_snapshot(&state, None)), timed_out)
+                    (
+                        timed_out.then(|| super::observer_snapshot(&state, None)),
+                        timed_out,
+                    )
                 }
             };
             drop(candidate);

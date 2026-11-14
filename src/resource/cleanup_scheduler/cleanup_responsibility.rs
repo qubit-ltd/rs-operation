@@ -122,7 +122,9 @@ mod tests {
                 .is_none()
         );
 
-        let mut observer = responsibility.task(resource_id).expect("owner retains scheduled task");
+        let mut observer = responsibility
+            .task(resource_id)
+            .expect("owner retains scheduled task");
         let mut context = Context::from_waker(Waker::noop());
         assert!(matches!(
             observer.poll_at(&mut context, MonotonicTime::new(ClockDomainId(1), 0)),

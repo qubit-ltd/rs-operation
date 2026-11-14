@@ -654,7 +654,10 @@ mod tests {
         let completion = group
             .run_and_settle(OperationOptions::default(), |_| Ok::<_, ()>(91usize))
             .unwrap();
-        assert!(matches!(completion.outcome, OperationOutcome::Succeeded(91)));
+        assert!(matches!(
+            completion.outcome,
+            OperationOutcome::Succeeded(91)
+        ));
         assert!(completion.settlement.all_released());
     }
 

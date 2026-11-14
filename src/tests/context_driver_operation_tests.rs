@@ -36,7 +36,10 @@ impl Wake for CountingWake {
 
 fn counting_waker() -> (Waker, Arc<Mutex<usize>>) {
     let count = Arc::new(Mutex::new(0));
-    (Waker::from(Arc::new(CountingWake(Arc::clone(&count)))), count)
+    (
+        Waker::from(Arc::new(CountingWake(Arc::clone(&count)))),
+        count,
+    )
 }
 
 #[test]
@@ -64,9 +67,14 @@ fn test_stop_signal_capacity_recovers_when_waiter_is_dropped() {
     let context = OperationContext::new(ContextOptions::default());
     let (waker, _) = counting_waker();
     let mut task_context = Context::from_waker(&waker);
-    let mut signals = (0..64).map(|_| Box::pin(context.stop_signal())).collect::<Vec<_>>();
+    let mut signals = (0..64)
+        .map(|_| Box::pin(context.stop_signal()))
+        .collect::<Vec<_>>();
     for signal in &mut signals {
-        assert!(matches!(signal.as_mut().poll(&mut task_context), Poll::Pending));
+        assert!(matches!(
+            signal.as_mut().poll(&mut task_context),
+            Poll::Pending
+        ));
     }
 
     let mut overflow = Box::pin(context.stop_signal());
@@ -78,7 +86,10 @@ fn test_stop_signal_capacity_recovers_when_waiter_is_dropped() {
     drop(signals.pop());
 
     let mut replacement = Box::pin(context.stop_signal());
-    assert!(matches!(replacement.as_mut().poll(&mut task_context), Poll::Pending));
+    assert!(matches!(
+        replacement.as_mut().poll(&mut task_context),
+        Poll::Pending
+    ));
 }
 
 #[test]

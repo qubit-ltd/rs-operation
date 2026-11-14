@@ -96,7 +96,10 @@ impl<T, E> StateCell<T, E> {
     ///
     /// Returns the unconsumed `outcome` when another outcome or stop has
     /// already claimed the result slot.
-    pub(crate) fn publish(&self, outcome: OperationOutcome<T, E>) -> Result<(), OperationOutcome<T, E>> {
+    pub(crate) fn publish(
+        &self,
+        outcome: OperationOutcome<T, E>,
+    ) -> Result<(), OperationOutcome<T, E>> {
         let mut state = lock(&self.state);
         if !matches!(state.result, ResultSlot::Pending) || state.stop.is_some() {
             drop(state);
@@ -128,13 +131,20 @@ impl<T, E> StateCell<T, E> {
     /// Returns `true` if this call records the first accepted stop, or `false`
     /// if success or an earlier stop already determines the result.
     #[must_use]
-    pub(crate) fn request_stop(&self, reason: StopReason, accepted_at: Option<MonotonicTime>) -> bool {
+    pub(crate) fn request_stop(
+        &self,
+        reason: StopReason,
+        accepted_at: Option<MonotonicTime>,
+    ) -> bool {
         let accepted = {
             let mut state = lock(&self.state);
             if state.success_published || state.stop.is_some() {
                 false
             } else {
-                let report = StopReport { reason, accepted_at };
+                let report = StopReport {
+                    reason,
+                    accepted_at,
+                };
                 state.stop = Some(report.clone());
                 if matches!(state.result, ResultSlot::Pending) {
                     state.result = ResultSlot::Ready(OperationOutcome::Stopped(report));

@@ -27,7 +27,11 @@ use super::State;
 /// The wakers that were present in the registrations.
 #[must_use]
 pub(in crate::supervisor) fn take_waiter_wakers(state: &mut State) -> Vec<Waker> {
-    state.waiters.iter_mut().filter_map(|(_, waker)| waker.take()).collect()
+    state
+        .waiters
+        .iter_mut()
+        .filter_map(|(_, waker)| waker.take())
+        .collect()
 }
 
 /// Wakes each supplied waiter after the supervisor state lock has been
@@ -102,5 +106,7 @@ pub(in crate::supervisor) fn promote_one(state: &mut State, active_limit: usize)
 ///
 /// A guard for the mutex-protected value.
 pub(in crate::supervisor) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

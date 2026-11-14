@@ -46,7 +46,10 @@ impl Wake for CountingWake {
 
 fn counting_waker() -> (Waker, Arc<Mutex<usize>>) {
     let count = Arc::new(Mutex::new(0));
-    (Waker::from(Arc::new(CountingWake(Arc::clone(&count)))), count)
+    (
+        Waker::from(Arc::new(CountingWake(Arc::clone(&count)))),
+        count,
+    )
 }
 
 #[test]
@@ -59,7 +62,10 @@ fn test_completed_result_can_be_taken_once_without_clone() {
         cell.take_result_blocking().unwrap(),
         OperationOutcome::Failed(NonCloneError("original"))
     );
-    assert_eq!(cell.take_result_blocking(), Err(ObservationError::AlreadyTaken));
+    assert_eq!(
+        cell.take_result_blocking(),
+        Err(ObservationError::AlreadyTaken)
+    );
 }
 
 #[test]
@@ -76,7 +82,10 @@ fn test_stop_accepted_before_success_prevents_result_from_flipping() {
         })
     );
     assert!(cell.publish(OperationOutcome::Succeeded(7)).is_err());
-    assert_eq!(cell.take_result_blocking(), Err(ObservationError::AlreadyTaken));
+    assert_eq!(
+        cell.take_result_blocking(),
+        Err(ObservationError::AlreadyTaken)
+    );
 }
 
 #[test]
@@ -85,13 +94,17 @@ fn test_published_success_wins_over_later_stop_request() {
     cell.publish(OperationOutcome::Succeeded(11)).unwrap();
 
     assert!(!cell.request_stop(StopReason::UserCancelled, None));
-    assert_eq!(cell.take_result_blocking().unwrap(), OperationOutcome::Succeeded(11));
+    assert_eq!(
+        cell.take_result_blocking().unwrap(),
+        OperationOutcome::Succeeded(11)
+    );
 }
 
 #[test]
 fn test_later_stop_is_recorded_without_overwriting_a_failure() {
     let cell = StateCell::<usize, NonCloneError>::new();
-    cell.publish(OperationOutcome::Failed(NonCloneError("failed"))).unwrap();
+    cell.publish(OperationOutcome::Failed(NonCloneError("failed")))
+        .unwrap();
 
     assert!(cell.request_stop(StopReason::UserCancelled, None));
     assert_eq!(
@@ -113,7 +126,10 @@ fn test_waiting_future_drop_preserves_result_for_next_waiter() {
     let (first_waker, _) = counting_waker();
     let mut first_context = Context::from_waker(&first_waker);
     let mut first = Box::pin(cell.result());
-    assert!(matches!(first.as_mut().poll(&mut first_context), Poll::Pending));
+    assert!(matches!(
+        first.as_mut().poll(&mut first_context),
+        Poll::Pending
+    ));
     drop(first);
 
     cell.publish(OperationOutcome::Succeeded(23)).unwrap();
@@ -183,7 +199,9 @@ fn test_condvar_waiter_observes_published_snapshot() {
     let (lock, condition) = &*rendezvous;
     let mut registered = lock.lock().unwrap();
     while !*registered {
-        let (next, timeout) = condition.wait_timeout(registered, Duration::from_secs(2)).unwrap();
+        let (next, timeout) = condition
+            .wait_timeout(registered, Duration::from_secs(2))
+            .unwrap();
         registered = next;
         assert!(!timeout.timed_out(), "waiter did not reach its gate");
     }
@@ -211,7 +229,10 @@ fn test_async_and_blocking_observers_share_one_result_slot() {
         Pin::as_mut(&mut result).poll(&mut context),
         Poll::Ready(Ok(OperationOutcome::Succeeded(41)))
     ));
-    assert_eq!(cell.take_result_blocking(), Err(ObservationError::AlreadyTaken));
+    assert_eq!(
+        cell.take_result_blocking(),
+        Err(ObservationError::AlreadyTaken)
+    );
 }
 
 #[test]
@@ -244,6 +265,12 @@ fn test_discarded_result_stays_discarded_for_every_observer() {
 
     assert!(cell.discard_result());
     assert!(!cell.discard_result());
-    assert_eq!(cell.take_result_blocking(), Err(ObservationError::ResultDiscarded));
-    assert_eq!(cell.take_result_blocking(), Err(ObservationError::ResultDiscarded));
+    assert_eq!(
+        cell.take_result_blocking(),
+        Err(ObservationError::ResultDiscarded)
+    );
+    assert_eq!(
+        cell.take_result_blocking(),
+        Err(ObservationError::ResultDiscarded)
+    );
 }

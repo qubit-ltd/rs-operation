@@ -52,7 +52,11 @@ impl TaskLease {
         if lease.execution_released {
             return Poll::Ready(false);
         }
-        if !lease.active_waiters.iter().any(|waker| waker.will_wake(cx.waker())) {
+        if !lease
+            .active_waiters
+            .iter()
+            .any(|waker| waker.will_wake(cx.waker()))
+        {
             lease.active_waiters.push(cx.waker().clone());
         }
         Poll::Pending

@@ -90,11 +90,12 @@ impl CleanupScheduler {
             if active >= self.state.limit {
                 return None;
             }
-            match self
-                .state
-                .active
-                .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
-            {
+            match self.state.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => {
                     return Some(CleanupPermit {
                         active: Arc::clone(&self.state.active),
@@ -245,7 +246,11 @@ impl CleanupScheduler {
         permit: CleanupPermit,
         future: Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>>,
     ) -> Result<CleanupTask, Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>>> {
-        let mut tasks = self.state.tasks.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut tasks = self
+            .state
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if tasks.contains_key(&resource_id) {
             drop(permit);
             return Err(future);
@@ -395,19 +400,27 @@ mod tests {
         let id = ResourceId::new(OperationId::new(731), 0, 0);
         let retained_drops = Arc::new(AtomicUsize::new(0));
         let rejected_drops = Arc::new(AtomicUsize::new(0));
-        let mut task =
-            match scheduler.schedule(id, cleanup_future(CleanupOutcome::Cleaned, Arc::clone(&retained_drops))) {
-                Ok(task) => task,
-                Err(_) => panic!("first registration has capacity"),
-            };
+        let mut task = match scheduler.schedule(
+            id,
+            cleanup_future(CleanupOutcome::Cleaned, Arc::clone(&retained_drops)),
+        ) {
+            Ok(task) => task,
+            Err(_) => panic!("first registration has capacity"),
+        };
         assert_eq!(scheduler.active(), 1);
 
-        let rejected =
-            match scheduler.schedule(id, cleanup_future(CleanupOutcome::Cleaned, Arc::clone(&rejected_drops))) {
-                Ok(_) => panic!("duplicate resource IDs cannot replace retained tasks"),
-                Err(future) => future,
-            };
-        assert_eq!(scheduler.active(), 1, "duplicate rejection returns its permit");
+        let rejected = match scheduler.schedule(
+            id,
+            cleanup_future(CleanupOutcome::Cleaned, Arc::clone(&rejected_drops)),
+        ) {
+            Ok(_) => panic!("duplicate resource IDs cannot replace retained tasks"),
+            Err(future) => future,
+        };
+        assert_eq!(
+            scheduler.active(),
+            1,
+            "duplicate rejection returns its permit"
+        );
         assert_eq!(rejected_drops.load(Ordering::SeqCst), 0);
         drop(rejected);
         assert_eq!(rejected_drops.load(Ordering::SeqCst), 1);
@@ -426,7 +439,8 @@ mod tests {
         let scheduler = CleanupScheduler::new(1);
         let owner = scheduler.responsibility_owner();
         let id = ResourceId::new(OperationId::new(732), 0, 0);
-        let task = match scheduler.schedule(id, Box::pin(std::future::pending::<CleanupOutcome>())) {
+        let task = match scheduler.schedule(id, Box::pin(std::future::pending::<CleanupOutcome>()))
+        {
             Ok(task) => task,
             Err(_) => panic!("cleanup slot is available"),
         };
@@ -473,6 +487,9 @@ mod tests {
             Poll::Ready(CleanupObservation::Settled(Ok(CleanupOutcome::Cleaned)))
         ));
         assert_eq!(scheduler.active(), 0, "settlement releases the permit");
-        assert!(scheduler.task(id).is_none(), "settlement removes the registry entry");
+        assert!(
+            scheduler.task(id).is_none(),
+            "settlement removes the registry entry"
+        );
     }
 }

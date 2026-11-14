@@ -70,7 +70,9 @@ impl<T, E> ServiceOperationHandle<T, E> {
     ///
     /// Returns an error if the result was already taken or discarded.
     #[inline]
-    pub async fn result(&mut self) -> Result<crate::report::OperationOutcome<T, E>, crate::report::ObservationError> {
+    pub async fn result(
+        &mut self,
+    ) -> Result<crate::report::OperationOutcome<T, E>, crate::report::ObservationError> {
         self.inner.result().await
     }
 
@@ -113,7 +115,9 @@ impl<T, E> ServiceOperationHandle<T, E> {
     ///
     /// Returns an error if blocking here could deadlock an executor worker.
     #[inline]
-    pub fn released_blocking(&self) -> Result<crate::report::SettlementReport, crate::report::ObservationError> {
+    pub fn released_blocking(
+        &self,
+    ) -> Result<crate::report::SettlementReport, crate::report::ObservationError> {
         self.inner.released_blocking()
     }
 }

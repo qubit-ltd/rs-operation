@@ -39,5 +39,7 @@ pub(crate) use state_cell::StateCell;
 /// A guard borrowing `mutex`; if the lock is poisoned, the guard exposes its
 /// inner value after recovering the poisoned state.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }

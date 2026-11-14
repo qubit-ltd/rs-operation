@@ -172,14 +172,18 @@ impl ResourceRegistry {
         let Ok(state) = self.inner.state.lock() else {
             return false;
         };
-        state.slots.iter().filter_map(|slot| slot.entry.as_ref()).any(|entry| {
-            let Ok(entry_state) = entry.state.lock() else {
-                return false;
-            };
-            entry_state.phase == EntryPhase::Closed
-                && entry_state.active_uses == 0
-                && !has_unreleased_prerequisite(&state, entry_state.id)
-        })
+        state
+            .slots
+            .iter()
+            .filter_map(|slot| slot.entry.as_ref())
+            .any(|entry| {
+                let Ok(entry_state) = entry.state.lock() else {
+                    return false;
+                };
+                entry_state.phase == EntryPhase::Closed
+                    && entry_state.active_uses == 0
+                    && !has_unreleased_prerequisite(&state, entry_state.id)
+            })
     }
 
     /// Register an owned cleanup adapter, returning it unchanged if capacity is
@@ -335,7 +339,8 @@ impl ResourceRegistry {
         if receipt.source() != resource_id {
             return Err(RegistryError::InvalidReceipt);
         }
-        self.finish_release(resource_id, Some(receipt), false).map(|_| ())
+        self.finish_release(resource_id, Some(receipt), false)
+            .map(|_| ())
     }
 
     /// Confirm transfer only after a receiver-issued receipt matches this
@@ -357,15 +362,26 @@ impl ResourceRegistry {
     ///
     /// Returns an error if the receipt is invalid, the resource is unknown, or
     /// cleanup is not in progress.
-    pub fn confirm_transferred(&self, resource_id: ResourceId, receipt: TransferReceipt) -> Result<(), RegistryError> {
+    pub fn confirm_transferred(
+        &self,
+        resource_id: ResourceId,
+        receipt: TransferReceipt,
+    ) -> Result<(), RegistryError> {
         if receipt.resource() != resource_id || receipt.generation() != resource_id.generation {
             return Err(RegistryError::InvalidReceipt);
         }
-        let state = self.inner.state.lock().map_err(|_| RegistryError::RegistryPoisoned)?;
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| RegistryError::RegistryPoisoned)?;
         let (_, entry) = lookup_slot(&state, resource_id).ok_or(RegistryError::NotRegistered)?;
         let entry = Arc::clone(entry);
         {
-            let mut entry_state = entry.state.lock().map_err(|_| RegistryError::RegistryPoisoned)?;
+            let mut entry_state = entry
+                .state
+                .lock()
+                .map_err(|_| RegistryError::RegistryPoisoned)?;
             if entry_state.phase != EntryPhase::Cleaning {
                 return Err(RegistryError::NotCleaning);
             }
@@ -391,9 +407,16 @@ impl ResourceRegistry {
     /// Returns an error if the resource is unknown or cleanup is not in
     /// progress.
     pub fn accept_recovery(&self, resource_id: ResourceId) -> Result<(), RegistryError> {
-        let state = self.inner.state.lock().map_err(|_| RegistryError::RegistryPoisoned)?;
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| RegistryError::RegistryPoisoned)?;
         let (_, entry) = lookup_slot(&state, resource_id).ok_or(RegistryError::NotRegistered)?;
-        let mut entry_state = entry.state.lock().map_err(|_| RegistryError::RegistryPoisoned)?;
+        let mut entry_state = entry
+            .state
+            .lock()
+            .map_err(|_| RegistryError::RegistryPoisoned)?;
         if entry_state.phase != EntryPhase::Cleaning {
             return Err(RegistryError::NotCleaning);
         }
@@ -472,12 +495,18 @@ impl ResourceRegistry {
     /// Returns an error if either registry is poisoned, the resource is not
     /// registered here, the registries are identical, or the destination lacks
     /// capacity.
-    pub fn transfer_to(&self, resource: &ResourceHandle, destination: &ResourceRegistry) -> Result<(), TransferError> {
+    pub fn transfer_to(
+        &self,
+        resource: &ResourceHandle,
+        destination: &ResourceRegistry,
+    ) -> Result<(), TransferError> {
         if Arc::ptr_eq(&self.inner, &destination.inner) {
             return Err(TransferError::SameRegistry);
         }
         let first_id = resource.id();
-        let resource_registry = resource.registry().map_err(|_| TransferError::NotRegistered)?;
+        let resource_registry = resource
+            .registry()
+            .map_err(|_| TransferError::NotRegistered)?;
         if !Arc::ptr_eq(&resource_registry, &self.inner) {
             return Err(TransferError::NotRegistered);
         }
@@ -494,7 +523,8 @@ impl ResourceRegistry {
         let mut remapped = BTreeMap::new();
         let mut moved_entries = Vec::with_capacity(group.len());
         for (old_id, target_slot_index) in group.iter().zip(target_slots) {
-            let (source_slot_index, entry) = lookup_slot(&source_state, *old_id).ok_or(TransferError::NotRegistered)?;
+            let (source_slot_index, entry) =
+                lookup_slot(&source_state, *old_id).ok_or(TransferError::NotRegistered)?;
             let target_slot = &destination_state.slots[target_slot_index];
             let new_id = ResourceId::new(
                 destination.inner.operation_id,
@@ -502,7 +532,12 @@ impl ResourceRegistry {
                 target_slot.generation,
             );
             remapped.insert(*old_id, new_id);
-            moved_entries.push((source_slot_index, target_slot_index, Arc::clone(entry), new_id));
+            moved_entries.push((
+                source_slot_index,
+                target_slot_index,
+                Arc::clone(entry),
+                new_id,
+            ));
         }
 
         let mut moved_edges = Vec::new();
@@ -516,17 +551,25 @@ impl ResourceRegistry {
 
         for (source_slot, target_slot, entry, new_id) in &moved_entries {
             {
-                let mut entry_state = entry.state.lock().map_err(|_| TransferError::RegistryPoisoned)?;
+                let mut entry_state = entry
+                    .state
+                    .lock()
+                    .map_err(|_| TransferError::RegistryPoisoned)?;
                 entry_state.id = *new_id;
             }
-            *entry.registry.lock().map_err(|_| TransferError::RegistryPoisoned)? = Arc::downgrade(&destination.inner);
+            *entry
+                .registry
+                .lock()
+                .map_err(|_| TransferError::RegistryPoisoned)? = Arc::downgrade(&destination.inner);
             release_slot(&mut source_state.slots[*source_slot]);
             destination_state.slots[*target_slot].entry = Some(Arc::clone(entry));
         }
-        source_state.dependencies.retain(|prerequisite, dependents| {
-            dependents.retain(|dependent| group.binary_search(dependent).is_err());
-            group.binary_search(prerequisite).is_err() && !dependents.is_empty()
-        });
+        source_state
+            .dependencies
+            .retain(|prerequisite, dependents| {
+                dependents.retain(|dependent| group.binary_search(dependent).is_err());
+                group.binary_search(prerequisite).is_err() && !dependents.is_empty()
+            });
         for (prerequisite, dependent) in moved_edges {
             destination_state
                 .dependencies
@@ -656,11 +699,19 @@ impl ResourceRegistry {
         receipt: Option<ReleaseReceipt>,
         issue_release_receipt: bool,
     ) -> Result<Option<ReleaseReceipt>, RegistryError> {
-        let mut state = self.inner.state.lock().map_err(|_| RegistryError::RegistryPoisoned)?;
-        let (slot_index, entry) = lookup_slot(&state, resource_id).ok_or(RegistryError::NotRegistered)?;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| RegistryError::RegistryPoisoned)?;
+        let (slot_index, entry) =
+            lookup_slot(&state, resource_id).ok_or(RegistryError::NotRegistered)?;
         let entry = Arc::clone(entry);
         {
-            let mut entry_state = entry.state.lock().map_err(|_| RegistryError::RegistryPoisoned)?;
+            let mut entry_state = entry
+                .state
+                .lock()
+                .map_err(|_| RegistryError::RegistryPoisoned)?;
             if entry_state.phase == EntryPhase::Cleaning
                 && entry_state.transfer_source.is_some()
                 && receipt.is_none()
@@ -672,7 +723,9 @@ impl ResourceRegistry {
                 let Some(receipt) = receipt else {
                     return Err(RegistryError::NotCleaning);
                 };
-                if receipt.source() != resource_id || Some(receipt.receiver()) != entry_state.transfer_receiver {
+                if receipt.source() != resource_id
+                    || Some(receipt.receiver()) != entry_state.transfer_receiver
+                {
                     return Err(RegistryError::InvalidReceipt);
                 }
             } else if entry_state.phase != EntryPhase::Cleaning {
@@ -731,7 +784,11 @@ fn lock_registries<'a>(
     TransferError,
 > {
     if source.inner.id < destination.inner.id {
-        let source_state = source.inner.state.lock().map_err(|_| TransferError::RegistryPoisoned)?;
+        let source_state = source
+            .inner
+            .state
+            .lock()
+            .map_err(|_| TransferError::RegistryPoisoned)?;
         let destination_state = destination
             .inner
             .state
@@ -744,7 +801,11 @@ fn lock_registries<'a>(
             .state
             .lock()
             .map_err(|_| TransferError::RegistryPoisoned)?;
-        let source_state = source.inner.state.lock().map_err(|_| TransferError::RegistryPoisoned)?;
+        let source_state = source
+            .inner
+            .state
+            .lock()
+            .map_err(|_| TransferError::RegistryPoisoned)?;
         Ok((source_state, destination_state))
     }
 }
@@ -767,7 +828,10 @@ impl fmt::Debug for ResourceRegistry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ResourceRegistry")
             .field("operation_id", &self.inner.operation_id)
-            .field("capacity", &self.inner.state.lock().map(|state| state.slots.len()).ok())
+            .field(
+                "capacity",
+                &self.inner.state.lock().map(|state| state.slots.len()).ok(),
+            )
             .finish()
     }
 }

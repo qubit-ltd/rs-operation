@@ -58,7 +58,9 @@ impl fmt::Display for ObservationError {
             Self::InvalidObserver => "operation observer is invalid",
             Self::ClockUnavailable => "operation observer has no clock source",
             Self::ClockDomainMismatch => "operation observer deadline uses another clock domain",
-            Self::WaiterCapacityExceeded => "operation has reached its asynchronous waiter capacity",
+            Self::WaiterCapacityExceeded => {
+                "operation has reached its asynchronous waiter capacity"
+            }
         })
     }
 }

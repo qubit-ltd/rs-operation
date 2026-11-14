@@ -32,5 +32,8 @@ pub(crate) trait Driver: Send + Sync {
     /// # Errors
     ///
     /// Returns the rejected task and its failure reason if registration fails.
-    fn submit(&self, task: BoxFuture<()>) -> Result<Box<dyn ManagedOperationControl>, DriverRejected>;
+    fn submit(
+        &self,
+        task: BoxFuture<()>,
+    ) -> Result<Box<dyn ManagedOperationControl>, DriverRejected>;
 }

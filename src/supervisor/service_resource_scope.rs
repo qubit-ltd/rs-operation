@@ -92,7 +92,10 @@ impl ServiceResourceScope {
     ///
     /// Returns an error if this scope is closed, the identifier is not
     /// registered, or the resource no longer accepts use leases.
-    pub fn acquire_use(&self, id: ResourceId) -> Result<crate::resource::ResourceUse, crate::resource::ResourceError> {
+    pub fn acquire_use(
+        &self,
+        id: ResourceId,
+    ) -> Result<crate::resource::ResourceUse, crate::resource::ResourceError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(crate::resource::ResourceError::ClosedForUse);
         }
@@ -113,7 +116,9 @@ impl ServiceResourceScope {
     ///
     /// Returns `Some` when a recovery key is available, consuming that key
     /// from the scope. Returns `None` when no retained owner has a key.
-    pub fn take_recovery_key(&self) -> Option<crate::report::RecoveryKey<crate::report::RecoveryOwner>> {
+    pub fn take_recovery_key(
+        &self,
+    ) -> Option<crate::report::RecoveryKey<crate::report::RecoveryOwner>> {
         self.scope.take_recovery_key()
     }
 

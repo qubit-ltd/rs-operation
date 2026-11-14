@@ -24,5 +24,6 @@ pub(in crate::resource::cleanup_scheduler) struct SchedulerState {
     /// Tasks waiting for a permit to become available.
     pub(in crate::resource::cleanup_scheduler) capacity_waiters: Arc<Mutex<Vec<Waker>>>,
     /// Active cleanup tasks indexed by their resource identifiers.
-    pub(in crate::resource::cleanup_scheduler) tasks: Mutex<BTreeMap<ResourceId, Arc<CleanupTaskState>>>,
+    pub(in crate::resource::cleanup_scheduler) tasks:
+        Mutex<BTreeMap<ResourceId, Arc<CleanupTaskState>>>,
 }

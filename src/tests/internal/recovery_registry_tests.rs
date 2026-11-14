@@ -29,7 +29,10 @@ use crate::resource::ResourceRegistry;
 struct CountedCleanup(Arc<AtomicUsize>);
 
 impl OwnedCleanup for CountedCleanup {
-    fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+    fn begin(
+        self: Box<Self>,
+        _: CleanupContext,
+    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(ready(CleanupOutcome::Cleaned))
     }
@@ -40,7 +43,8 @@ fn test_wrong_generation_or_type_key_does_not_consume_recovery_owner() {
     let id = ResourceId::new(OperationId::new(2), 1, 8);
     let key = RecoveryKey::<String>::new(9, id, 44);
     let owner = RecoveryOwner::new(&key, String::from("still owned"));
-    let old_generation = RecoveryKey::<String>::new(9, ResourceId::new(OperationId::new(2), 1, 7), 44);
+    let old_generation =
+        RecoveryKey::<String>::new(9, ResourceId::new(OperationId::new(2), 1, 7), 44);
     let owner = owner.take(old_generation).unwrap_err();
     let wrong_type = RecoveryKey::<u64>::new(9, id, 44);
     let owner = owner.take(wrong_type).unwrap_err();
@@ -56,7 +60,9 @@ fn test_recovery_registry_preserves_values_when_capacity_is_full() {
     assert_eq!(registry.capacity(), 1);
     assert_eq!(registry.len(), 1);
     assert!(registry.keep(&key));
-    assert!(matches!(registry.register(id, String::from("rejected")), Err(value) if value == "rejected"));
+    assert!(
+        matches!(registry.register(id, String::from("rejected")), Err(value) if value == "rejected")
+    );
     assert_eq!(registry.take_recovery(key).unwrap(), "retained");
     assert!(registry.is_empty());
 }
@@ -66,9 +72,12 @@ fn test_recovery_registry_returns_capsule_and_failure_owner_when_full() {
     let id = ResourceId::new(OperationId::new(4), 2, 7);
     let registry = RecoveryRegistry::new(0);
 
-    let rejected = registry.register_with_capsule(id, String::from("capsule"), String::from("failure"));
+    let rejected =
+        registry.register_with_capsule(id, String::from("capsule"), String::from("failure"));
 
-    assert!(matches!(rejected, Err((capsule, failure)) if capsule == "capsule" && failure == "failure"));
+    assert!(
+        matches!(rejected, Err((capsule, failure)) if capsule == "capsule" && failure == "failure")
+    );
     assert!(registry.is_empty());
 }
 
@@ -101,7 +110,9 @@ fn test_recovery_key_mismatches_preserve_recovery_owner() {
 fn test_recovery_registry_retries_only_while_key_is_retained() {
     let resource = ResourceId::new(OperationId::new(7), 0, 2);
     let registry = RecoveryRegistry::new(1);
-    let key = registry.register(resource, String::from("capsule")).unwrap();
+    let key = registry
+        .register(resource, String::from("capsule"))
+        .unwrap();
     let begins = Arc::new(AtomicUsize::new(0));
     let future = match registry.retry_cleanup(
         &key,
@@ -117,7 +128,9 @@ fn test_recovery_registry_retries_only_while_key_is_retained() {
 
     assert_eq!(registry.take_recovery(key).unwrap(), "capsule");
     let foreign_registry = RecoveryRegistry::new(1);
-    let stale = foreign_registry.register(resource, String::from("foreign")).unwrap();
+    let stale = foreign_registry
+        .register(resource, String::from("foreign"))
+        .unwrap();
     assert!(
         registry
             .retry_cleanup(
@@ -164,11 +177,20 @@ fn test_resource_handle_closes_future_uses_and_rejects_self_dependency() {
         .unwrap();
 
     let lease = handle.acquire_use().unwrap();
-    assert_eq!(handle.cleanup_after(&handle), Err(DependencyError::SelfDependency));
+    assert_eq!(
+        handle.cleanup_after(&handle),
+        Err(DependencyError::SelfDependency)
+    );
     handle.close_for_use().unwrap();
     handle.close_for_use().unwrap();
-    assert!(matches!(handle.acquire_use(), Err(ResourceError::ClosedForUse)));
+    assert!(matches!(
+        handle.acquire_use(),
+        Err(ResourceError::ClosedForUse)
+    ));
     drop(lease);
     let _cleanup = registry.take_ready_cleanup().unwrap();
-    assert!(matches!(handle.close_for_use(), Err(ResourceError::AlreadyCleaning)));
+    assert!(matches!(
+        handle.close_for_use(),
+        Err(ResourceError::AlreadyCleaning)
+    ));
 }

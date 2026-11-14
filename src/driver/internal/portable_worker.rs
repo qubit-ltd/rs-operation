@@ -49,7 +49,10 @@ pub fn portable_worker_loop(shared: Arc<PortableShared>) {
                         }
                         continue;
                     }
-                    state = shared.ready.wait(state).unwrap_or_else(|error| error.into_inner());
+                    state = shared
+                        .ready
+                        .wait(state)
+                        .unwrap_or_else(|error| error.into_inner());
                 }
             };
             let Some(mut future) = lock(&task.future).take() else {

@@ -45,9 +45,11 @@ pub(in crate::supervisor) fn release_execution(inner: &Arc<Inner>, lease: &Arc<M
         }
         if lease_state.queued {
             lease_state.queued = false;
-            state
-                .queued
-                .retain(|entry| entry.upgrade().is_some_and(|candidate| !Arc::ptr_eq(&candidate, lease)));
+            state.queued.retain(|entry| {
+                entry
+                    .upgrade()
+                    .is_some_and(|candidate| !Arc::ptr_eq(&candidate, lease))
+            });
         }
         promoted.extend(take_waiter_wakers(&mut state));
         (promoted, mem::take(&mut state.shutdown_waiters))
@@ -106,9 +108,11 @@ pub(in crate::supervisor) fn release_all(inner: &Arc<Inner>, lease: &Arc<Mutex<L
             }
             if lease_state.queued {
                 lease_state.queued = false;
-                state
-                    .queued
-                    .retain(|entry| entry.upgrade().is_some_and(|candidate| !Arc::ptr_eq(&candidate, lease)));
+                state.queued.retain(|entry| {
+                    entry
+                        .upgrade()
+                        .is_some_and(|candidate| !Arc::ptr_eq(&candidate, lease))
+                });
             }
         }
         if lease_state.result_reserved {

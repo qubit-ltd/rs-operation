@@ -59,7 +59,11 @@ impl Node {
             }
             state.stop_reason = Some(reason);
             state.children.retain(|child| child.strong_count() > 0);
-            let children = state.children.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+            let children = state
+                .children
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
             (children, std::mem::take(&mut state.stop_waiters))
         };
         for waker in waiters.into_iter().map(|(_, waker)| waker) {

@@ -122,13 +122,19 @@ impl<F> Future for AdmissionWait<F> {
                     return Poll::Ready(Err(error));
                 }
                 Poll::Ready(Err(ContextError::WaiterCapacityExceeded)) => {
-                    let error = StartError::new(AdmissionError::Busy, this.body.take().expect("body retained"));
+                    let error = StartError::new(
+                        AdmissionError::Busy,
+                        this.body.take().expect("body retained"),
+                    );
                     this.unregister();
                     return Poll::Ready(Err(error));
                 }
                 Poll::Ready(Err(error)) => {
                     let error = StartError::new(
-                        context_admission_error(this.context.as_ref().expect("signal has context"), error),
+                        context_admission_error(
+                            this.context.as_ref().expect("signal has context"),
+                            error,
+                        ),
                         this.body.take().expect("body retained"),
                     );
                     this.unregister();
@@ -141,17 +147,24 @@ impl<F> Future for AdmissionWait<F> {
             if let Some(signal) = &mut this.deadline_signal
                 && Pin::new(signal).poll(cx).is_ready()
             {
-                let error = StartError::new(AdmissionError::DeadlineExpired, this.body.take().unwrap());
+                let error =
+                    StartError::new(AdmissionError::DeadlineExpired, this.body.take().unwrap());
                 this.unregister();
                 return Poll::Ready(Err(error));
             }
             if let Err(error) = context.admission_check() {
-                let error = StartError::new(context_admission_error(context, error), this.body.take().unwrap());
+                let error = StartError::new(
+                    context_admission_error(context, error),
+                    this.body.take().unwrap(),
+                );
                 this.unregister();
                 return Poll::Ready(Err(error));
             }
         }
-        match this.supervisor.try_admit_body(this.body.take().expect("body retained")) {
+        match this
+            .supervisor
+            .try_admit_body(this.body.take().expect("body retained"))
+        {
             Ok(admission) => {
                 this.unregister();
                 Poll::Ready(Ok(admission))
@@ -159,7 +172,10 @@ impl<F> Future for AdmissionWait<F> {
             Err(error) if error.reason() == AdmissionError::Busy => {
                 this.body = Some(error.into_body());
                 this.register_waker(cx.waker());
-                match this.supervisor.try_admit_body(this.body.take().expect("body retained")) {
+                match this
+                    .supervisor
+                    .try_admit_body(this.body.take().expect("body retained"))
+                {
                     Ok(admission) => {
                         this.unregister();
                         Poll::Ready(Ok(admission))
@@ -197,10 +213,9 @@ impl<F> AdmissionWait<F> {
                 .iter_mut()
                 .find(|(id, _)| *id == self.waiter_id)
                 .and_then(|(_, registered)| {
-                    if registered
-                        .as_ref()
-                        .is_some_and(|old| old.will_wake(replacement.as_ref().expect("waker cloned")))
-                    {
+                    if registered.as_ref().is_some_and(|old| {
+                        old.will_wake(replacement.as_ref().expect("waker cloned"))
+                    }) {
                         None
                     } else {
                         registered.replace(replacement.take().expect("waker cloned"))
@@ -253,15 +268,22 @@ impl<F> Drop for AdmissionWait<F> {
 /// # Returns
 ///
 /// Returns the corresponding public admission error category.
-pub(super) fn context_admission_error(context: &OperationContext, error: ContextError) -> AdmissionError {
+pub(super) fn context_admission_error(
+    context: &OperationContext,
+    error: ContextError,
+) -> AdmissionError {
     match error {
         ContextError::DeadlineExpired => AdmissionError::DeadlineExpired,
-        ContextError::Stopped if context.stop_reason() == Some(crate::report::StopReason::Timeout) => {
+        ContextError::Stopped
+            if context.stop_reason() == Some(crate::report::StopReason::Timeout) =>
+        {
             AdmissionError::DeadlineExpired
         }
         ContextError::Stopped => AdmissionError::Stopped,
         ContextError::BudgetUnavailable => AdmissionError::ReservationLimit,
         ContextError::WaiterCapacityExceeded => AdmissionError::Busy,
-        ContextError::ClockUnavailable | ContextError::ClockDomainMismatch => AdmissionError::DriverUnavailable,
+        ContextError::ClockUnavailable | ContextError::ClockDomainMismatch => {
+            AdmissionError::DriverUnavailable
+        }
     }
 }

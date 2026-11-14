@@ -50,7 +50,9 @@ impl Clone for ShutdownObserver {
     /// Clones the observer while retaining the shared supervisor state.
     fn clone(&self) -> Self {
         Self(match &self.0 {
-            ShutdownSource::Supervisor(supervisor) => ShutdownSource::Supervisor(supervisor.internal_handle()),
+            ShutdownSource::Supervisor(supervisor) => {
+                ShutdownSource::Supervisor(supervisor.internal_handle())
+            }
             ShutdownSource::Service(state, supervisor) => {
                 ShutdownSource::Service(Arc::clone(state), supervisor.internal_handle())
             }
@@ -85,7 +87,9 @@ impl ShutdownObserver {
             ShutdownSource::Service(state, supervisor) => {
                 start_service_resource_cleanup(Arc::clone(state), supervisor.internal_handle())
             }
-            ShutdownSource::Supervisor(supervisor) => retry_closed_service_group_cleanups(supervisor),
+            ShutdownSource::Supervisor(supervisor) => {
+                retry_closed_service_group_cleanups(supervisor)
+            }
         }
         let context = OperationContext::new(crate::context::ContextOptions {
             clock: Some(clock),
@@ -138,7 +142,9 @@ impl ShutdownObserver {
             ShutdownSource::Service(state, supervisor) => {
                 start_service_resource_cleanup(Arc::clone(state), supervisor.internal_handle())
             }
-            ShutdownSource::Supervisor(supervisor) => retry_closed_service_group_cleanups(supervisor),
+            ShutdownSource::Supervisor(supervisor) => {
+                retry_closed_service_group_cleanups(supervisor)
+            }
         }
         let report = match &self.0 {
             ShutdownSource::Supervisor(supervisor) => {
@@ -154,14 +160,18 @@ impl ShutdownObserver {
                     })
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 ShutdownReport {
-                    pending_requests: state.active + state.queued.len() + supervisor.service_totals().0,
+                    pending_requests: state.active
+                        + state.queued.len()
+                        + supervisor.service_totals().0,
                     pending_recovery: supervisor.pending_recovery(),
                     pending_resources: supervisor.service_totals().1,
                 }
             }
             ShutdownSource::Service(state, supervisor) => {
                 let (mutex, changed) = &**state;
-                let guard = mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let guard = mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (guard, _) = changed
                     .wait_timeout_while(guard, timeout, |s| {
                         !s.requests.is_empty() || !s.resource_scopes.is_empty()
@@ -186,7 +196,9 @@ impl ShutdownObserver {
             ShutdownSource::Supervisor(supervisor) => {
                 let state = lock(&supervisor.inner.state);
                 ShutdownReport {
-                    pending_requests: state.active + state.queued.len() + supervisor.service_totals().0,
+                    pending_requests: state.active
+                        + state.queued.len()
+                        + supervisor.service_totals().0,
                     pending_recovery: supervisor.pending_recovery(),
                     pending_resources: supervisor.service_totals().1,
                 }

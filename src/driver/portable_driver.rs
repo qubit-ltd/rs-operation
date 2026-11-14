@@ -269,7 +269,11 @@ mod tests {
                     sender,
                     completed: Arc::clone(&task_completed),
                 };
-                let last_owner = task_owner.lock().unwrap().take().expect("last driver owner");
+                let last_owner = task_owner
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("last driver owner");
                 drop(last_owner);
                 task_completed.store(true, Ordering::SeqCst);
             })
@@ -283,7 +287,10 @@ mod tests {
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         while shared.active_workers.load(Ordering::Acquire) != 0 {
-            assert!(Instant::now() < deadline, "closing workers exit within watchdog");
+            assert!(
+                Instant::now() < deadline,
+                "closing workers exit within watchdog"
+            );
             thread::yield_now();
         }
     }
@@ -296,10 +303,15 @@ mod tests {
             polls_per_turn: 1,
         })
         .expect("driver starts");
-        let _accepted = driver.spawn(std::future::pending::<()>()).expect("first task fits");
+        let _accepted = driver
+            .spawn(std::future::pending::<()>())
+            .expect("first task fits");
 
         assert_eq!(driver.task_count(), 1);
-        assert_eq!(driver.spawn(async {}).unwrap_err(), PortableDriverError::Capacity);
+        assert_eq!(
+            driver.spawn(async {}).unwrap_err(),
+            PortableDriverError::Capacity
+        );
         assert_eq!(driver.task_count(), 1);
     }
 
@@ -328,7 +340,10 @@ mod tests {
             .expect("worker continues after isolating the panic");
         let deadline = Instant::now() + Duration::from_secs(5);
         while driver.task_count() != 0 {
-            assert!(Instant::now() < deadline, "completed tasks leave the registry");
+            assert!(
+                Instant::now() < deadline,
+                "completed tasks leave the registry"
+            );
             thread::yield_now();
         }
     }

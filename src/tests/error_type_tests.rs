@@ -57,8 +57,14 @@ fn test_context_error_displays_each_context_failure() {
             "operation deadline clock is unavailable",
         ),
         (ContextError::Stopped, "operation context has been stopped"),
-        (ContextError::DeadlineExpired, "operation deadline has expired"),
-        (ContextError::BudgetUnavailable, "operation budget lease is unavailable"),
+        (
+            ContextError::DeadlineExpired,
+            "operation deadline has expired",
+        ),
+        (
+            ContextError::BudgetUnavailable,
+            "operation budget lease is unavailable",
+        ),
         (
             ContextError::WaiterCapacityExceeded,
             "operation context waiter capacity is full",
@@ -85,7 +91,10 @@ fn test_portable_driver_error_displays_each_failure() {
             PortableDriverError::InvalidConfiguration,
             "portable driver limits must be positive",
         ),
-        (PortableDriverError::Capacity, "portable driver task capacity is full"),
+        (
+            PortableDriverError::Capacity,
+            "portable driver task capacity is full",
+        ),
         (PortableDriverError::Closed, "portable driver is closed"),
         (
             PortableDriverError::WorkerSpawn,
@@ -131,10 +140,16 @@ fn test_blocking_executor_default_worker_check_is_false() {
 #[test]
 fn test_executor_error_displays_each_failure() {
     let cases = [
-        (ExecutorError::InvalidConfiguration, "executor limits must be positive"),
+        (
+            ExecutorError::InvalidConfiguration,
+            "executor limits must be positive",
+        ),
         (ExecutorError::Capacity, "executor queue capacity is full"),
         (ExecutorError::Closed, "executor is closed"),
-        (ExecutorError::WorkerSpawn, "executor worker could not be started"),
+        (
+            ExecutorError::WorkerSpawn,
+            "executor worker could not be started",
+        ),
     ];
     for (error, expected) in cases {
         assert_display(error, expected);
@@ -147,11 +162,26 @@ fn test_admission_error_displays_each_rejection_reason() {
     let cases = [
         (AdmissionError::Busy, "operation capacity is busy"),
         (AdmissionError::Closed, "operation supervisor is closed"),
-        (AdmissionError::Stopped, "operation context has been stopped"),
-        (AdmissionError::DeadlineExpired, "operation deadline has expired"),
-        (AdmissionError::ReservationLimit, "operation reservation limit reached"),
-        (AdmissionError::DriverUnavailable, "operation driver is unavailable"),
-        (AdmissionError::WouldDeadlock, "blocking admission wait would deadlock"),
+        (
+            AdmissionError::Stopped,
+            "operation context has been stopped",
+        ),
+        (
+            AdmissionError::DeadlineExpired,
+            "operation deadline has expired",
+        ),
+        (
+            AdmissionError::ReservationLimit,
+            "operation reservation limit reached",
+        ),
+        (
+            AdmissionError::DriverUnavailable,
+            "operation driver is unavailable",
+        ),
+        (
+            AdmissionError::WouldDeadlock,
+            "blocking admission wait would deadlock",
+        ),
     ];
     for (error, expected) in cases {
         assert_display(error, expected);
@@ -162,10 +192,22 @@ fn test_admission_error_displays_each_rejection_reason() {
 #[test]
 fn test_observation_error_displays_each_observation_failure() {
     let cases = [
-        (ObservationError::AlreadyTaken, "operation result was already taken"),
-        (ObservationError::ResultDiscarded, "operation result was discarded"),
-        (ObservationError::WouldDeadlock, "blocking observation would deadlock"),
-        (ObservationError::InvalidObserver, "operation observer is invalid"),
+        (
+            ObservationError::AlreadyTaken,
+            "operation result was already taken",
+        ),
+        (
+            ObservationError::ResultDiscarded,
+            "operation result was discarded",
+        ),
+        (
+            ObservationError::WouldDeadlock,
+            "blocking observation would deadlock",
+        ),
+        (
+            ObservationError::InvalidObserver,
+            "operation observer is invalid",
+        ),
         (
             ObservationError::ClockUnavailable,
             "operation observer has no clock source",
@@ -281,12 +323,18 @@ fn test_registry_error_displays_each_failed_confirmation() {
 #[test]
 fn test_resource_error_displays_each_rejected_resource_operation() {
     let cases = [
-        (ResourceError::ClosedForUse, "resource operation failed: ClosedForUse"),
+        (
+            ResourceError::ClosedForUse,
+            "resource operation failed: ClosedForUse",
+        ),
         (
             ResourceError::AlreadyCleaning,
             "resource operation failed: AlreadyCleaning",
         ),
-        (ResourceError::NotRegistered, "resource operation failed: NotRegistered"),
+        (
+            ResourceError::NotRegistered,
+            "resource operation failed: NotRegistered",
+        ),
         (
             ResourceError::RegistryDropped,
             "resource operation failed: RegistryDropped",
@@ -309,7 +357,10 @@ fn test_resource_error_displays_each_rejected_resource_operation() {
 #[test]
 fn test_transfer_error_displays_each_rejected_transfer() {
     let cases = [
-        (TransferError::SameRegistry, "resource transfer rejected: SameRegistry"),
+        (
+            TransferError::SameRegistry,
+            "resource transfer rejected: SameRegistry",
+        ),
         (
             TransferError::NotRegistered,
             "resource transfer rejected: NotRegistered",

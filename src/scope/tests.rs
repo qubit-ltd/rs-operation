@@ -129,7 +129,10 @@ fn test_child_reservation_rejects_second_control_attachment() {
     let control = fixed_control(OperationId::new(2), ChildBusinessOutcome::Succeeded);
 
     reservation.attach(control.clone()).unwrap();
-    assert!(matches!(reservation.attach(control), Err(ScopeError::AlreadyAttached)));
+    assert!(matches!(
+        reservation.attach(control),
+        Err(ScopeError::AlreadyAttached)
+    ));
 }
 
 #[test]
@@ -137,7 +140,10 @@ fn test_child_reservation_commit_rejects_cancelled_and_closed_scopes() {
     let cancelled = test_scope(ScopePolicy::Collect, 1);
     let mut reservation = cancelled.reserve_child(ChildRequirement::Required).unwrap();
     reservation
-        .attach(fixed_control(OperationId::new(5), ChildBusinessOutcome::Succeeded))
+        .attach(fixed_control(
+            OperationId::new(5),
+            ChildBusinessOutcome::Succeeded,
+        ))
         .unwrap();
     cancelled.request_cancel(StopReason::UserCancelled);
     assert!(matches!(reservation.commit(), Err(ScopeError::Cancelled)));
@@ -145,7 +151,10 @@ fn test_child_reservation_commit_rejects_cancelled_and_closed_scopes() {
     let closed = test_scope(ScopePolicy::Collect, 1);
     let mut reservation = closed.reserve_child(ChildRequirement::Required).unwrap();
     reservation
-        .attach(fixed_control(OperationId::new(6), ChildBusinessOutcome::Succeeded))
+        .attach(fixed_control(
+            OperationId::new(6),
+            ChildBusinessOutcome::Succeeded,
+        ))
         .unwrap();
     closed.close_body();
     assert!(matches!(reservation.commit(), Err(ScopeError::Closed)));
@@ -166,7 +175,10 @@ fn test_required_child_failure_is_reported_once_and_requests_fail_fast_stop() {
         facts.failed_required.as_ref().unwrap().operation_id,
         OperationId::new(3)
     );
-    assert_eq!(*control.stop.lock().unwrap(), Some(StopReason::RequiredChildFailed));
+    assert_eq!(
+        *control.stop.lock().unwrap(),
+        Some(StopReason::RequiredChildFailed)
+    );
     assert!(super::internal::poll::poll_child_business(&scope, &mut cx, &mut facts).is_ready());
     assert_eq!(facts.business.len(), 1);
     assert!(super::internal::poll::poll_child_releases(&scope, &mut cx, &mut facts).is_ready());
@@ -224,14 +236,20 @@ fn test_child_scope_enforces_limits_and_closes_with_parent_body() {
     let mut too_large = super::ScopeOptions::default();
     too_large.limits.child_operations = 2;
 
-    assert!(matches!(scope.child_scope(too_large), Err(ScopeError::LimitReached)));
+    assert!(matches!(
+        scope.child_scope(too_large),
+        Err(ScopeError::LimitReached)
+    ));
 
     let mut allowed = super::ScopeOptions::default();
     allowed.limits.child_operations = 1;
     let child = scope.child_scope(allowed.clone()).unwrap();
     assert_eq!(scope.child_scopes().len(), 1);
     scope.close_body();
-    assert!(matches!(scope.child_scope(allowed), Err(ScopeError::Closed)));
+    assert!(matches!(
+        scope.child_scope(allowed),
+        Err(ScopeError::Closed)
+    ));
     assert!(matches!(
         child.reserve_child(ChildRequirement::Required),
         Err(ScopeError::Closed)
@@ -270,7 +288,10 @@ fn test_record_effect_reports_overflow_after_retaining_configured_limit() {
 }
 
 impl OwnedCleanup for ReadyCleanup {
-    fn begin(self: Box<Self>, _: CleanupContext) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+    fn begin(
+        self: Box<Self>,
+        _: CleanupContext,
+    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
         Box::pin(ready(CleanupOutcome::Cleaned))
     }
 }

@@ -245,7 +245,11 @@ mod tests {
 
         let (rejected_sender, rejected_receiver) = mpsc::sync_channel(1);
         let rejected = executor
-            .execute(move || rejected_sender.send(()).expect("rejected job can be recovered"))
+            .execute(move || {
+                rejected_sender
+                    .send(())
+                    .expect("rejected job can be recovered")
+            })
             .expect_err("pending queue is full");
         assert_eq!(rejected.error, ExecutorError::Capacity);
         assert!(rejected_receiver.try_recv().is_err());
@@ -280,7 +284,9 @@ mod tests {
             })
             .unwrap_or_else(|_| panic!("job is accepted"));
         assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(5)).expect("worker runs job"),
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker runs job"),
             (true, true, false)
         );
     }

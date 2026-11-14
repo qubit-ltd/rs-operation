@@ -239,8 +239,8 @@ mod tests {
     };
     use crate::v02::resource::{AsyncCleanup, CleanupOutcome, RecoveryStore, RecoveryStoreOptions};
     use std::future;
-    use std::sync::mpsc;
     use std::sync::Arc;
+    use std::sync::mpsc;
     use std::time::Duration;
 
     struct FailingCleanup;

@@ -118,7 +118,10 @@ impl Future for DeadlineSignal {
                 registration.cancel();
             }
             self.registered_waker = Some(cx.waker().clone());
-            self.registration = Some(self.clock.register_deadline(self.deadline.at, cx.waker().clone()));
+            self.registration = Some(
+                self.clock
+                    .register_deadline(self.deadline.at, cx.waker().clone()),
+            );
         }
         Poll::Pending
     }

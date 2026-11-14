@@ -358,13 +358,18 @@ impl OperationSupervisor {
         context: &OperationContext,
     ) -> Result<RootAdmission<F>, StartError<F>> {
         if let Err(error) = context.admission_check() {
-            return Err(StartError::new(context_admission_error(context, error), body));
+            return Err(StartError::new(
+                context_admission_error(context, error),
+                body,
+            ));
         }
         let admission = self.try_admit_body(body)?;
         let cancel = {
             let mut state = lock(&self.inner.state);
             state.contexts.retain(|(lease, _)| lease.strong_count() > 0);
-            state.contexts.push((Arc::downgrade(&admission.lease), context.clone()));
+            state
+                .contexts
+                .push((Arc::downgrade(&admission.lease), context.clone()));
             state.cancel
         };
         if cancel {
@@ -424,7 +429,10 @@ impl OperationSupervisor {
         if let Some(context) = &context
             && let Err(error) = context.admission_check()
         {
-            return Err(StartError::new(context_admission_error(context, error), body));
+            return Err(StartError::new(
+                context_admission_error(context, error),
+                body,
+            ));
         }
         let mut state = lock(&self.inner.state);
         let error = if state.closed {
@@ -476,7 +484,11 @@ impl OperationSupervisor {
     /// # Returns
     ///
     /// The accepted operation handle, or the original body in `StartError`.
-    pub fn start<F, Fut, T, E>(&self, options: ScopeOptions, body: F) -> Result<OperationHandle<T, E>, StartError<F>>
+    pub fn start<F, Fut, T, E>(
+        &self,
+        options: ScopeOptions,
+        body: F,
+    ) -> Result<OperationHandle<T, E>, StartError<F>>
     where
         F: FnOnce(OperationScope) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, E>> + Send + 'static,
@@ -494,11 +506,15 @@ impl OperationSupervisor {
             Err(error) => {
                 return Err(StartError::new(
                     error.reason(),
-                    operation_lock(&body_cell).take().expect("unstarted body retained"),
+                    operation_lock(&body_cell)
+                        .take()
+                        .expect("unstarted body retained"),
                 ));
             }
         };
-        let admitted = admission.transfer().expect("fresh admission transfers once");
+        let admitted = admission
+            .transfer()
+            .expect("fresh admission transfers once");
         let (_, task_lease, result_lease) = admitted.into_parts();
         self.start_admitted(options, context, body_cell, task_lease, result_lease)
     }
@@ -547,7 +563,9 @@ impl OperationSupervisor {
             let reason = error.reason();
             StartError::new(reason, error.into_body()())
         })?;
-        let admitted = admission.transfer().expect("fresh admission transfers once");
+        let admitted = admission
+            .transfer()
+            .expect("fresh admission transfers once");
         let (_, task_lease, result_lease) = admitted.into_parts();
         self.start_admitted(options, context, body_cell, task_lease, result_lease)
     }
@@ -633,14 +651,20 @@ impl OperationSupervisor {
         let body_cell = Arc::new(Mutex::new(Some(body)));
         let retained = Arc::clone(&body_cell);
         let mut admission = match self.try_admit_with_context(
-            move || operation_lock(&retained).take().expect("blocking body invoked once"),
+            move || {
+                operation_lock(&retained)
+                    .take()
+                    .expect("blocking body invoked once")
+            },
             &context,
         ) {
             Ok(admission) => admission,
             Err(error) => {
                 return Err(StartError::new(
                     error.reason(),
-                    operation_lock(&body_cell).take().expect("rejected body retained"),
+                    operation_lock(&body_cell)
+                        .take()
+                        .expect("rejected body retained"),
                 ));
             }
         };
@@ -653,7 +677,9 @@ impl OperationSupervisor {
                     .expect("queued blocking body retained"),
             ));
         }
-        let admitted = admission.transfer().expect("fresh admission transfers once");
+        let admitted = admission
+            .transfer()
+            .expect("fresh admission transfers once");
         let (_, task_lease, result_lease) = admitted.into_parts();
         let id = OperationId::new(NEXT_ID.fetch_add(1, Ordering::Relaxed) as u128);
         let shared = Arc::new(Shared {
@@ -745,7 +771,8 @@ impl OperationSupervisor {
                     operation_id: id,
                     resource_phase,
                     all_released: resource_phase == ResourcePhase::Released
-                        || (resource_phase == ResourcePhase::RecoveryRequired && unconfirmed_count == 0),
+                        || (resource_phase == ResourcePhase::RecoveryRequired
+                            && unconfirmed_count == 0),
                     children: facts.settlements.into(),
                     cleanup_failures: settlement.failures.into(),
                     transfers: settlement.transfers.into(),
@@ -768,7 +795,9 @@ impl OperationSupervisor {
             drop(operation_lock(&lease).take());
             return Err(StartError::new(
                 reason,
-                operation_lock(&body_cell).take().expect("unstarted body retained"),
+                operation_lock(&body_cell)
+                    .take()
+                    .expect("unstarted body retained"),
             ));
         }
         let job_completion = Arc::clone(&completion);
@@ -1140,19 +1169,21 @@ impl OperationSupervisor {
     /// A pair containing the standalone request count and resource count.
     pub(super) fn service_totals(&self) -> (usize, usize) {
         let groups = { lock(&self.inner.service_groups).clone() };
-        groups.into_iter().fold((0, 0), |(requests, resources), group| {
-            let state = lock(&group.0);
-            (
-                requests.saturating_add(
-                    state
-                        .requests
-                        .values()
-                        .filter(|entry| matches!(entry, ServiceRequestEntry::Standalone))
-                        .count(),
-                ),
-                resources.saturating_add(state.resource_scopes.len()),
-            )
-        })
+        groups
+            .into_iter()
+            .fold((0, 0), |(requests, resources), group| {
+                let state = lock(&group.0);
+                (
+                    requests.saturating_add(
+                        state
+                            .requests
+                            .values()
+                            .filter(|entry| matches!(entry, ServiceRequestEntry::Standalone))
+                            .count(),
+                    ),
+                    resources.saturating_add(state.resource_scopes.len()),
+                )
+            })
     }
 
     /// Registers a shutdown observer with every nonempty recovery registry.
@@ -1183,7 +1214,11 @@ impl OperationSupervisor {
             }
             state.contexts.retain(|(lease, _)| lease.strong_count() > 0);
             let contexts = if state.cancel {
-                state.contexts.iter().map(|(_, context)| context.clone()).collect()
+                state
+                    .contexts
+                    .iter()
+                    .map(|(_, context)| context.clone())
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -1276,9 +1311,17 @@ impl OperationSupervisor {
         let cleanup_scheduler = self.cleanup_scheduler();
         let manager_supervisor = self.internal_handle();
         let future = async move {
-            let scope = OperationScope::new(id, options.limits, options.policy, cleanup_scheduler, scope_context);
+            let scope = OperationScope::new(
+                id,
+                options.limits,
+                options.policy,
+                cleanup_scheduler,
+                scope_context,
+            );
             manager_supervisor.track_scope_recovery(&scope);
-            let f = operation_lock(&worker_body).take().expect("body invoked once");
+            let f = operation_lock(&worker_body)
+                .take()
+                .expect("body invoked once");
             let body_scope = scope.clone();
             let body_future = async move {
                 let body_future = f(body_scope);
@@ -1294,7 +1337,8 @@ impl OperationSupervisor {
             }
             .await;
             if stopped.is_none()
-                && (result.is_err() || (matches!(&result, Ok(Err(_))) && scope.policy() == ScopePolicy::FailFast))
+                && (result.is_err()
+                    || (matches!(&result, Ok(Err(_))) && scope.policy() == ScopePolicy::FailFast))
             {
                 scope.request_cancel(StopReason::ParentStopped);
             }
@@ -1315,7 +1359,8 @@ impl OperationSupervisor {
                 operation_id: id,
                 resource_phase,
                 all_released: resource_phase == ResourcePhase::Released
-                    || (resource_phase == ResourcePhase::RecoveryRequired && unconfirmed_count == 0),
+                    || (resource_phase == ResourcePhase::RecoveryRequired
+                        && unconfirmed_count == 0),
                 children: facts.settlements.into(),
                 cleanup_failures: failures.into(),
                 transfers: transfers.into(),
@@ -1345,7 +1390,9 @@ impl OperationSupervisor {
             if ready && worker_context.admission_check().is_ok() {
                 future.await;
             } else {
-                let reason = worker_context.stop_reason().unwrap_or(StopReason::UserCancelled);
+                let reason = worker_context
+                    .stop_reason()
+                    .unwrap_or(StopReason::UserCancelled);
                 publish_result(
                     &gate_shared,
                     OperationOutcome::Stopped(StopReport {
@@ -1383,7 +1430,9 @@ impl OperationSupervisor {
                     _ => AdmissionError::DriverUnavailable,
                 };
                 drop(operation_lock(&lease).take());
-                let body = operation_lock(&body_cell).take().expect("unstarted body retained");
+                let body = operation_lock(&body_cell)
+                    .take()
+                    .expect("unstarted body retained");
                 Err(StartError::new(reason, body))
             }
         }

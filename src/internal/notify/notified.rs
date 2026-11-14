@@ -61,11 +61,19 @@ impl Future for Notified {
         let registration = {
             let mut state = lock(&inner.state);
             if state.generation != self.generation {
-                if let Some(index) = state.waiters.iter().position(|(waiter_id, _)| *waiter_id == id) {
+                if let Some(index) = state
+                    .waiters
+                    .iter()
+                    .position(|(waiter_id, _)| *waiter_id == id)
+                {
                     replaced_waker = Some(state.waiters.swap_remove(index).1);
                 }
                 Ok(true)
-            } else if let Some((_, existing)) = state.waiters.iter_mut().find(|(waiter_id, _)| *waiter_id == id) {
+            } else if let Some((_, existing)) = state
+                .waiters
+                .iter_mut()
+                .find(|(waiter_id, _)| *waiter_id == id)
+            {
                 if !existing.will_wake(context.waker()) {
                     replaced_waker = Some(std::mem::replace(existing, context.waker().clone()));
                 }

@@ -34,7 +34,10 @@ impl Wake for CountingWake {
 
 fn counting_waker() -> (Waker, Arc<Mutex<usize>>) {
     let count = Arc::new(Mutex::new(0));
-    (Waker::from(Arc::new(CountingWake(Arc::clone(&count)))), count)
+    (
+        Waker::from(Arc::new(CountingWake(Arc::clone(&count)))),
+        count,
+    )
 }
 
 #[test]
@@ -58,7 +61,10 @@ fn test_notification_after_wait_registration_wakes_once() {
     let mut notified = Box::pin(notify.notified());
     let (waker, wake_count) = counting_waker();
     let mut context = Context::from_waker(&waker);
-    assert!(matches!(Pin::as_mut(&mut notified).poll(&mut context), Poll::Pending));
+    assert!(matches!(
+        Pin::as_mut(&mut notified).poll(&mut context),
+        Poll::Pending
+    ));
 
     notify.notify_waiters();
 
@@ -145,5 +151,8 @@ fn test_async_waiter_capacity_is_enforced_and_reclaimed_on_drop() {
 
     drop(waiters.pop());
     let mut replacement = Box::pin(notify.notified());
-    assert!(matches!(replacement.as_mut().poll(&mut context), Poll::Pending));
+    assert!(matches!(
+        replacement.as_mut().poll(&mut context),
+        Poll::Pending
+    ));
 }
