@@ -1,8 +1,10 @@
 # User guide (0.1.0)
 
+> **Historical version:** This guide documents qubit-operation 0.1. Its API is incompatible with 0.2; use the [0.2 Chinese developer guide](developer_guide-0.2.0.zh_CN.md) for the current API.
+
 [中文用户指南](user_guide.zh_CN.md) · [README](../README.md) · [API reference](https://docs.rs/qubit-operation) · [Adapter guide (Chinese)](adapter-guide.zh_CN.md)
 
-This guide is for Rust developers managing owned operations and their cleanup. In a download, transform, and publish pipeline, publishing the artifact and releasing temporary resources are separate events. The runnable MIME lifecycle example below demonstrates the complete public API path; later sections cover admission, child work, recovery, and service shutdown.
+This guide is for Rust developers managing owned operations and their cleanup. In a download, transform, and publish pipeline, publishing the artifact and releasing temporary resources are separate events. The historical MIME lifecycle example documents the 0.1 public API path; later sections cover admission, child work, recovery, and service shutdown.
 
 ## Start a pipeline
 
@@ -13,13 +15,9 @@ Use Rust 1.94 or later. Add the published crate to your application’s `Cargo.t
 qubit-operation = "^0.1"
 ```
 
-The crate has no default features or runtime dependencies. Keep an `OperationSupervisor` for the service lifetime and shut it down explicitly. From the crate directory, run:
+The crate has no default features or runtime dependencies. In 0.1, keep an `OperationSupervisor` for the service lifetime and shut it down explicitly. The 0.1 example targets have since been retired; see the current 0.2 examples from the repository README.
 
-```sh
-cargo run --example sync_pipeline --locked
-```
-
-The following complete example uses the public API with an in-memory input: define an application cleanup owner, register it, acquire a use lease, inspect the input, read the business result, inspect settlement, and drain the supervisor. The same lifecycle is available as [`mime_lifecycle.rs`](../examples/mime_lifecycle.rs); run it with `cargo run --example mime_lifecycle --locked`. It deliberately uses a buffer and a PDF signature check; it is an ownership exercise, not a MIME library.
+The following example records the 0.1 API with an in-memory input. Its former Cargo target was retired when the examples moved to 0.2; use the version label above to avoid treating these signatures as current. It deliberately uses a buffer and a PDF signature check; it is an ownership exercise, not a MIME library.
 
 ```rust
 use std::future::Future;
@@ -218,4 +216,4 @@ Operation and cleanup futures must be owned and `Send + 'static`. Polling, user-
 - **`WouldDeadlock`:** a blocking observation or wait was attempted on a library worker. Use async observation or wait on an external thread.
 - **Pending shutdown:** the timeout bounds this wait. Retain the shutdown observer and continue checking requests, resources, and recovery counts.
 
-Continue with the [API reference](https://docs.rs/qubit-operation), [adapter guide](adapter-guide.zh_CN.md), [MIME lifecycle example](../examples/mime_lifecycle.rs), or [README](../README.md).
+Continue with the [API reference](https://docs.rs/qubit-operation), the [0.2 adapter guide](adapter-guide.zh_CN.md), or the [README](../README.md). The 0.1 Cargo examples were retired.

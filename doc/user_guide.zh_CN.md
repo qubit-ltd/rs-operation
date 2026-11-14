@@ -1,5 +1,7 @@
 # 用户手册（0.1.0）
 
+> **历史版本：** 本文介绍 qubit-operation 0.1。其 API 与 0.2 不兼容；当前 API 请参阅 [0.2 中文开发者手册](developer_guide-0.2.0.zh_CN.md)。
+
 [中文 README](../README.zh_CN.md) · [API 文档](https://docs.rs/qubit-operation) · [适配器接入指南](adapter-guide.zh_CN.md)
 
 本文面向有经验的 Rust 开发者，以 MIME 检测为例，说明 `qubit-operation` 的核心 API、资源归属和错误处理方式。
@@ -58,7 +60,7 @@
 qubit-operation = "^0.1"
 ```
 
-以下代码可作为应用的 `src/main.rs`，也可通过仓库中的 [`mime_lifecycle.rs`](../examples/mime_lifecycle.rs) 运行：在 crate 目录执行 `cargo run --example mime_lifecycle --locked` 即可。
+以下代码记录 0.1 API。示例 Cargo 目标已随 0.2 示例替换而退役；请结合本文顶部的版本标识阅读，不要将这些签名当作当前接口。
 
 ```rust
 use std::future::Future;
@@ -717,7 +719,7 @@ fn inspect_settlement(report: &SettlementReport) {
 - [中文 README](../README.zh_CN.md)：库的定位和核心场景。
 - [API 文档](https://docs.rs/qubit-operation)：方法签名、配置字段和错误类型。
 - [适配器接入指南](adapter-guide.zh_CN.md)：提交顺序、线程要求、清理对象和验收方法。
-- 示例：[MIME 生命周期](../examples/mime_lifecycle.rs)、[异步观察](../examples/async_pipeline.rs)、[不可中断工作取消](../examples/inference_cancel.rs)。后两者补充说明执行和取消行为。
+- 继续阅读：[0.2 中文开发者手册](developer_guide-0.2.0.zh_CN.md)、[0.2 适配器指南](adapter-guide.zh_CN.md) 和 [中文 README](../README.zh_CN.md)。本文所述 0.1 Cargo 示例已退役。
 - 相关设计：rs-command 0.12.0、rs-local-files 0.6.0、rs-mime 0.22.0、rs-magika 0.19.0、rs-fs 0.4.0。可参考其中的组件分工，具体 API 以对应实现为准。
 
 英文手册见[User guide](user_guide.md)，覆盖相同的主要操作路径；类型签名和错误细节以源码及 API 文档为准。

@@ -1,70 +1,79 @@
-# 领域适配器接入指南（0.1.0）
+# 领域适配器接入指南（0.2）
 
-[用户指南](user_guide.zh_CN.md) · [English README](../README.md) · [中文 README](../README.zh_CN.md) · [API 文档](https://docs.rs/qubit-operation)
+[0.2 中文开发者手册](developer_guide-0.2.0.zh_CN.md) · [0.2 API 设计](design-0.2.0.zh_CN.md) · [中文 README](../README.zh_CN.md) · [English README](../README.md) · [API 文档](https://docs.rs/qubit-operation)
 
-本文面向把进程、文件 provider、媒体探测器或模型 session 接入 `qubit-operation` 的维护者。适配器保留领域语义与真实释放证据；本库提供 scope、登记协议、租约和结算观察。请以 T10 公共接口及本仓库当前代码为准，不要把下游尚未实现的设想包装成现有保证。
+本文面向把文件、子进程、媒体探测器、模型 session 等领域资源接入 `qubit-operation` 的维护者。适配器负责真实领域行为和释放证据；本库负责操作归属、`ResourceRef` 生命周期、准入、结果与 settlement 汇总。请使用 0.2 API；旧 0.1 的 `reserve_child`、`attach`、`commit`、`ResourceUse`、`OwnedCleanup` 和 `ServiceResourceScope` 入口不属于当前操作 API。
 
-## 接入前先划清责任
+## 先确定 owner 和范围
 
-为每个领域 owner 明确：谁创建它、谁持有原生句柄、何时可以停止新使用、哪个事实能证明它已释放、失败后由谁继续恢复。长期领域资源由应用的 `ServiceResourceScope` 持有；一次请求的临时资源由请求的 `OperationScope` 持有。不要把所有请求挂在一个长期 root 上。
+接入前为每个资源回答四个问题：谁创建它，哪个 scope 登记它，哪些工作可能继续使用它，什么事实能证明它已经释放。一次请求的临时资源通常由该请求的 `OperationScope` 管理；跨请求的长期资源应放进应用明确管理的服务资源范围。一个 owner 只登记一次。Facade 若包裹已登记资源，应传递同一份 `ResourceRef`，不要再次登记或重复清理。
 
-对每个副作用只指定一个登记 owner。若 facade 包装底层已登记的实现，应透传同一登记与 lease，而不是再次登记、重复清理同一个对象。
-
-## 先登记，再启动副作用
-
-受管子操作使用 `reserve_child` → `attach` → `commit`。适配器应按以下顺序实现：
-
-1. 先 reserve，确认 scope 接受该子操作及其配额。
-2. attach 能请求停止、报告业务状态与等待真实释放的 control。
-3. 将必须与子操作共同存活的 `ResourceUse` leases 一起 attach（若适用）。
-4. commit 成功后才启动领域副作用；失败时归还尚未启动的输入和许可。
-
-不要在 executor 回调、`poll` 或内部锁中启动外部工作。取消与 commit 竞态必须有明确线性化点：取消先被接受时，不能随后提交并启动副作用；commit 先完成时，该工作必须继续受 scope 管理。领域 executor 如需单独许可，应在 commit 前取得，并在拒绝时原样归还。
-
-## 接入资源与清理 capsule
-
-资源 owner 实现公开 `OwnedCleanup`：
+`scope.manage(value)` 将资源登记到当前操作的资源范围，并返回 `ResourceRef<T>`。该引用同时提供共享访问并计入使用者数量；clone 增加一份使用引用，move 不增加，Drop 归还一份。资源只会在**所属范围结束且所有 `ResourceRef` 都已归还**后进入清理。父子关系本身不会推迟无关父资源的释放；子工作要继续访问父资源，必须拿到并持有该资源的引用。
 
 ```rust,ignore
-impl OwnedCleanup for NativeSession {
-    fn begin(
-        self: Box<Self>,
+let input = scope.manage(staged_file).map_err(|error| error.to_string())?;
+let child_input = input.clone();
+let child = scope.manager().try_submit(OperationOptions::default(), move |_child_scope| {
+    run_command(&child_input)
+})?;
+let _observer = child.into_observer();
+```
+
+这是局部接入片段：`staged_file`、`run_command` 和错误转换由应用定义。`child_input` 必须一直留在子闭包中，直到子进程及所有文件访问真正结束。请求已取消、父主体已返回或业务 outcome 已经产生，都不能代替这个释放事实。`scope.manager()` 绑定当前操作，所以 child 是直接子操作；不要把根 manager 传进去冒充子提交。
+
+`ResourceRef<T>` 只提供共享 `&T`，不授予独占访问。若多个 worker 会修改同一状态，应由 T 或应用提供 `Mutex`、`RwLock`、原子操作或领域同步。框架不在整个引用持有期间加锁，也不追踪应用复制出去的裸句柄。
+
+## 清理要有可核验的结果
+
+如果普通析构足以释放资源，使用 `scope.manage(resource)`。需要异步关闭、远端确认或保留恢复 owner 时，使用 `scope.manage_with(resource, cleanup)` 并实现 `AsyncCleanup<T>`。成功的 `Released` 应对应适配器能够说明的释放事实；`Transferred(receipt)` 表示已由明确接收方接手责任，不代表物理资源已经释放；`Failed { failure, resource }` 必须保留可恢复的资源 owner。
+
+```rust,ignore
+impl AsyncCleanup<NativeSession> for CloseSession {
+    fn cleanup(
+        self: Arc<Self>,
+        resource: NativeSession,
         context: CleanupContext,
-    ) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + 'static>> {
+    ) -> CleanupFuture<NativeSession> {
         Box::pin(async move {
-            // 适配器在这里异步关闭原生 session，并只在确认后返回 Cleaned。
-            self.close_and_confirm(context).await
+            match resource.close_and_confirm(context).await {
+                Ok(()) => CleanupOutcome::Released,
+                Err((failure, resource)) => CleanupOutcome::Failed { failure, resource },
+            }
         })
     }
 }
 ```
 
-这是结构示意；`NativeSession::close_and_confirm` 由领域适配器实现，不是本 crate API。cleanup capsule 必须拥有其执行所需的 owner/state，不能借用已结束的业务栈。先调用 `OperationScope::register_resource(owner)`，再创建或暴露资源句柄。每个使用路径持有独立 `ResourceUse`；停止新使用后，直到所有适配器内部使用者释放 lease 才可以清理。
+`NativeSession::close_and_confirm`、错误类型和清理执行环境由领域适配器提供；片段展示 trait 形状，不是完整程序。不要在 `Drop` 中等待、阻塞或执行可能失败的异步关闭。若创建资源可能在登记前失败，先通过 `scope.reserve_resource()` 预留责任与额度；副作用失败后，使用 reservation 的 `retain_with_for_cleanup` 保留部分资源，不能把唯一 owner 丢进普通析构。
 
-清理结果必须表达可证实事实：`Cleaned` 表示领域确认释放；`Transferred(receipt)` 表示另一个明确 owner 接受责任；`FailedWithRecovery` 必须同时保留可恢复 owner。若 runtime、设备或进程暂时无法确认，保留 Unconfirmed/恢复责任，不得合成成功报告。清理 panic 时的 owner 恢复方式必须由独立 capsule/注册表保留；不能只把唯一 owner 移进可能 panic 的 future。
+清理报告中 `DropCompleted` 只证明 Rust 析构已完成，不证明外部进程、远端 session 或设备状态已得到独立确认。需要更强保证时，由适配器返回带有证据的清理结果，并对无法确认的状态保留恢复责任。
 
-## 线程归属和不可中断工作
+## 把结果、收尾和容量分开观察
 
-在适配器设计中记录每个值的创建线程、调用线程、析构线程和 runtime 归属。线程绑定的 native session 不应被默认 `PortableDriver` 任意迁移；应由保持其线程归属的领域 executor 执行控制及清理。若使用 `ExternalDriver`，应用需保持该 driver/runtime 存活至已接纳工作释放，并能报告 driver 丢失或未确认状态。
+`wait_outcome` 回答业务执行结果，`wait_settlement` 回答操作及子树自动收尾责任是否已有稳定报告。`Succeeded` 不代表资源已释放；`wait_settlement` 得到报告也不代表报告状态一定是 Released。应用必须检查 `SettlementReport` 的状态、资源报告和清理失败，再决定是否继续、重试或转交。
 
-阻塞或不可中断工作可通过 `start_blocking` 交给应用提供的 `BlockingExecutor`；对已有领域线程池不要再套线程池。取消只通知停止，容量和输入 leases 必须持续占用到领域调用真正退出。通过 `OperationScope` 的子操作 control 报告停止与释放事实。不得让管理线程直接执行会阻塞的推理、I/O 或任意用户 closure。
+同步任务使用 `OperationManager`，异步任务使用同一核心的 `manager.as_async()` / `AsyncOperationManager`。`OperationManager` 的同步闭包由配置的执行器运行；不要在该 worker 中同步等待只有同一执行器退出后才能获得容量的子任务。异步主体等待子 outcome 时，可把子 handle 转为异步视图并 `await`；异步等待不会消除逻辑上的容量依赖。
 
-## 依赖、恢复与 facade
+各类额度独立计算：root / 子操作、结果槽、资源登记、清理并发和执行器队列不是一个总数。子提交成功不保证资源登记成功；`ResourceRef::clone()` 不新增资源登记，但增加使用引用。容量只有在对应责任稳定归还后才可重用。业务侧的文件字节数、进程数、模型内存和连接池应由应用的领域预算控制，可参考 [rs-budget](https://github.com/qubit-ltd/rs-budget)；不要把管理器的操作额度当作业务资源预算。
 
-用 `cleanup_after(resource, prerequisite)` 表达有序释放。依赖失败时后续 owner 仍需留在恢复组内；单独取走前置 owner 不应假装解除了后续责任。跨 scope 转移必须一次性转交完整依赖组并通过目标配额接纳；失败时源 owner 仍归原 scope 管理。
+## 停止、恢复和服务关闭
 
-Facade 需要给出唯一登记责任的可追踪证据：同一个 owner 在报告中只出现一个 registration、只触发一个 cleanup，底层 `ResourceUse` 由实际使用方持有到使用结束。对外导出无法约束生命周期的裸句柄时，应明确其保证边界，不能声称 lease 覆盖了调用方复制出的原生句柄。
+停止是协作式信号，不能杀死任意 native 调用，也不撤销仍存活的 `ResourceRef`。不可中断调用必须运行在适合的同步执行器或领域线程池中，并在真实返回之前保留输入引用与执行许可。不要再包一层通用线程池，也不要让管理线程直接执行 I/O、推理或清理闭包。
+
+恢复对象必须连同仍需的资源 owner 一起保留。跨服务移交时使用接收方确认的转交协议；若使用 `RecoveryStore`，先配置 `RecoveryStoreOptions` 的组容量、资源容量、清理并发和执行器，再根据 `RecoveryHandle` 的状态重试或转交。历史 settlement 是不可变快照；后续恢复成功不会改写原报告。
+
+服务关闭由应用持有的 manager / service owner 发起。Drain 停止新 root 准入并等待已接纳的树；Cancel 还请求活动树停止。若关闭观察返回 Pending，应保留观察句柄、执行器和恢复设施，检查尚在运行的任务、`ResourceRef`、清理和恢复责任，再继续观察。不要使用固定 sleep 推断退出或释放。
 
 ## 适配器验收清单
 
-- [ ] 注册容量满时，副作用尚未启动，原始输入和领域许可可由调用方收回。
-- [ ] reserve/attach/commit 与取消交错时，不出现未登记的运行中工作。
-- [ ] 停止请求不早于事实地报告调用退出；最后一个 use lease 归还前不清理。
-- [ ] 清理返回 Cleaned 前有领域释放证据；转交和恢复保留唯一 owner。
-- [ ] 清理 panic/运行时丢失/设备不可用时仍有恢复 owner 或明确的 Unconfirmed 报告。
-- [ ] 线程绑定值不会在错误线程 poll、关闭或析构；不阻塞管理线程。
-- [ ] facade 与底层实现没有重复登记/清理。
-- [ ] 主业务错误、部分副作用与清理错误分别保留；没有自动补偿或无界重试假设。
-- [ ] shutdown Drain/Cancel 后继续持有 pending observer，直到责任释放、恢复或显式转交。
+- [ ] 容量拒绝发生在领域副作用启动之前；原输入、许可和部分资源仍有明确 owner。
+- [ ] 后台和异步使用者持有 `ResourceRef` 到真实使用结束；scope 结束且引用归零后才清理。
+- [ ] 父资源不会被无关子资源的清理拖住；仍需父资源的子清理明确持有其引用。
+- [ ] 停止信号、业务 outcome、执行退出、资源释放和 settlement 分别记录，不互相冒充。
+- [ ] `Released` 有对应证据；转交有接收方回执；失败保留恢复对象；未确认不伪装成功。
+- [ ] facade 不重复登记或清理；适配器不把未受管裸句柄的生命周期纳入虚假保证。
+- [ ] 线程绑定资源只在所属领域执行器访问和关闭；管理线程不运行阻塞 I/O、模型调用或用户清理。
+- [ ] 容量测试分别覆盖提交拒绝、资源登记拒绝、恢复占额和实际归还时点。
+- [ ] 关闭 Drain / Cancel 后持续观察 Pending；执行环境保持可用，直到释放、恢复或显式转交。
 
-记录可重复的 gate、故障注入和计数器证据，包含拒绝、取消、释放、恢复及关闭路径。不要用固定 sleep 作为竞态证明，也不要宣称框架测试替代真实进程、文件系统、provider 或 native runtime 的领域验收。
+使用 gate、显式通知和计数器记录可重复的交错及证据。fixture 只替代外部领域服务、时钟或故障源，不替代被验收的 manager、scope、资源引用或清理实现。固定 sleep 不能证明竞态或释放顺序。
