@@ -3,5 +3,7 @@
 pub mod protocol;
 pub mod report;
 pub mod context;
+pub mod executor;
 pub mod internal;
 pub mod manager;
+pub mod operation;
