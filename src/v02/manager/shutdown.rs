@@ -234,10 +234,68 @@ impl Drop for ShutdownDeadline {
 mod tests {
     use crate::v02::manager::core::OperationManager;
     use crate::v02::report::{
-        AdmissionError, ManagerOptions, OperationOptions, ShutdownMode, ShutdownWait,
+        AdmissionError, CleanupFailure, CleanupStage, DiagnosticSummary, ManagerId, ManagerOptions,
+        OperationOptions, ResourceId, ResourceScopeOptions, ShutdownMode, ShutdownWait,
     };
+    use crate::v02::resource::{AsyncCleanup, CleanupOutcome, RecoveryStore, RecoveryStoreOptions};
+    use std::future;
     use std::sync::mpsc;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    struct FailingCleanup;
+
+    impl AsyncCleanup<usize> for FailingCleanup {
+        fn cleanup(
+            self: Arc<Self>,
+            resource: usize,
+            _context: crate::v02::context::CleanupContext,
+        ) -> crate::v02::resource::CleanupFuture<usize> {
+            Box::pin(future::ready(CleanupOutcome::Failed {
+                failure: CleanupFailure {
+                    resource_id: ResourceId::new(ManagerId::new_unique(), 1, 1),
+                    stage: CleanupStage::AsyncRelease,
+                    summary: DiagnosticSummary::new("retry required"),
+                    source: None,
+                },
+                resource,
+            }))
+        }
+    }
+
+    #[test]
+    fn recovery_blocks_shutdown_until_signed_transfer() {
+        let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+        let completion = manager
+            .run_and_settle(OperationOptions::default(), |scope| {
+                let resources = scope
+                    .resource_scope(ResourceScopeOptions { capacity: 1 })
+                    .unwrap();
+                let resource = resources
+                    .manage_with(17usize, Arc::new(FailingCleanup))
+                    .unwrap();
+                drop(resource);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(completion.settlement.recovery_count, 1);
+        let recovery = completion.settlement.recoveries[0].clone();
+        let shutdown = manager.request_shutdown(ShutdownMode::Drain);
+        assert_eq!(shutdown.snapshot().recovery_groups, 1);
+        assert!(matches!(
+            shutdown.wait_for(Duration::ZERO).unwrap(),
+            ShutdownWait::Pending(snapshot) if snapshot.recovery_groups == 1
+        ));
+
+        let store = RecoveryStore::new(RecoveryStoreOptions::default()).unwrap();
+        let transfer = recovery.transfer_to(&store).unwrap();
+        assert_eq!(transfer.recovery, recovery.id());
+        assert!(store.contains(recovery.id()));
+        assert!(matches!(
+            shutdown.wait_for(Duration::from_secs(2)).unwrap(),
+            ShutdownWait::Completed(report) if report.snapshot.recovery_groups == 0
+        ));
+    }
 
     #[test]
     fn shutdown_can_upgrade_not_reopen() {

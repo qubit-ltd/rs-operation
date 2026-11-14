@@ -206,7 +206,10 @@ impl GroupCore {
 
     pub(crate) fn shutdown_snapshot(&self) -> crate::v02::report::ShutdownSnapshot {
         let (recovery_count, unconfirmed_count) = {
-            let handles = lock(&self.state).recoveries.values().cloned().collect::<Vec<_>>();
+            let handles = {
+                let state = lock(&self.state);
+                state.recoveries.values().cloned().collect::<Vec<_>>()
+            };
             let unconfirmed = handles
                 .iter()
                 .filter(|handle| {
@@ -215,13 +218,17 @@ impl GroupCore {
                 .count();
             (handles.len(), unconfirmed)
         };
+        let active_operations = self.snapshot().1;
+        let queued_operations = lock(&self.state).queued.len();
+        let cleaning_resources = self.cleaning_count();
+        let service_resources = self.service_count();
         crate::v02::report::ShutdownSnapshot {
-            active_operations: self.snapshot().1,
-            queued_operations: lock(&self.state).queued.len(),
+            active_operations,
+            queued_operations,
             unconfirmed_users: unconfirmed_count,
-            cleaning_resources: self.cleaning_count(),
+            cleaning_resources,
             recovery_groups: recovery_count,
-            service_resources: self.service_count(),
+            service_resources,
         }
     }
 
@@ -704,11 +711,11 @@ mod tests {
         let mut outside = manager
             .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()))
             .unwrap();
+        finish_tx.send(()).unwrap();
         assert!(matches!(
             outside.wait_outcome().unwrap(),
             OperationOutcome::Succeeded(())
         ));
-        finish_tx.send(()).unwrap();
         assert!(matches!(
             operation.wait_outcome().unwrap(),
             OperationOutcome::Stopped(_)
