@@ -1,12 +1,13 @@
 //! Admission and lifecycle ports for externally executed child operations.
 
+use crate::v02::operation::OperationCore;
 use crate::v02::protocol::OperationControl;
 use crate::v02::report::{
-    ChildOutcomeSummary, ChildRelease, ChildSnapshot, OperationId, OperationOptions,
-    SettlementReport, StopReason, StopReport,
+    ChildOutcomeSummary, ChildRelease, ChildSnapshot, OperationId, SettlementReport, StopReason,
+    StopReport,
 };
 use crate::v02::resource::ResourceRef;
-use crate::v02::scope::OperationScope;
+use crate::v02::scope::ScopeCore;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -21,7 +22,6 @@ mod tests;
 pub(crate) enum AdapterErrorKind {
     Stopped,
     ScopeEnded,
-    CapacityExceeded,
     AlreadyAttached,
     AlreadyCommitted,
 }
@@ -43,6 +43,9 @@ impl<P> std::fmt::Debug for AdapterError<P> {
 /// An owning reservation for child admission and its capacity token.
 pub(crate) struct AdapterReservation {
     admission: Option<Box<dyn Any + Send>>,
+    commit_gate: Arc<dyn Fn() -> Result<(), AdapterErrorKind> + Send + Sync>,
+    activation_gate: Arc<dyn Fn() -> Result<(), AdapterErrorKind> + Send + Sync>,
+    gate_is_authoritative: bool,
     activate: Option<Box<dyn FnOnce(Box<dyn Any + Send>) + Send>>,
     abandon: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -53,8 +56,39 @@ impl AdapterReservation {
         activate: impl FnOnce(Box<dyn Any + Send>) + Send + 'static,
         abandon: impl FnOnce() + Send + 'static,
     ) -> Self {
+        Self::build(admission, || Ok(()), || Ok(()), false, activate, abandon)
+    }
+
+    pub(crate) fn new_with_gates(
+        admission: Box<dyn Any + Send>,
+        commit_gate: impl Fn() -> Result<(), AdapterErrorKind> + Send + Sync + 'static,
+        activation_gate: impl Fn() -> Result<(), AdapterErrorKind> + Send + Sync + 'static,
+        activate: impl FnOnce(Box<dyn Any + Send>) + Send + 'static,
+        abandon: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self::build(
+            admission,
+            commit_gate,
+            activation_gate,
+            true,
+            activate,
+            abandon,
+        )
+    }
+
+    fn build(
+        admission: Box<dyn Any + Send>,
+        commit_gate: impl Fn() -> Result<(), AdapterErrorKind> + Send + Sync + 'static,
+        activation_gate: impl Fn() -> Result<(), AdapterErrorKind> + Send + Sync + 'static,
+        gate_is_authoritative: bool,
+        activate: impl FnOnce(Box<dyn Any + Send>) + Send + 'static,
+        abandon: impl FnOnce() + Send + 'static,
+    ) -> Self {
         Self {
             admission: Some(admission),
+            commit_gate: Arc::new(commit_gate),
+            activation_gate: Arc::new(activation_gate),
+            gate_is_authoritative,
             activate: Some(Box::new(activate)),
             abandon: Some(Box::new(abandon)),
         }
@@ -79,6 +113,9 @@ impl AdapterReservation {
                 phase: ChildPhase::Attached,
                 stop_requested: false,
             })),
+            commit_gate: Arc::clone(&self.commit_gate),
+            activation_gate: Arc::clone(&self.activation_gate),
+            gate_is_authoritative: self.gate_is_authoritative,
             activate: self.activate.take(),
             abandon: self.abandon.take(),
         })
@@ -91,6 +128,9 @@ pub(crate) struct AttachedChild {
     control: Arc<dyn OperationControl>,
     payload: Option<Box<dyn Any + Send>>,
     lifecycle: Arc<Mutex<Lifecycle>>,
+    commit_gate: Arc<dyn Fn() -> Result<(), AdapterErrorKind> + Send + Sync>,
+    activation_gate: Arc<dyn Fn() -> Result<(), AdapterErrorKind> + Send + Sync>,
+    gate_is_authoritative: bool,
     activate: Option<Box<dyn FnOnce(Box<dyn Any + Send>) + Send>>,
     abandon: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -112,7 +152,7 @@ impl AttachedChild {
     }
 
     pub(crate) fn commit(mut self) -> Result<ChildStartPermit, AdapterError<Self>> {
-        {
+        let (can_commit, stop_requested) = {
             let mut lifecycle = lock(&self.lifecycle);
             if lifecycle.phase != ChildPhase::Attached {
                 drop(lifecycle);
@@ -121,22 +161,32 @@ impl AttachedChild {
                     payload: self,
                 });
             }
-            if lifecycle.stop_requested || self.control.snapshot().stop.is_some() {
-                lifecycle.phase = ChildPhase::Abandoned;
-                drop(lifecycle);
-                if let Some(abandon) = self.abandon.take() {
-                    abandon();
-                }
-                drop(self.admission.take());
-                return Err(AdapterError {
-                    reason: AdapterErrorKind::Stopped,
-                    payload: self,
-                });
+            lifecycle.phase = ChildPhase::Committing;
+            (true, lifecycle.stop_requested)
+        };
+        debug_assert!(can_commit);
+        let gate_result = (self.commit_gate)();
+        let rejected = gate_result.err().or_else(|| {
+            (!self.gate_is_authoritative
+                && (stop_requested || self.control.snapshot().stop.is_some()))
+            .then_some(AdapterErrorKind::Stopped)
+        });
+        if let Some(reason) = rejected {
+            lock(&self.lifecycle).phase = ChildPhase::Abandoned;
+            if let Some(abandon) = self.abandon.take() {
+                abandon();
             }
-            lifecycle.phase = ChildPhase::Committed;
+            drop(self.admission.take());
+            return Err(AdapterError {
+                reason,
+                payload: self,
+            });
         }
+        lock(&self.lifecycle).phase = ChildPhase::Committed;
         Ok(ChildStartPermit {
             lifecycle: Arc::clone(&self.lifecycle),
+            activation_gate: Arc::clone(&self.activation_gate),
+            gate_is_authoritative: self.gate_is_authoritative,
             activate: self.activate.take(),
             abandon: self.abandon.take(),
             admission: self.admission.take(),
@@ -176,7 +226,9 @@ impl Drop for AttachedChild {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChildPhase {
     Attached,
+    Committing,
     Committed,
+    Activating,
     Activated,
     Abandoned,
 }
@@ -189,6 +241,8 @@ struct Lifecycle {
 /// One-shot permission to start an already committed external child.
 pub(crate) struct ChildStartPermit {
     lifecycle: Arc<Mutex<Lifecycle>>,
+    activation_gate: Arc<dyn Fn() -> Result<(), AdapterErrorKind> + Send + Sync>,
+    gate_is_authoritative: bool,
     activate: Option<Box<dyn FnOnce(Box<dyn Any + Send>) + Send>>,
     abandon: Option<Box<dyn FnOnce() + Send>>,
     admission: Option<Box<dyn Any + Send>>,
@@ -204,7 +258,7 @@ impl std::fmt::Debug for ChildStartPermit {
 
 impl ChildStartPermit {
     pub(crate) fn activate(mut self) -> Result<(), AdapterError<Self>> {
-        let stopped = {
+        let stop_requested = {
             let mut lifecycle = lock(&self.lifecycle);
             if lifecycle.phase != ChildPhase::Committed {
                 drop(lifecycle);
@@ -213,24 +267,27 @@ impl ChildStartPermit {
                     payload: self,
                 });
             }
-            if lifecycle.stop_requested || self.control.snapshot().stop.is_some() {
-                lifecycle.phase = ChildPhase::Abandoned;
-                true
-            } else {
-                lifecycle.phase = ChildPhase::Activated;
-                false
-            }
+            lifecycle.phase = ChildPhase::Activating;
+            lifecycle.stop_requested
         };
-        if stopped {
+        let gate_result = (self.activation_gate)();
+        let activation_error = gate_result.err().or_else(|| {
+            (!self.gate_is_authoritative
+                && (stop_requested || self.control.snapshot().stop.is_some()))
+            .then_some(AdapterErrorKind::Stopped)
+        });
+        if let Some(reason) = activation_error {
+            lock(&self.lifecycle).phase = ChildPhase::Abandoned;
             if let Some(abandon) = self.abandon.take() {
                 abandon();
             }
             drop(self.admission.take());
             return Err(AdapterError {
-                reason: AdapterErrorKind::Stopped,
+                reason,
                 payload: self,
             });
         }
+        lock(&self.lifecycle).phase = ChildPhase::Activated;
         if let Some(activate) = self.activate.take() {
             activate(
                 self.payload
@@ -241,10 +298,6 @@ impl ChildStartPermit {
         drop(self.admission.take());
         self.abandon.take();
         Ok(())
-    }
-
-    pub(crate) fn abandon(mut self) {
-        self.abandon_once();
     }
 
     fn abandon_once(&mut self) {
@@ -272,23 +325,207 @@ impl Drop for ChildStartPermit {
     }
 }
 
-/// Adapter boundary for reserving, attaching, and committing external children.
-pub(crate) trait ChildAdapter: Send + Sync {
-    fn reserve_child(
-        &self,
-        parent: &OperationScope,
-        options: &OperationOptions,
-    ) -> Result<AdapterReservation, AdapterError<()>>;
+/// Manager-owned observation bridge for one real operation scope.
+///
+/// Outcome and input release are mirrored here because `OperationCore` exposes
+/// only untyped outcome availability. Settlement remains owned by
+/// `OperationCore`; this bridge only wakes settlement observers after the core
+/// publishes its immutable report.
+pub(crate) struct ManagedOperationControl {
+    operation: Arc<OperationCore>,
+    scope: Arc<ScopeCore>,
+    facts: Mutex<ManagedFacts>,
+}
 
-    fn attach<P: Send + 'static>(
-        &self,
-        reservation: AdapterReservation,
-        control: Arc<dyn OperationControl>,
-        payload: P,
-    ) -> Result<AttachedChild, AdapterError<(P, AdapterReservation)>>;
+struct ManagedFacts {
+    outcome: Option<ChildOutcomeSummary>,
+    release: Option<ChildRelease>,
+    outcome_waiters: Vec<Waker>,
+    release_waiters: Vec<Waker>,
+    settlement_waiters: Vec<Waker>,
+    settlement_generation: u64,
+}
 
-    fn commit(&self, child: AttachedChild)
-    -> Result<ChildStartPermit, AdapterError<AttachedChild>>;
+impl ManagedOperationControl {
+    pub(crate) fn new(operation: Arc<OperationCore>, scope: Arc<ScopeCore>) -> Arc<Self> {
+        Arc::new(Self {
+            operation,
+            scope,
+            facts: Mutex::new(ManagedFacts {
+                outcome: None,
+                release: None,
+                outcome_waiters: Vec::new(),
+                release_waiters: Vec::new(),
+                settlement_waiters: Vec::new(),
+                settlement_generation: 0,
+            }),
+        })
+    }
+
+    pub(crate) fn publish_outcome(&self, outcome: ChildOutcomeSummary) -> bool {
+        let waiters = {
+            let mut facts = lock(&self.facts);
+            if outcome.operation_id != self.operation.id() || facts.outcome.is_some() {
+                return false;
+            }
+            facts.outcome = Some(outcome);
+            std::mem::take(&mut facts.outcome_waiters)
+        };
+        wake_all(waiters);
+        true
+    }
+
+    pub(crate) fn confirm_input_release(&self, release: ChildRelease) -> bool {
+        let waiters = {
+            let mut facts = lock(&self.facts);
+            if release.operation_id != self.operation.id() || facts.release.is_some() {
+                return false;
+            }
+            facts.release = Some(release);
+            std::mem::take(&mut facts.release_waiters)
+        };
+        if let Some(parent) = self.scope.parent() {
+            parent.child_input_released(self.operation.id());
+        }
+        wake_all(waiters);
+        true
+    }
+
+    pub(crate) fn settlement_published(&self) {
+        let waiters = {
+            let mut facts = lock(&self.facts);
+            facts.settlement_generation = facts.settlement_generation.wrapping_add(1);
+            std::mem::take(&mut facts.settlement_waiters)
+        };
+        wake_all(waiters);
+    }
+
+    fn poll_outcome(&self, cx: &mut Context<'_>) -> Poll<ChildOutcomeSummary> {
+        poll_managed_fact(
+            &self.facts,
+            cx,
+            |facts| &mut facts.outcome_waiters,
+            |facts| facts.outcome.clone(),
+        )
+    }
+
+    fn poll_release(&self, cx: &mut Context<'_>) -> Poll<ChildRelease> {
+        poll_managed_fact(
+            &self.facts,
+            cx,
+            |facts| &mut facts.release_waiters,
+            |facts| facts.release.clone(),
+        )
+    }
+
+    fn poll_settlement(&self, cx: &mut Context<'_>) -> Poll<Arc<SettlementReport>> {
+        loop {
+            let generation = lock(&self.facts).settlement_generation;
+            if let Some(report) = self.operation.snapshot().settlement {
+                return Poll::Ready(report);
+            }
+            let candidate = cx.waker().clone();
+            let (retry, retired) = {
+                let mut facts = lock(&self.facts);
+                if facts.settlement_generation != generation {
+                    (true, Some(candidate))
+                } else if let Some(index) = facts
+                    .settlement_waiters
+                    .iter()
+                    .position(|old| old.will_wake(&candidate))
+                {
+                    (
+                        false,
+                        Some(std::mem::replace(
+                            &mut facts.settlement_waiters[index],
+                            candidate,
+                        )),
+                    )
+                } else {
+                    facts.settlement_waiters.push(candidate);
+                    (false, None)
+                }
+            };
+            drop(retired);
+            if retry {
+                continue;
+            }
+            return Poll::Pending;
+        }
+    }
+}
+
+impl OperationControl for ManagedOperationControl {
+    fn request_stop(&self, reason: StopReason) {
+        self.scope.request_stop(reason);
+    }
+
+    fn snapshot(&self) -> ChildSnapshot {
+        let operation = self.operation.snapshot();
+        let facts = lock(&self.facts);
+        ChildSnapshot {
+            operation_id: operation.operation_id,
+            execution: operation.execution,
+            stop: operation.stop.or_else(|| {
+                self.scope.context().stop_reason().map(|reason| StopReport {
+                    reason,
+                    accepted_at: None,
+                })
+            }),
+            outcome: facts.outcome.clone(),
+            input_released: facts.release.is_some(),
+            settlement: operation.settlement,
+        }
+    }
+
+    fn poll_outcome(&self, cx: &mut Context<'_>) -> Poll<ChildOutcomeSummary> {
+        ManagedOperationControl::poll_outcome(self, cx)
+    }
+
+    fn poll_release(&self, cx: &mut Context<'_>) -> Poll<ChildRelease> {
+        ManagedOperationControl::poll_release(self, cx)
+    }
+
+    fn poll_settlement(&self, cx: &mut Context<'_>) -> Poll<Arc<SettlementReport>> {
+        ManagedOperationControl::poll_settlement(self, cx)
+    }
+}
+
+impl crate::v02::operation::StopControl for ManagedOperationControl {
+    fn request_stop(&self, reason: StopReason) {
+        OperationControl::request_stop(self, reason);
+    }
+}
+
+fn poll_managed_fact<V: Clone>(
+    state: &Mutex<ManagedFacts>,
+    cx: &mut Context<'_>,
+    waiters: impl for<'a> Fn(&'a mut ManagedFacts) -> &'a mut Vec<Waker>,
+    value: impl Fn(&ManagedFacts) -> Option<V>,
+) -> Poll<V> {
+    if let Some(value) = value(&lock(state)) {
+        return Poll::Ready(value);
+    }
+    let candidate = cx.waker().clone();
+    let (result, retired) = {
+        let mut facts = lock(state);
+        if let Some(value) = value(&facts) {
+            (Poll::Ready(value), Some(candidate))
+        } else {
+            let waiters = waiters(&mut facts);
+            if let Some(index) = waiters.iter().position(|old| old.will_wake(&candidate)) {
+                (
+                    Poll::Pending,
+                    Some(std::mem::replace(&mut waiters[index], candidate)),
+                )
+            } else {
+                waiters.push(candidate);
+                (Poll::Pending, None)
+            }
+        }
+    };
+    drop(retired);
+    result
 }
 
 /// External work together with the resource reference that keeps its input alive.

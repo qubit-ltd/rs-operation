@@ -32,6 +32,7 @@ pub(crate) struct ScopeCore {
 struct ScopeState {
     open: bool,
     stopping: bool,
+    start: StartState,
     active_children: HashMap<OperationId, ChildRecord>,
     children: Vec<ChildSettlement>,
     children_total: usize,
@@ -54,6 +55,14 @@ struct ScopeState {
     settlement_callback: Option<Box<dyn FnOnce() + Send + 'static>>,
     body_finished: bool,
     outcome_callback: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartState {
+    Reserved,
+    Committed,
+    Activated,
+    Abandoned,
 }
 
 struct ChildRecord {
@@ -97,6 +106,7 @@ impl ScopeCore {
             state: Mutex::new(ScopeState {
                 open: true,
                 stopping: false,
+                start: StartState::Reserved,
                 active_children: HashMap::new(),
                 children: Vec::with_capacity(diagnostic_limit),
                 children_total: 0,
@@ -425,16 +435,103 @@ impl ScopeCore {
     }
 
     pub(crate) fn request_stop(&self, reason: StopReason) -> bool {
-        {
+        let (accepted, descendants) = self.with_lifecycle_gate(|| {
             let mut state = lock(&self.state);
             if state.stopping {
-                return false;
+                return (false, Vec::new());
             }
             state.stopping = true;
+            if state.start == StartState::Reserved {
+                state.start = StartState::Abandoned;
+            }
+            let descendants = state
+                .active_children
+                .values()
+                .filter_map(|record| record.scope.upgrade())
+                .collect::<Vec<_>>();
+            (true, descendants)
+        });
+        if !accepted {
+            return false;
         }
         let accepted = self.context.request_stop(reason);
         self.children_changed.notify_waiters();
+        for child in descendants {
+            child.request_stop(StopReason::ParentStopped);
+        }
         accepted
+    }
+
+    /// Commits a reserved manager child while serialized with every scope stop.
+    pub(crate) fn commit_start(&self) -> Result<(), crate::v02::adapter::AdapterErrorKind> {
+        self.with_lifecycle_gate(|| {
+            if self.ancestor_stop_accepted() || self.manager_stopped_commits() {
+                lock(&self.state).start = StartState::Abandoned;
+                return Err(crate::v02::adapter::AdapterErrorKind::Stopped);
+            }
+            let mut state = lock(&self.state);
+            if !state.open {
+                state.start = StartState::Abandoned;
+                return Err(crate::v02::adapter::AdapterErrorKind::ScopeEnded);
+            }
+            if state.start != StartState::Reserved {
+                return Err(crate::v02::adapter::AdapterErrorKind::AlreadyCommitted);
+            }
+            state.start = StartState::Committed;
+            Ok(())
+        })
+    }
+
+    /// Activates a committed child unless a stop won the shared lifecycle gate.
+    pub(crate) fn activate_start(&self) -> Result<(), crate::v02::adapter::AdapterErrorKind> {
+        self.with_lifecycle_gate(|| {
+            if self.ancestor_stop_accepted() || self.manager_stopped_commits() {
+                lock(&self.state).start = StartState::Abandoned;
+                return Err(crate::v02::adapter::AdapterErrorKind::Stopped);
+            }
+            let mut state = lock(&self.state);
+            if !state.open {
+                state.start = StartState::Abandoned;
+                return Err(crate::v02::adapter::AdapterErrorKind::ScopeEnded);
+            }
+            if state.start != StartState::Committed {
+                return Err(crate::v02::adapter::AdapterErrorKind::AlreadyCommitted);
+            }
+            state.start = StartState::Activated;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn abandon_start(&self) {
+        self.with_lifecycle_gate(|| {
+            let mut state = lock(&self.state);
+            if matches!(state.start, StartState::Reserved | StartState::Committed) {
+                state.start = StartState::Abandoned;
+            }
+        });
+    }
+
+    fn ancestor_stop_accepted(&self) -> bool {
+        lock(&self.state).stopping
+            || self.context.stop_reason().is_some()
+            || self
+                .parent
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|parent| parent.ancestor_stop_accepted())
+    }
+
+    fn with_lifecycle_gate<R>(&self, action: impl FnOnce() -> R) -> R {
+        match self.manager.upgrade() {
+            Some(manager) => manager.with_lifecycle_gate(action),
+            None => action(),
+        }
+    }
+
+    fn manager_stopped_commits(&self) -> bool {
+        self.manager
+            .upgrade()
+            .is_some_and(|manager| !manager.adapter_start_allowed())
     }
 
     pub(crate) async fn wait_unavailable(&self) -> crate::v02::report::AdmissionError {

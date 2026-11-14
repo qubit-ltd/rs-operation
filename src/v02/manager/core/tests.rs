@@ -1,12 +1,16 @@
 use super::{
-    ManagerCore, OperationJob, OperationManager, SubmissionLease, SubmissionPermit, SubmissionPort,
-    SubmissionReservation,
+    ExecutionKind, ManagerCore, OperationJob, OperationManager, ScopeCore, SubmissionLease,
+    SubmissionPermit, SubmissionPort, SubmissionReservation,
 };
+use crate::v02::adapter::ManagedOperationControl;
 use crate::v02::executor::CleanupExecutor;
 use crate::v02::manager::capacity::{ManagerCapacityPools, ScopeCapacity};
-use crate::v02::operation::OutcomeDelivery;
+use crate::v02::operation::{
+    OperationCore, OperationHandle, OutcomeDelivery, OutcomeSlot, StopControl,
+};
+use crate::v02::protocol::OperationControl;
 use crate::v02::report::{AdmissionError, OperationOptions};
-use crate::v02::report::{ContextOptions, ScopeLimits};
+use crate::v02::report::{ContextOptions, ManagerOptions, ScopeLimits, ShutdownMode, StopReason};
 use crate::v02::report::{
     ManagerId, ManagerLimits, PortableExecutorOptions, ResourceId, ResourceScopeId,
     ThreadPoolExecutorOptions,
@@ -18,6 +22,7 @@ use crate::v02::resource::cleanup_port::{
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 
 struct WaitPort {
     ready: std::sync::atomic::AtomicBool,
@@ -280,7 +285,7 @@ fn sync_submit_waits_without_busy_retry_and_resumes_on_capacity() {
         Some(crate::v02::report::OperationOutcome::Succeeded(5))
     ));
 }
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Mutex, mpsc};
 
 #[test]
 fn typed_sync_submission_publishes_outcome_and_settlement() {
@@ -876,4 +881,184 @@ fn async_manager_conversion_keeps_parent_and_runs_grandchildren() {
     assert_eq!(relationships[0].1, None);
     assert_eq!(relationships[1].1, Some(relationships[0].0));
     assert_eq!(relationships[2].1, Some(relationships[1].0));
+}
+
+fn reserve_production_root(
+    manager: &OperationManager,
+) -> (
+    Arc<ManagerCore>,
+    crate::v02::report::OperationId,
+    Arc<ScopeCore>,
+    SubmissionReservation,
+) {
+    let core = manager.core_arc();
+    let reserved = core.reserve_scope(
+        &manager.target,
+        OperationOptions::default(),
+        ExecutionKind::Sync,
+        || {},
+    );
+    let (_, id, scope, reservation) = match reserved {
+        Ok(reserved) => reserved,
+        Err(_) => panic!("default production manager should reserve a root"),
+    };
+    (core, id, scope, reservation)
+}
+
+#[test]
+fn production_cancel_abandons_adapter_without_running_unstarted_body() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let (core, id, scope, reservation) = reserve_production_root(&manager);
+    let operation = OperationCore::new(id);
+    let slot = Arc::new(OutcomeSlot::<(), ()>::new(Arc::clone(&operation)));
+    let lease = Arc::clone(&reservation.lifecycle);
+    slot.set_delivery_hook({
+        let lease = Arc::clone(&lease);
+        move |delivery| lease.outcome_delivered(delivery)
+    });
+    let control = ManagedOperationControl::new(Arc::clone(&operation), Arc::clone(&scope));
+    core.register_settlement(
+        Arc::clone(&scope),
+        Arc::clone(&operation),
+        Arc::clone(&lease),
+        Arc::clone(&control),
+    );
+    let mut handle = OperationHandle::new(
+        Arc::clone(&operation),
+        Arc::clone(&slot),
+        Arc::clone(&control) as Arc<dyn StopControl>,
+    );
+
+    assert_eq!(
+        core.request_shutdown(ShutdownMode::Cancel),
+        super::ManagerPhase::Cancelling
+    );
+    assert_eq!(
+        scope.context().stop_reason(),
+        Some(StopReason::ManagerShutdown)
+    );
+    let ran_body = Arc::new(AtomicUsize::new(0));
+    let abandon_count = Arc::new(AtomicUsize::new(0));
+    let ran_body_on_job = Arc::clone(&ran_body);
+    let abandon_count_on_callback = Arc::clone(&abandon_count);
+    let abandon_scope = Arc::clone(&scope);
+    let abandon_operation = Arc::clone(&operation);
+    let abandon_slot = Arc::clone(&slot);
+    let abandon_lease = Arc::clone(&lease);
+    let abandon_control = Arc::clone(&control);
+    let execution = reservation.execution;
+    let result = core.dispatch_adapter_job(
+        Arc::clone(&scope),
+        Arc::clone(&control),
+        execution,
+        OperationJob::Sync(Box::new(move || {
+            ran_body_on_job.fetch_add(1, Ordering::SeqCst);
+        })),
+        move || {
+            abandon_count_on_callback.fetch_add(1, Ordering::SeqCst);
+            ManagerCore::abandon_reserved_operation(
+                abandon_scope,
+                abandon_operation,
+                abandon_slot,
+                abandon_lease,
+                None,
+                abandon_control,
+            );
+        },
+    );
+
+    assert_eq!(result, Err(crate::v02::adapter::AdapterErrorKind::Stopped));
+    assert_eq!(ran_body.load(Ordering::SeqCst), 0);
+    assert_eq!(abandon_count.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        handle.try_take_outcome().unwrap(),
+        Some(crate::v02::report::OperationOutcome::Stopped(_))
+    ));
+    assert_eq!(
+        control.snapshot().execution,
+        crate::v02::report::ExecutionPhase::Finished
+    );
+    assert!(control.snapshot().input_released);
+    let settlement = handle.wait_settlement().unwrap();
+    assert!(settlement.all_released());
+    assert_eq!(core.active_scope_count(), 0);
+    core.finish_shutdown();
+}
+
+#[test]
+fn production_parent_stop_and_adapter_activation_have_one_gate_winner() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let (core, _id, scope, reservation) = reserve_production_root(&manager);
+    scope.commit_start().unwrap();
+
+    let start = Arc::new(Barrier::new(3));
+    let activate_scope = Arc::clone(&scope);
+    let activate_start = Arc::clone(&start);
+    let activate = std::thread::spawn(move || {
+        activate_start.wait();
+        activate_scope.activate_start()
+    });
+    let stop_scope = Arc::clone(&scope);
+    let stop_start = Arc::clone(&start);
+    let stop = std::thread::spawn(move || {
+        stop_start.wait();
+        stop_scope.request_stop(StopReason::UserCancelled)
+    });
+    start.wait();
+    let activation_result = activate.join().unwrap();
+    assert!(stop.join().unwrap());
+    assert!(matches!(
+        activation_result,
+        Ok(()) | Err(crate::v02::adapter::AdapterErrorKind::Stopped)
+    ));
+    assert!(scope.context().stop_reason().is_some());
+
+    scope.end();
+    drop(reservation);
+    core.finish_shutdown();
+}
+
+#[test]
+fn production_scope_stop_and_adapter_commit_have_one_gate_winner() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let (core, id, scope, reservation) = reserve_production_root(&manager);
+    let operation = OperationCore::new(id);
+    let control = ManagedOperationControl::new(Arc::clone(&operation), Arc::clone(&scope));
+    let lease = Arc::clone(&reservation.lifecycle);
+    core.register_settlement(
+        Arc::clone(&scope),
+        Arc::clone(&operation),
+        Arc::clone(&lease),
+        Arc::clone(&control),
+    );
+
+    let start = Arc::new(Barrier::new(3));
+    let commit_scope = Arc::clone(&scope);
+    let commit_start = Arc::clone(&start);
+    let commit = std::thread::spawn(move || {
+        commit_start.wait();
+        commit_scope.commit_start()
+    });
+    let stop_scope = Arc::clone(&scope);
+    let stop_start = Arc::clone(&start);
+    let stop = std::thread::spawn(move || {
+        stop_start.wait();
+        stop_scope.request_stop(StopReason::UserCancelled)
+    });
+    start.wait();
+    let commit_result = commit.join().unwrap();
+    assert!(stop.join().unwrap());
+    assert!(matches!(
+        commit_result,
+        Ok(()) | Err(crate::v02::adapter::AdapterErrorKind::Stopped)
+    ));
+    assert_eq!(
+        scope.activate_start(),
+        Err(crate::v02::adapter::AdapterErrorKind::Stopped)
+    );
+
+    lease.execution_finished();
+    scope.end();
+    drop(reservation);
+    core.finish_shutdown();
 }

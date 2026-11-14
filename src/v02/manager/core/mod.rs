@@ -1,5 +1,6 @@
 //! Shared admission and operation-tree coordination for manager views.
 
+use crate::v02::adapter::{AdapterErrorKind, AdapterReservation, ManagedOperationControl};
 use crate::v02::context::OperationContext;
 use crate::v02::manager::capacity::ScopeCapacity;
 use crate::v02::operation::OutcomeDelivery;
@@ -7,9 +8,10 @@ use crate::v02::operation::{
     AsyncOperationHandle, OperationCore, OperationHandle, OutcomeSlot, StopControl,
 };
 use crate::v02::report::{
-    AdmissionError, ChildOutcomeKind, ChildOutcomeSummary, ContextError, DiagnosticSummary,
-    ExecutionPhase, OperationId, OperationOptions, OperationOutcome, PanicSummary, ScopeLimits,
-    SettlementReport, SettlementStatus, StopReason, SubmitError,
+    AdmissionError, ChildOutcomeKind, ChildOutcomeSummary, ChildRelease, ContextError,
+    DiagnosticSummary, ExecutionPhase, OperationId, OperationOptions, OperationOutcome,
+    PanicSummary, ScopeLimits, SettlementReport, SettlementStatus, StopReason, StopReport,
+    SubmitError,
 };
 use crate::v02::resource::ResourceScope;
 use crate::v02::scope::{ExecutionFrameGuard, OperationScope, ScopeCore};
@@ -85,7 +87,9 @@ pub(crate) trait SubmissionPort: Send + Sync + 'static {
 
     fn phase_changed(&self, _phase: ManagerPhase) {}
     fn finish_shutdown(&self) {}
-    fn queued_operation_count(&self) -> usize { 0 }
+    fn queued_operation_count(&self) -> usize {
+        0
+    }
     fn service_resource_scope(
         &self,
         _capacity: usize,
@@ -126,6 +130,7 @@ struct ManagerState {
 /// State shared by all sync and async manager views.
 pub(crate) struct ManagerCore {
     state: Mutex<ManagerState>,
+    lifecycle_gate: Mutex<()>,
     shutdown_changed: Condvar,
     shutdown_notify: crate::v02::internal::notify::Notify,
     port: Arc<dyn SubmissionPort>,
@@ -161,6 +166,7 @@ impl ManagerCore {
                 #[cfg(test)]
                 values: Vec::new(),
             }),
+            lifecycle_gate: Mutex::new(()),
             shutdown_changed: Condvar::new(),
             shutdown_notify: crate::v02::internal::notify::Notify::new(),
             port,
@@ -168,6 +174,19 @@ impl ManagerCore {
             scope_limits,
             diagnostic_limit,
         })
+    }
+
+    /// Serializes scope stops with adapter commit and activation transitions.
+    pub(crate) fn with_lifecycle_gate<R>(&self, action: impl FnOnce() -> R) -> R {
+        let _gate = lock(&self.lifecycle_gate);
+        action()
+    }
+
+    pub(crate) fn adapter_start_allowed(&self) -> bool {
+        matches!(
+            lock(&self.state).phase,
+            ManagerPhase::Open | ManagerPhase::Draining
+        )
     }
 
     pub(crate) fn root_view(self: &Arc<Self>) -> OperationManager {
@@ -411,6 +430,7 @@ impl ManagerCore {
         scope: Arc<ScopeCore>,
         operation: Arc<OperationCore>,
         lease: Arc<dyn SubmissionLease>,
+        control: Arc<ManagedOperationControl>,
     ) {
         let parent = scope.parent();
         let operation_id = scope.id();
@@ -422,6 +442,7 @@ impl ManagerCore {
             // completed report observable to waiters.
             lease.settlement_finished();
             if operation.publish_settlement((*report).clone()).is_ok() {
+                control.settlement_published();
                 if let Some(parent) = parent {
                     parent.record_child_settlement(operation_id, report);
                 }
@@ -437,8 +458,88 @@ impl ManagerCore {
         });
     }
 
+    fn dispatch_adapter_job(
+        self: &Arc<Self>,
+        scope: Arc<ScopeCore>,
+        control: Arc<ManagedOperationControl>,
+        execution: Box<dyn SubmissionPermit>,
+        job: OperationJob,
+        abandon: impl FnOnce() + Send + 'static,
+    ) -> Result<(), AdapterErrorKind> {
+        let commit_scope = Arc::clone(&scope);
+        let activate_scope = Arc::clone(&scope);
+        let adapter = AdapterReservation::new_with_gates(
+            Box::new(()),
+            move || commit_scope.commit_start(),
+            move || activate_scope.activate_start(),
+            move |payload| {
+                let Ok(job) = payload.downcast::<OperationJob>() else {
+                    return;
+                };
+                execution.dispatch(*job);
+            },
+            abandon,
+        );
+        let child = match adapter.attach(control, job) {
+            Ok(child) => child,
+            Err(error) => return Err(error.reason),
+        };
+        let permit = match child.commit() {
+            Ok(permit) => permit,
+            Err(error) => {
+                let reason = error.reason;
+                drop(error.payload);
+                return Err(reason);
+            }
+        };
+        match permit.activate() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let reason = error.reason;
+                drop(error.payload);
+                Err(reason)
+            }
+        }
+    }
+
+    fn abandon_reserved_operation<T: Send + 'static, E: Send + 'static>(
+        scope: Arc<ScopeCore>,
+        operation: Arc<OperationCore>,
+        slot: Arc<OutcomeSlot<T, E>>,
+        lease: Arc<dyn SubmissionLease>,
+        parent: Option<Arc<ScopeCore>>,
+        control: Arc<ManagedOperationControl>,
+    ) {
+        scope.abandon_start();
+        let operation_id = operation.id();
+        operation.set_execution(ExecutionPhase::Finished);
+        lease.execution_finished();
+        control.confirm_input_release(ChildRelease {
+            operation_id,
+            confirmed_at: None,
+        });
+        let callback_scope = Arc::clone(&scope);
+        scope.on_outcomes_ready(move || {
+            let outcome = OperationOutcome::Stopped(StopReport {
+                reason: callback_scope
+                    .context()
+                    .stop_reason()
+                    .unwrap_or(StopReason::ParentStopped),
+                accepted_at: None,
+            });
+            let summary = child_outcome_summary(operation_id, &outcome);
+            control.publish_outcome(summary.clone());
+            if let Some(parent) = parent {
+                let _ = parent.record_child_outcome(summary);
+            }
+            let _ = slot.publish(outcome);
+        });
+        scope.end();
+        scope.mark_body_finished();
+    }
+
     pub(crate) fn request_shutdown(&self, mode: crate::v02::report::ShutdownMode) -> ManagerPhase {
-        let (phase, scopes, services) = {
+        let (phase, scopes, services) = self.with_lifecycle_gate(|| {
             let mut state = lock(&self.state);
             match (state.phase, mode) {
                 (ManagerPhase::Open, crate::v02::report::ShutdownMode::Drain) => {
@@ -467,7 +568,7 @@ impl ManagerCore {
                 .map(ResourceScope::internal_clone)
                 .collect::<Vec<_>>();
             (state.phase, scopes, services)
-        };
+        });
         self.port.phase_changed(phase);
         if phase == ManagerPhase::Cancelling {
             for scope in scopes {
@@ -643,10 +744,16 @@ impl ManagerCore {
     }
 
     pub(crate) fn unconfirmed_recovery_count(&self) -> usize {
-        let handles = lock(&self.state).recoveries.values().cloned().collect::<Vec<_>>();
+        let handles = lock(&self.state)
+            .recoveries
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         handles
             .iter()
-            .filter(|handle| handle.snapshot().phase == crate::v02::report::RecoveryPhase::Unconfirmed)
+            .filter(|handle| {
+                handle.snapshot().phase == crate::v02::report::RecoveryPhase::Unconfirmed
+            })
             .count()
     }
 
@@ -921,18 +1028,20 @@ impl OperationManager {
             let body = lock(&body_for_job)
                 .take()
                 .expect("accepted body is present");
-            let (operation, slot, lease, parent) = lock(&parts_for_job)
+            let (operation, slot, lease, parent, control) = lock(&parts_for_job)
                 .take()
                 .expect("accepted runner capsule is present");
             let scope_core = Arc::clone(&scope.core);
             let operation_id = scope.id();
             let frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
+            operation.set_execution(ExecutionPhase::Running);
             let result = panic::catch_unwind(AssertUnwindSafe(|| body(scope)));
             operation.set_execution(ExecutionPhase::Finished);
             lease.execution_finished();
-            if let Some(parent) = &parent {
-                parent.child_input_released(operation_id);
-            }
+            control.confirm_input_release(ChildRelease {
+                operation_id,
+                confirmed_at: None,
+            });
             let callback_scope = Arc::clone(&scope_core);
             scope_core.on_outcomes_ready(move || {
                 let outcome = match result {
@@ -943,9 +1052,10 @@ impl OperationManager {
                         summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
                     }),
                 };
+                let summary = child_outcome_summary(operation_id, &outcome);
+                control.publish_outcome(summary.clone());
                 if let Some(parent) = parent {
-                    let _ =
-                        parent.record_child_outcome(child_outcome_summary(operation_id, &outcome));
+                    let _ = parent.record_child_outcome(summary);
                 }
                 let _ = slot.publish(outcome);
             });
@@ -965,7 +1075,6 @@ impl OperationManager {
                 }
             };
         let operation = OperationCore::new(id);
-        operation.set_execution(ExecutionPhase::Running);
         let slot = Arc::new(OutcomeSlot::new(Arc::clone(&operation)));
         let lease = Arc::clone(&reservation.lifecycle);
         slot.set_delivery_hook({
@@ -973,28 +1082,51 @@ impl OperationManager {
             move |delivery| lease.outcome_delivered(delivery)
         });
         let parent = scope.parent();
+        let control = ManagedOperationControl::new(Arc::clone(&operation), Arc::clone(&scope));
         self.core.register_settlement(
             Arc::clone(&scope),
             Arc::clone(&operation),
             Arc::clone(&lease),
+            Arc::clone(&control),
         );
         *lock(&parts) = Some((
             Arc::clone(&operation),
             Arc::clone(&slot),
             Arc::clone(&lease),
             parent,
+            Arc::clone(&control),
         ));
         let handle = OperationHandle::new(
-            operation,
-            slot,
-            Arc::new(ScopeStopControl(Arc::downgrade(&scope))),
+            Arc::clone(&operation),
+            Arc::clone(&slot),
+            Arc::clone(&control) as Arc<dyn StopControl>,
         );
         let core = Arc::clone(&self.core);
-        reservation
-            .execution
-            .dispatch(OperationJob::Sync(Box::new(move || {
+        let abandon_scope = Arc::clone(&scope);
+        let abandon_operation = Arc::clone(&operation);
+        let abandon_slot = Arc::clone(&slot);
+        let abandon_lease = Arc::clone(&lease);
+        let abandon_parent = scope.parent();
+        let abandon_control = Arc::clone(&control);
+        let execution = reservation.execution;
+        let _ = self.core.dispatch_adapter_job(
+            Arc::clone(&scope),
+            Arc::clone(&control),
+            execution,
+            OperationJob::Sync(Box::new(move || {
                 runner(OperationScope::new(scope, core));
-            })));
+            })),
+            move || {
+                ManagerCore::abandon_reserved_operation(
+                    abandon_scope,
+                    abandon_operation,
+                    abandon_slot,
+                    abandon_lease,
+                    abandon_parent,
+                    abandon_control,
+                );
+            },
+        );
         Ok(handle)
     }
 
@@ -1169,19 +1301,21 @@ impl AsyncOperationManager {
             let body = lock(&body_for_job)
                 .take()
                 .expect("accepted async body is present");
-            let (operation, slot, lease, parent) = lock(&parts_for_job)
+            let (operation, slot, lease, parent, control) = lock(&parts_for_job)
                 .take()
                 .expect("accepted async runner capsule is present");
             let scope_core = Arc::clone(&scope.core);
             let operation_id = scope.id();
             async move {
                 let frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
+                operation.set_execution(ExecutionPhase::Running);
                 let result = CatchUnwindFuture(Box::pin(body(scope))).await;
                 operation.set_execution(ExecutionPhase::Finished);
                 lease.execution_finished();
-                if let Some(parent) = &parent {
-                    parent.child_input_released(operation_id);
-                }
+                control.confirm_input_release(ChildRelease {
+                    operation_id,
+                    confirmed_at: None,
+                });
                 let callback_scope = Arc::clone(&scope_core);
                 scope_core.on_outcomes_ready(move || {
                     let outcome = match result {
@@ -1192,9 +1326,10 @@ impl AsyncOperationManager {
                             summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
                         }),
                     };
+                    let summary = child_outcome_summary(operation_id, &outcome);
+                    control.publish_outcome(summary.clone());
                     if let Some(parent) = parent {
-                        let _ = parent
-                            .record_child_outcome(child_outcome_summary(operation_id, &outcome));
+                        let _ = parent.record_child_outcome(summary);
                     }
                     let _ = slot.publish(outcome);
                 });
@@ -1217,7 +1352,6 @@ impl AsyncOperationManager {
                 }
             };
         let operation = OperationCore::new(id);
-        operation.set_execution(ExecutionPhase::Running);
         let slot = Arc::new(OutcomeSlot::new(Arc::clone(&operation)));
         let lease = Arc::clone(&reservation.lifecycle);
         slot.set_delivery_hook({
@@ -1225,26 +1359,52 @@ impl AsyncOperationManager {
             move |delivery| lease.outcome_delivered(delivery)
         });
         let parent = scope.parent();
+        let control = ManagedOperationControl::new(Arc::clone(&operation), Arc::clone(&scope));
         self.core.register_settlement(
             Arc::clone(&scope),
             Arc::clone(&operation),
             Arc::clone(&lease),
+            Arc::clone(&control),
         );
         *lock(&parts) = Some((
             Arc::clone(&operation),
             Arc::clone(&slot),
             Arc::clone(&lease),
             parent,
+            Arc::clone(&control),
         ));
         let handle = AsyncOperationHandle::new(
-            operation,
-            slot,
-            Arc::new(ScopeStopControl(Arc::downgrade(&scope))),
+            Arc::clone(&operation),
+            Arc::clone(&slot),
+            Arc::clone(&control) as Arc<dyn StopControl>,
         );
-        let future = runner(OperationScope::new(scope, Arc::clone(&self.core)));
-        reservation
-            .execution
-            .dispatch(OperationJob::Async(Box::pin(future)));
+        let future = runner(OperationScope::new(
+            Arc::clone(&scope),
+            Arc::clone(&self.core),
+        ));
+        let abandon_scope = Arc::clone(&scope);
+        let abandon_operation = Arc::clone(&operation);
+        let abandon_slot = Arc::clone(&slot);
+        let abandon_lease = Arc::clone(&lease);
+        let abandon_parent = scope.parent();
+        let abandon_control = Arc::clone(&control);
+        let execution = reservation.execution;
+        let _ = self.core.dispatch_adapter_job(
+            Arc::clone(&scope),
+            Arc::clone(&control),
+            execution,
+            OperationJob::Async(Box::pin(future)),
+            move || {
+                ManagerCore::abandon_reserved_operation(
+                    abandon_scope,
+                    abandon_operation,
+                    abandon_slot,
+                    abandon_lease,
+                    abandon_parent,
+                    abandon_control,
+                );
+            },
+        );
         Ok(handle)
     }
 
@@ -1311,6 +1471,7 @@ type RunnerParts<T, E> = (
     Arc<OutcomeSlot<T, E>>,
     Arc<dyn SubmissionLease>,
     Option<Arc<ScopeCore>>,
+    Arc<ManagedOperationControl>,
 );
 
 struct CatchUnwindFuture<F>(Pin<Box<F>>);
@@ -1323,15 +1484,6 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
             Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
             Ok(Poll::Pending) => Poll::Pending,
             Err(payload) => Poll::Ready(Err(payload)),
-        }
-    }
-}
-
-struct ScopeStopControl(Weak<ScopeCore>);
-impl StopControl for ScopeStopControl {
-    fn request_stop(&self, reason: StopReason) {
-        if let Some(scope) = self.0.upgrade() {
-            scope.request_stop(reason);
         }
     }
 }
