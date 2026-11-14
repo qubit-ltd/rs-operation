@@ -1,0 +1,1 @@
+//! Single-assignment outcome state.

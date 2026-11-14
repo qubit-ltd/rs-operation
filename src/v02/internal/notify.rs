@@ -1,0 +1,1 @@
+//! Reliable generation-based notifications.
