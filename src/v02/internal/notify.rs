@@ -12,11 +12,6 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 
-use crate::report::ObservationError;
-
-/// Maximum number of asynchronous waiters retained by one notification source.
-pub(crate) const ASYNC_WAITER_CAPACITY: usize = 64;
-
 /// A latched notification source for blocking and asynchronous observers.
 pub(crate) struct Notify {
     inner: Arc<Inner>,
@@ -99,12 +94,12 @@ pub(crate) struct Notified {
 }
 
 impl Future for Notified {
-    type Output = Result<(), ObservationError>;
+    type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let Some(inner) = self.inner.upgrade() else {
             self.waiter_id = None;
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(());
         };
         let id = *self
             .waiter_id
@@ -113,7 +108,7 @@ impl Future for Notified {
         // not run while the waiter-list lock is held.
         let mut new_waker = Some(context.waker().clone());
         let mut removed_waker = None;
-        let result = {
+        let changed = {
             let mut state = lock(&inner.state);
             if state.generation != self.generation {
                 if let Some(index) = state
@@ -123,7 +118,7 @@ impl Future for Notified {
                 {
                     removed_waker = Some(state.waiters.swap_remove(index).1);
                 }
-                Ok(true)
+                true
             } else if let Some((_, existing)) = state
                 .waiters
                 .iter_mut()
@@ -135,26 +130,22 @@ impl Future for Notified {
                         new_waker.take().expect("new waker is present"),
                     ));
                 }
-                Ok(false)
-            } else if state.waiters.len() >= ASYNC_WAITER_CAPACITY {
-                Err(ObservationError::WaiterCapacityExceeded)
+                false
             } else {
                 state
                     .waiters
                     .push((id, new_waker.take().expect("new waker is present")));
-                Ok(false)
+                false
             }
         };
         // Waker drop can also run user-defined code.
         drop(removed_waker);
         drop(new_waker);
-        match result {
-            Ok(true) => {
-                self.waiter_id = None;
-                Poll::Ready(Ok(()))
-            }
-            Ok(false) => Poll::Pending,
-            Err(error) => Poll::Ready(Err(error)),
+        if changed {
+            self.waiter_id = None;
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
     }
 }
@@ -229,7 +220,7 @@ mod tests {
         }
     }
 
-    fn poll_once(future: Pin<&mut Notified>, waker: &Waker) -> Poll<Result<(), ObservationError>> {
+    fn poll_once(future: Pin<&mut Notified>, waker: &Waker) -> Poll<()> {
         let mut context = Context::from_waker(waker);
         future.poll(&mut context)
     }

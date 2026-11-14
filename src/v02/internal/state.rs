@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 
-use crate::report::{
-    MonotonicTime, ObservationError, OperationOutcome, SettlementReport, StopReason, StopReport,
-};
 use crate::v02::internal::notify::Notify;
+use crate::v02::protocol::MonotonicTime;
+use crate::v02::report::{
+    OperationOutcome, OutcomeError, SettlementReport, StopReason, StopReport,
+};
 
 /// Single-consumer business-result state plus independently published lifecycle facts.
 pub(crate) struct StateCell<T, E> {
@@ -46,7 +47,7 @@ impl<T, E> StateCell<T, E> {
     }
 
     /// Takes a ready result or reports the terminal state preventing access.
-    pub(crate) fn take_if_ready(&self) -> Result<Option<OperationOutcome<T, E>>, ObservationError> {
+    pub(crate) fn take_if_ready(&self) -> Result<Option<OperationOutcome<T, E>>, OutcomeError> {
         let mut state = lock(&self.state);
         match std::mem::replace(&mut state.result, ResultSlot::Taken) {
             ResultSlot::Pending => {
@@ -56,11 +57,11 @@ impl<T, E> StateCell<T, E> {
             ResultSlot::Ready(result) => Ok(Some(result)),
             ResultSlot::Taken => {
                 state.result = ResultSlot::Taken;
-                Err(ObservationError::AlreadyTaken)
+                Err(OutcomeError::AlreadyTaken)
             }
             ResultSlot::Discarded => {
                 state.result = ResultSlot::Discarded;
-                Err(ObservationError::ResultDiscarded)
+                Err(OutcomeError::Discarded)
             }
         }
     }
@@ -116,7 +117,7 @@ impl<T, E> StateCell<T, E> {
     }
 
     /// Takes the outcome once, blocking until it is published.
-    pub(crate) fn take_result_blocking(&self) -> Result<OperationOutcome<T, E>, ObservationError> {
+    pub(crate) fn take_result_blocking(&self) -> Result<OperationOutcome<T, E>, OutcomeError> {
         loop {
             let generation = self.changed.generation();
             if let Some(result) = self.take_if_ready()? {
@@ -192,7 +193,7 @@ pub(crate) struct ResultFuture<'a, T, E> {
 }
 
 impl<T, E> Future for ResultFuture<'_, T, E> {
-    type Output = Result<OperationOutcome<T, E>, ObservationError>;
+    type Output = Result<OperationOutcome<T, E>, OutcomeError>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
@@ -207,8 +208,7 @@ impl<T, E> Future for ResultFuture<'_, T, E> {
             }
             match Pin::new(self.notification.as_mut().expect("notification was set")).poll(context)
             {
-                Poll::Ready(Ok(())) => self.notification = None,
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(()) => self.notification = None,
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -224,7 +224,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::OperationOutcome;
+    use crate::v02::report::OperationOutcome;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::sync::Weak;
@@ -284,10 +284,7 @@ mod tests {
             .publish(outcome)
             .expect_err("discarded delivery must reject publication");
         assert!(matches!(returned, OperationOutcome::Succeeded(value) if *value == 17));
-        assert_eq!(
-            cell.take_if_ready().unwrap_err(),
-            ObservationError::ResultDiscarded
-        );
+        assert_eq!(cell.take_if_ready().unwrap_err(), OutcomeError::Discarded);
     }
 
     #[test]
@@ -305,7 +302,7 @@ mod tests {
         }
         assert_eq!(
             cell.take_if_ready().unwrap_err(),
-            ObservationError::AlreadyTaken
+            OutcomeError::AlreadyTaken
         );
     }
 }
