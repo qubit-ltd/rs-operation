@@ -198,10 +198,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use crate::v02::report::OperationOutcome;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::sync::Weak;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     struct LockCheckingDrop {
         cell: Weak<StateCell<LockCheckingDrop, ()>>,
@@ -239,9 +239,10 @@ mod tests {
         assert!(future.as_mut().poll(&mut context).is_pending());
         drop(future);
 
-        assert!(cell
-            .publish(OperationOutcome::Succeeded(Box::new(91)))
-            .is_ok());
+        assert!(
+            cell.publish(OperationOutcome::Succeeded(Box::new(91)))
+                .is_ok()
+        );
         let outcome = cell
             .take_if_ready()
             .expect("cancelled observation must not take result")

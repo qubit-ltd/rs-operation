@@ -9,10 +9,8 @@ pub(crate) trait CleanupJob: Send + 'static {
     ///
     /// On admission failure, returns the same job intact so the reserved
     /// dispatch slot can keep it pending without dropping the resource.
-    fn schedule(
-        self: Box<Self>,
-        executor: Arc<CleanupExecutor>,
-    ) -> Result<(), Box<dyn CleanupJob>>;
+    fn schedule(self: Box<Self>, executor: Arc<CleanupExecutor>)
+    -> Result<(), Box<dyn CleanupJob>>;
 }
 
 /// Reserves bounded storage for one resource's eventual cleanup handoff.
