@@ -85,9 +85,17 @@ pub(crate) trait SubmissionPort: Send + Sync + 'static {
 
     fn phase_changed(&self, _phase: ManagerPhase) {}
     fn finish_shutdown(&self) {}
+    fn queued_operation_count(&self) -> usize { 0 }
     fn service_resource_scope(
         &self,
         _capacity: usize,
+    ) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
+        Err(crate::v02::report::ResourceScopeError::InvalidOptions)
+    }
+    fn operation_resource_scope(
+        &self,
+        _id: crate::v02::report::ResourceScopeId,
+        _capacity: Arc<ScopeCapacity>,
     ) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
         Err(crate::v02::report::ResourceScopeError::InvalidOptions)
     }
@@ -105,6 +113,10 @@ struct ManagerState {
     phase: ManagerPhase,
     active_scopes: std::collections::HashMap<OperationId, Weak<ScopeCore>>,
     service_scopes: std::collections::HashMap<crate::v02::report::ResourceScopeId, ResourceScope>,
+    recoveries: std::collections::HashMap<
+        crate::v02::report::RecoveryId,
+        crate::v02::report::RecoveryHandle,
+    >,
     #[cfg(test)]
     relationships: Vec<(OperationId, Option<OperationId>)>,
     #[cfg(test)]
@@ -143,6 +155,7 @@ impl ManagerCore {
                 phase: ManagerPhase::Open,
                 active_scopes: std::collections::HashMap::new(),
                 service_scopes: std::collections::HashMap::new(),
+                recoveries: std::collections::HashMap::new(),
                 #[cfg(test)]
                 relationships: Vec::new(),
                 #[cfg(test)]
@@ -232,6 +245,7 @@ impl ManagerCore {
             Ok(permit) => permit,
             Err(reason) => return Err(SubmitError::new(reason, body)),
         };
+        self.track_resource_recoveries(&permit.resource_scope, group.cloned());
         let scope_core = ScopeCore::new(
             id,
             Arc::downgrade(self),
@@ -495,6 +509,7 @@ impl ManagerCore {
         group: Option<Arc<super::group::GroupCore>>,
     ) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
         let scope = self.port.service_resource_scope(capacity)?;
+        self.track_resource_recoveries(&scope, group.clone());
         let id = scope.id();
         let manager = Arc::downgrade(self);
         let group_callback = group.clone();
@@ -530,10 +545,37 @@ impl ManagerCore {
         Ok(scope)
     }
 
+    pub(crate) fn operation_resource_scope(
+        self: &Arc<Self>,
+        owner: &Arc<ScopeCore>,
+        options: crate::v02::report::ResourceScopeOptions,
+    ) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
+        if options.capacity == 0 {
+            return Err(crate::v02::report::ResourceScopeError::InvalidOptions);
+        }
+        if !owner.is_open() {
+            return Err(crate::v02::report::ResourceScopeError::ScopeEnded);
+        }
+        let id = crate::v02::report::ResourceScopeId::new_unique();
+        let capacity = Arc::new(owner.capacity().resource_scope_for(id, options.capacity));
+        let resource_scope = self.port.operation_resource_scope(id, capacity)?;
+        self.track_resource_recoveries(&resource_scope, owner.group().cloned());
+        match owner.attach_resource_scope(resource_scope.internal_clone()) {
+            Ok(()) => Ok(resource_scope),
+            Err(resource_scope) => {
+                resource_scope.end();
+                Err(crate::v02::report::ResourceScopeError::ScopeEnded)
+            }
+        }
+    }
+
     pub(crate) fn shutdown_wait_for(&self, timeout: std::time::Duration) -> bool {
         let until = std::time::Instant::now() + timeout;
         let mut state = lock(&self.state);
-        while !state.active_scopes.is_empty() || !state.service_scopes.is_empty() {
+        while !state.active_scopes.is_empty()
+            || !state.service_scopes.is_empty()
+            || !state.recoveries.is_empty()
+        {
             let now = std::time::Instant::now();
             if now >= until {
                 return false;
@@ -544,7 +586,9 @@ impl ManagerCore {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state = next;
             if result.timed_out()
-                && (!state.active_scopes.is_empty() || !state.service_scopes.is_empty())
+                && (!state.active_scopes.is_empty()
+                    || !state.service_scopes.is_empty()
+                    || !state.recoveries.is_empty())
             {
                 return false;
             }
@@ -552,6 +596,21 @@ impl ManagerCore {
         drop(state);
         self.finish_shutdown();
         true
+    }
+
+    pub(crate) fn shutdown_wait_blocking(&self) {
+        let mut state = lock(&self.state);
+        while !state.active_scopes.is_empty()
+            || !state.service_scopes.is_empty()
+            || !state.recoveries.is_empty()
+        {
+            state = self
+                .shutdown_changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(state);
+        self.finish_shutdown();
     }
 
     pub(crate) async fn shutdown_wait(&self) {
@@ -570,11 +629,29 @@ impl ManagerCore {
 
     pub(crate) fn is_shutdown_empty(&self) -> bool {
         let state = lock(&self.state);
-        state.active_scopes.is_empty() && state.service_scopes.is_empty()
+        state.active_scopes.is_empty()
+            && state.service_scopes.is_empty()
+            && state.recoveries.is_empty()
     }
 
     pub(crate) fn service_scope_count(&self) -> usize {
         lock(&self.state).service_scopes.len()
+    }
+
+    pub(crate) fn recovery_group_count(&self) -> usize {
+        lock(&self.state).recoveries.len()
+    }
+
+    pub(crate) fn unconfirmed_recovery_count(&self) -> usize {
+        let handles = lock(&self.state).recoveries.values().cloned().collect::<Vec<_>>();
+        handles
+            .iter()
+            .filter(|handle| handle.snapshot().phase == crate::v02::report::RecoveryPhase::Unconfirmed)
+            .count()
+    }
+
+    pub(crate) fn queued_operation_count(&self) -> usize {
+        self.port.queued_operation_count()
     }
 
     pub(crate) fn cleaning_resource_count(&self) -> usize {
@@ -601,6 +678,37 @@ impl ManagerCore {
                 .iter()
                 .map(ResourceScope::cleanup_in_flight)
                 .sum::<usize>()
+    }
+
+    fn track_resource_recoveries(
+        self: &Arc<Self>,
+        scope: &ResourceScope,
+        group: Option<Arc<super::group::GroupCore>>,
+    ) {
+        let manager = Arc::downgrade(self);
+        let group_callback = group.as_ref().map(Arc::downgrade);
+        scope.set_recovery_callback(Arc::new(
+            move |handle: crate::v02::report::RecoveryHandle, active: bool| {
+                if let Some(group) = group_callback.as_ref().and_then(Weak::upgrade) {
+                    group.recovery_changed(handle.clone(), active);
+                }
+                let Some(manager) = manager.upgrade() else {
+                    return;
+                };
+                let id = handle.id();
+                let removed = {
+                    let mut state = lock(&manager.state);
+                    if active {
+                        state.recoveries.insert(id, handle)
+                    } else {
+                        state.recoveries.remove(&id)
+                    }
+                };
+                drop(removed);
+                manager.shutdown_changed.notify_all();
+                manager.shutdown_notify.notify_waiters();
+            },
+        ));
     }
 
     async fn wait_for_retry_capacity(
@@ -714,8 +822,20 @@ impl OperationManager {
             .map(crate::v02::resource::service::ServiceResourceScope::new)
     }
 
+    pub(crate) fn operation_resource_scope(
+        &self,
+        owner: &Arc<ScopeCore>,
+        options: crate::v02::report::ResourceScopeOptions,
+    ) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
+        self.core.operation_resource_scope(owner, options)
+    }
+
     pub(crate) fn bound(core: Arc<ManagerCore>, scope: &Arc<ScopeCore>) -> Self {
         core.bound(scope)
+    }
+
+    pub(crate) fn core_arc(&self) -> Arc<ManagerCore> {
+        Arc::clone(&self.core)
     }
 
     pub(crate) fn with_group(mut self, group: Arc<super::group::GroupCore>) -> Self {
@@ -891,6 +1011,49 @@ impl OperationManager {
         self.try_submit(options, body)
     }
 
+    pub fn run<T, E, F>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<OperationOutcome<T, E>, crate::v02::report::RunError<F>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(OperationScope) -> Result<T, E> + Send + 'static,
+    {
+        let mut operation = self
+            .submit(options, body)
+            .map_err(crate::v02::report::RunError::Submit)?;
+        operation
+            .wait_outcome()
+            .map_err(crate::v02::report::RunError::Outcome)
+    }
+
+    pub fn run_and_settle<T, E, F>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<crate::v02::report::OperationCompletion<T, E>, crate::v02::report::RunError<F>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(OperationScope) -> Result<T, E> + Send + 'static,
+    {
+        let mut operation = self
+            .submit(options, body)
+            .map_err(crate::v02::report::RunError::Submit)?;
+        let outcome = operation
+            .wait_outcome()
+            .map_err(crate::v02::report::RunError::Outcome)?;
+        let settlement = operation
+            .wait_settlement()
+            .map_err(crate::v02::report::RunError::Observation)?;
+        Ok(crate::v02::report::OperationCompletion {
+            outcome,
+            settlement,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn try_submit_body<F>(&self, body: F) -> Result<OperationId, SubmitError<F>>
     where
@@ -934,8 +1097,8 @@ impl AsyncOperationManager {
     pub fn request_shutdown(
         &self,
         mode: crate::v02::report::ShutdownMode,
-    ) -> crate::v02::manager::shutdown::ShutdownHandle {
-        self.as_sync().request_shutdown(mode)
+    ) -> crate::v02::manager::shutdown::AsyncShutdownHandle {
+        self.as_sync().request_shutdown(mode).as_async()
     }
 
     /// Returns the corresponding sync view without changing its target.
@@ -1083,6 +1246,53 @@ impl AsyncOperationManager {
             .execution
             .dispatch(OperationJob::Async(Box::pin(future)));
         Ok(handle)
+    }
+
+    pub async fn run<T, E, F, Fut>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<OperationOutcome<T, E>, crate::v02::report::RunError<F>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(OperationScope) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+    {
+        let mut operation = self
+            .submit(options, body)
+            .await
+            .map_err(crate::v02::report::RunError::Submit)?;
+        operation
+            .wait_outcome()
+            .await
+            .map_err(crate::v02::report::RunError::Outcome)
+    }
+
+    pub async fn run_and_settle<T, E, F, Fut>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<crate::v02::report::OperationCompletion<T, E>, crate::v02::report::RunError<F>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(OperationScope) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+    {
+        let mut operation = self
+            .submit(options, body)
+            .await
+            .map_err(crate::v02::report::RunError::Submit)?;
+        let outcome = operation
+            .wait_outcome()
+            .await
+            .map_err(crate::v02::report::RunError::Outcome)?;
+        let settlement = operation.wait_settlement().await;
+        Ok(crate::v02::report::OperationCompletion {
+            outcome,
+            settlement,
+        })
     }
 
     #[cfg(test)]

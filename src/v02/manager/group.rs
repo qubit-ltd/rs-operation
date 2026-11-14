@@ -18,9 +18,14 @@ struct GroupState {
         crate::v02::report::OperationId,
         Weak<crate::v02::scope::ScopeCore>,
     >,
+    queued: std::collections::HashSet<crate::v02::report::OperationId>,
     services: std::collections::HashMap<
         crate::v02::report::ResourceScopeId,
         crate::v02::resource::ResourceScope,
+    >,
+    recoveries: std::collections::HashMap<
+        crate::v02::report::RecoveryId,
+        crate::v02::report::RecoveryHandle,
     >,
 }
 
@@ -44,7 +49,9 @@ impl GroupCore {
                 active: 0,
                 mode: crate::v02::report::ShutdownMode::Drain,
                 scopes: std::collections::HashMap::new(),
+                queued: std::collections::HashSet::new(),
                 services: std::collections::HashMap::new(),
+                recoveries: std::collections::HashMap::new(),
             }),
             changed: Condvar::new(),
             notify: crate::v02::internal::notify::Notify::new(),
@@ -86,7 +93,12 @@ impl GroupCore {
             return false;
         }
         state.scopes.insert(id, scope);
+        state.queued.insert(id);
         true
+    }
+
+    pub(crate) fn execution_started(&self, id: crate::v02::report::OperationId) {
+        lock(&self.state).queued.remove(&id);
     }
 
     pub(crate) fn settlement_finished(&self, id: crate::v02::report::OperationId) {
@@ -94,7 +106,9 @@ impl GroupCore {
     }
 
     pub(crate) fn unregister_scope(&self, id: crate::v02::report::OperationId) {
-        lock(&self.state).scopes.remove(&id);
+        let mut state = lock(&self.state);
+        state.scopes.remove(&id);
+        state.queued.remove(&id);
     }
 
     fn begin_shutdown(&self, mode: crate::v02::report::ShutdownMode) {
@@ -136,9 +150,9 @@ impl GroupCore {
         self.notify.notify_waiters();
     }
 
-    fn wait_blocking(&self) {
+    pub(crate) fn wait_blocking(&self) {
         let mut state = lock(&self.state);
-        while state.active != 0 || !state.services.is_empty() {
+        while state.active != 0 || !state.services.is_empty() || !state.recoveries.is_empty() {
             state = self
                 .changed
                 .wait(state)
@@ -146,16 +160,68 @@ impl GroupCore {
         }
     }
 
-    async fn wait(&self) {
+    pub(crate) async fn wait(&self) {
         loop {
             let generation = self.notify.generation();
             {
                 let state = lock(&self.state);
-                if state.active == 0 && state.services.is_empty() {
+                if state.active == 0 && state.services.is_empty() && state.recoveries.is_empty() {
                     return;
                 }
             }
             self.notify.notified_since(generation).await;
+        }
+    }
+
+    pub(crate) fn mode(&self) -> crate::v02::report::ShutdownMode {
+        lock(&self.state).mode
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        let state = lock(&self.state);
+        state.active == 0 && state.services.is_empty() && state.recoveries.is_empty()
+    }
+
+    pub(crate) fn wait_for(&self, timeout: std::time::Duration) -> bool {
+        let until = std::time::Instant::now() + timeout;
+        let mut state = lock(&self.state);
+        while state.active != 0 || !state.services.is_empty() || !state.recoveries.is_empty() {
+            let now = std::time::Instant::now();
+            if now >= until {
+                return false;
+            }
+            let (next, result) = self
+                .changed
+                .wait_timeout(state, until.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+            if result.timed_out()
+                && (state.active != 0 || !state.services.is_empty() || !state.recoveries.is_empty())
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn shutdown_snapshot(&self) -> crate::v02::report::ShutdownSnapshot {
+        let (recovery_count, unconfirmed_count) = {
+            let handles = lock(&self.state).recoveries.values().cloned().collect::<Vec<_>>();
+            let unconfirmed = handles
+                .iter()
+                .filter(|handle| {
+                    handle.snapshot().phase == crate::v02::report::RecoveryPhase::Unconfirmed
+                })
+                .count();
+            (handles.len(), unconfirmed)
+        };
+        crate::v02::report::ShutdownSnapshot {
+            active_operations: self.snapshot().1,
+            queued_operations: lock(&self.state).queued.len(),
+            unconfirmed_users: unconfirmed_count,
+            cleaning_resources: self.cleaning_count(),
+            recovery_groups: recovery_count,
+            service_resources: self.service_count(),
         }
     }
 
@@ -215,7 +281,26 @@ impl GroupCore {
     }
 
     pub(crate) fn service_finished(&self, id: crate::v02::report::ResourceScopeId) {
-        lock(&self.state).services.remove(&id);
+        let removed = lock(&self.state).services.remove(&id);
+        drop(removed);
+        self.changed.notify_all();
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn recovery_changed(
+        &self,
+        handle: crate::v02::report::RecoveryHandle,
+        active: bool,
+    ) {
+        let removed = {
+            let mut state = lock(&self.state);
+            if active {
+                state.recoveries.insert(handle.id(), handle)
+            } else {
+                state.recoveries.remove(&handle.id())
+            }
+        };
+        drop(removed);
         self.changed.notify_all();
         self.notify.notify_waiters();
     }
@@ -278,6 +363,7 @@ impl SubmissionLease for GroupLease {
 }
 
 /// A bounded submission group with its own shutdown boundary.
+#[derive(Clone)]
 pub struct OperationGroup {
     manager: OperationManager,
     core: Arc<GroupCore>,
@@ -305,6 +391,12 @@ impl OperationGroup {
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    pub fn as_async(&self) -> AsyncOperationGroup {
+        AsyncOperationGroup {
+            group: self.clone(),
+        }
     }
 
     pub fn snapshot(&self) -> GroupSnapshot {
@@ -357,6 +449,32 @@ impl OperationGroup {
         self.manager.as_async().try_submit(options, body)
     }
 
+    pub fn run<F, T, E>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<crate::v02::report::OperationOutcome<T, E>, crate::v02::report::RunError<F>>
+    where
+        F: FnOnce(crate::v02::scope::OperationScope) -> Result<T, E> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.manager.run(options, body)
+    }
+
+    pub fn run_and_settle<F, T, E>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<crate::v02::report::OperationCompletion<T, E>, crate::v02::report::RunError<F>>
+    where
+        F: FnOnce(crate::v02::scope::OperationScope) -> Result<T, E> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.manager.run_and_settle(options, body)
+    }
+
     pub fn resource_scope(
         &self,
         options: crate::v02::report::ServiceResourceOptions,
@@ -367,56 +485,108 @@ impl OperationGroup {
         self.manager.service_resource_scope(options.capacity)
     }
 
-    pub fn request_shutdown(&self, mode: crate::v02::report::ShutdownMode) -> GroupShutdownHandle {
+    pub fn request_shutdown(
+        &self,
+        mode: crate::v02::report::ShutdownMode,
+    ) -> crate::v02::manager::shutdown::ShutdownHandle {
         self.core.begin_shutdown(mode);
-        GroupShutdownHandle {
-            core: Arc::clone(&self.core),
-        }
+        crate::v02::manager::shutdown::ShutdownHandle::for_group(
+            self.manager.core_arc(),
+            Arc::clone(&self.core),
+        )
     }
 }
 
+/// Async submission view over the same group target and local lifecycle state.
 #[derive(Clone)]
-pub struct GroupShutdownHandle {
-    core: Arc<GroupCore>,
+pub struct AsyncOperationGroup {
+    group: OperationGroup,
 }
 
-impl GroupShutdownHandle {
-    pub fn snapshot(&self) -> crate::v02::report::ShutdownSnapshot {
-        let active = self.core.snapshot().1;
-        crate::v02::report::ShutdownSnapshot {
-            active_operations: active,
-            queued_operations: 0,
-            unconfirmed_users: 0,
-            cleaning_resources: self.core.cleaning_count(),
-            recovery_groups: 0,
-            service_resources: self.core.service_count(),
-        }
+impl AsyncOperationGroup {
+    pub fn as_sync(&self) -> OperationGroup {
+        self.group.clone()
     }
 
-    pub async fn wait(&self) -> crate::v02::report::ShutdownReport {
-        self.core.wait().await;
-        crate::v02::report::ShutdownReport {
-            snapshot: self.snapshot(),
-        }
+    pub fn snapshot(&self) -> GroupSnapshot {
+        self.group.snapshot()
     }
 
-    pub fn blocking(&self) -> BlockingGroupShutdown {
-        BlockingGroupShutdown {
-            handle: self.clone(),
-        }
+    pub fn try_submit<F, Fut, T, E>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<AsyncOperationHandle<T, E>, SubmitError<F>>
+    where
+        F: FnOnce(crate::v02::scope::OperationScope) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.group.manager.as_async().try_submit(options, body)
     }
-}
 
-pub struct BlockingGroupShutdown {
-    handle: GroupShutdownHandle,
-}
+    pub async fn submit<F, Fut, T, E>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<AsyncOperationHandle<T, E>, SubmitError<F>>
+    where
+        F: FnOnce(crate::v02::scope::OperationScope) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.group.manager.as_async().submit(options, body).await
+    }
 
-impl BlockingGroupShutdown {
-    pub fn wait(&self) -> crate::v02::report::ShutdownReport {
-        self.handle.core.wait_blocking();
-        crate::v02::report::ShutdownReport {
-            snapshot: self.handle.snapshot(),
-        }
+    pub async fn run<F, Fut, T, E>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<crate::v02::report::OperationOutcome<T, E>, crate::v02::report::RunError<F>>
+    where
+        F: FnOnce(crate::v02::scope::OperationScope) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.group.manager.as_async().run(options, body).await
+    }
+
+    pub async fn run_and_settle<F, Fut, T, E>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<crate::v02::report::OperationCompletion<T, E>, crate::v02::report::RunError<F>>
+    where
+        F: FnOnce(crate::v02::scope::OperationScope) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.group
+            .manager
+            .as_async()
+            .run_and_settle(options, body)
+            .await
+    }
+
+    pub fn resource_scope(
+        &self,
+        options: crate::v02::report::ServiceResourceOptions,
+    ) -> Result<
+        crate::v02::resource::service::ServiceResourceScope,
+        crate::v02::report::ResourceScopeError,
+    > {
+        self.group.resource_scope(options)
+    }
+
+    pub fn request_shutdown(
+        &self,
+        mode: crate::v02::report::ShutdownMode,
+    ) -> crate::v02::manager::shutdown::AsyncShutdownHandle {
+        self.group.request_shutdown(mode).as_async()
     }
 }
 
@@ -468,6 +638,17 @@ mod tests {
                 .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn sync_group_run_and_settle_uses_group_target() {
+        let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+        let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
+        let completion = group
+            .run_and_settle(OperationOptions::default(), |_| Ok::<_, ()>(91usize))
+            .unwrap();
+        assert!(matches!(completion.outcome, OperationOutcome::Succeeded(91)));
+        assert!(completion.settlement.all_released());
     }
 
     #[test]
@@ -533,6 +714,37 @@ mod tests {
             OperationOutcome::Stopped(_)
         ));
         operation.wait_settlement().unwrap();
-        shutdown.blocking().wait();
+        shutdown.wait().unwrap();
+    }
+
+    #[test]
+    fn async_group_keeps_group_target_and_local_shutdown() {
+        let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+        let sync_group = manager.group(GroupOptions { capacity: 1 }).unwrap();
+        let async_group = sync_group.as_async();
+        let mut operation = async_group
+            .try_submit(OperationOptions::default(), |_| async {
+                Ok::<_, ()>(73usize)
+            })
+            .unwrap()
+            .into_sync();
+        assert!(matches!(
+            operation.wait_outcome().unwrap(),
+            OperationOutcome::Succeeded(73)
+        ));
+        operation.wait_settlement().unwrap();
+        let shutdown = async_group.request_shutdown(crate::v02::report::ShutdownMode::Drain);
+        assert!(matches!(
+            shutdown
+                .as_sync()
+                .wait_for(std::time::Duration::from_secs(2))
+                .unwrap(),
+            crate::v02::report::ShutdownWait::Completed(_)
+        ));
+        assert!(
+            manager
+                .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()))
+                .is_ok()
+        );
     }
 }

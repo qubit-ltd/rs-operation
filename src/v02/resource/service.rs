@@ -68,7 +68,7 @@ mod tests {
         assert_eq!(shutdown.snapshot().service_resources, 1);
         assert!(drop_rx.try_recv().is_err());
         assert!(matches!(
-            shutdown.blocking().wait_for(Duration::ZERO),
+            shutdown.wait_for(Duration::ZERO).unwrap(),
             crate::v02::report::ShutdownWait::Pending(_)
         ));
         drop(held);
@@ -76,7 +76,7 @@ mod tests {
             .recv()
             .expect("last service reference enables cleanup");
         assert!(matches!(
-            shutdown.blocking().wait_for(Duration::from_secs(2)),
+            shutdown.wait_for(Duration::from_secs(2)).unwrap(),
             crate::v02::report::ShutdownWait::Completed(_)
         ));
         assert_eq!(group.snapshot().service_resource_scopes, 0);
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(observed, vec![0, 1, 2]);
         let shutdown = manager.request_shutdown(ShutdownMode::Drain);
         assert!(matches!(
-            shutdown.blocking().wait_for(Duration::from_secs(2)),
+            shutdown.wait_for(Duration::from_secs(2)).unwrap(),
             crate::v02::report::ShutdownWait::Completed(_)
         ));
     }

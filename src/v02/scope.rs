@@ -672,9 +672,13 @@ impl OperationScope {
         OperationManager::bound(manager, &self.core)
     }
 
-    /// Returns the business resource scope attached to this execution frame.
-    pub fn resource_scope(&self) -> crate::v02::resource::ResourceScope {
-        self.core.resource_scope().internal_clone()
+    /// Creates an independently bounded resource scope attached to this
+    /// operation. Its cleanup report participates in operation settlement.
+    pub fn resource_scope(
+        &self,
+        options: crate::v02::report::ResourceScopeOptions,
+    ) -> Result<crate::v02::resource::ResourceScope, crate::v02::report::ResourceScopeError> {
+        self.manager.operation_resource_scope(&self.core, options)
     }
 
     /// Registers a resource in this operation's real cleanup scope.
@@ -720,6 +724,9 @@ pub(crate) struct ExecutionFrameGuard {
 }
 impl ExecutionFrameGuard {
     pub(crate) fn new(scope: Arc<ScopeCore>) -> Self {
+        if let Some(group) = scope.group() {
+            group.execution_started(scope.id());
+        }
         Self { scope }
     }
 }

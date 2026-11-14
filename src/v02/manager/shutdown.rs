@@ -14,55 +14,125 @@ use std::time::Duration;
 /// A durable observer for the manager-wide shutdown already in progress.
 #[derive(Clone)]
 pub struct ShutdownHandle {
-    core: Arc<ManagerCore>,
+    target: ShutdownTarget,
+}
+
+#[derive(Clone)]
+enum ShutdownTarget {
+    Manager(Arc<ManagerCore>),
+    Group(Arc<ManagerCore>, Arc<super::group::GroupCore>),
 }
 
 impl ShutdownHandle {
     pub(crate) fn new(core: Arc<ManagerCore>) -> Self {
-        Self { core }
+        Self {
+            target: ShutdownTarget::Manager(core),
+        }
+    }
+
+    pub(crate) fn for_group(core: Arc<ManagerCore>, group: Arc<super::group::GroupCore>) -> Self {
+        Self {
+            target: ShutdownTarget::Group(core, group),
+        }
+    }
+
+    fn manager(&self) -> &Arc<ManagerCore> {
+        match &self.target {
+            ShutdownTarget::Manager(core) | ShutdownTarget::Group(core, _) => core,
+        }
     }
 
     pub fn mode(&self) -> ShutdownMode {
-        match self.core.phase() {
-            ManagerPhase::Cancelling | ManagerPhase::Closed => ShutdownMode::Cancel,
-            ManagerPhase::Open | ManagerPhase::Draining => ShutdownMode::Drain,
+        match &self.target {
+            ShutdownTarget::Manager(core) => match core.phase() {
+                ManagerPhase::Cancelling | ManagerPhase::Closed => ShutdownMode::Cancel,
+                ManagerPhase::Open | ManagerPhase::Draining => ShutdownMode::Drain,
+            },
+            ShutdownTarget::Group(_, group) => group.mode(),
         }
     }
 
     pub fn snapshot(&self) -> ShutdownSnapshot {
-        let active = self.core.active_scope_count();
-        ShutdownSnapshot {
-            active_operations: active,
-            queued_operations: 0,
-            unconfirmed_users: 0,
-            cleaning_resources: self.core.cleaning_resource_count(),
-            recovery_groups: 0,
-            service_resources: self.core.service_scope_count(),
+        match &self.target {
+            ShutdownTarget::Manager(core) => ShutdownSnapshot {
+                active_operations: core.active_scope_count(),
+                queued_operations: core.queued_operation_count(),
+                unconfirmed_users: core.unconfirmed_recovery_count(),
+                cleaning_resources: core.cleaning_resource_count(),
+                recovery_groups: core.recovery_group_count(),
+                service_resources: core.service_scope_count(),
+            },
+            ShutdownTarget::Group(_, group) => group.shutdown_snapshot(),
         }
     }
 
+    pub fn wait(&self) -> Result<ShutdownReport, ObservationError> {
+        match &self.target {
+            ShutdownTarget::Manager(core) => core.shutdown_wait_blocking(),
+            ShutdownTarget::Group(_, group) => group.wait_blocking(),
+        }
+        Ok(ShutdownReport {
+            snapshot: self.snapshot(),
+        })
+    }
+
+    pub fn wait_for(&self, timeout: Duration) -> Result<ShutdownWait, ObservationError> {
+        let completed = match &self.target {
+            ShutdownTarget::Manager(core) => core.shutdown_wait_for(timeout),
+            ShutdownTarget::Group(_, group) => group.wait_for(timeout),
+        };
+        if completed {
+            Ok(ShutdownWait::Completed(ShutdownReport {
+                snapshot: self.snapshot(),
+            }))
+        } else {
+            Ok(ShutdownWait::Pending(self.snapshot()))
+        }
+    }
+
+    pub fn as_async(&self) -> AsyncShutdownHandle {
+        AsyncShutdownHandle {
+            handle: self.clone(),
+        }
+    }
+}
+
+/// Async observer over the same manager shutdown state.
+#[derive(Clone)]
+pub struct AsyncShutdownHandle {
+    handle: ShutdownHandle,
+}
+
+impl AsyncShutdownHandle {
+    pub fn snapshot(&self) -> ShutdownSnapshot {
+        self.handle.snapshot()
+    }
+
     pub async fn wait(&self) -> ShutdownReport {
-        self.core.shutdown_wait().await;
+        match &self.handle.target {
+            ShutdownTarget::Manager(core) => core.shutdown_wait().await,
+            ShutdownTarget::Group(_, group) => group.wait().await,
+        }
         ShutdownReport {
             snapshot: self.snapshot(),
         }
     }
 
     pub async fn wait_until(&self, deadline: Deadline) -> Result<ShutdownWait, ObservationError> {
-        let clock = self
-            .core
-            .clock()
-            .ok_or(ObservationError::ClockUnavailable)?;
+        let core = self.handle.manager();
+        let clock = core.clock().ok_or(ObservationError::ClockUnavailable)?;
         if clock.now().domain() != deadline.time_point().domain() {
             return Err(ObservationError::ClockDomainMismatch);
         }
-        if self.core.is_shutdown_empty() {
-            self.core.finish_shutdown();
+        if self.handle.is_empty() {
+            if let ShutdownTarget::Manager(_) = &self.handle.target {
+                core.finish_shutdown();
+            }
             return Ok(ShutdownWait::Completed(ShutdownReport {
                 snapshot: self.snapshot(),
             }));
         }
-        let mut completion = Box::pin(self.core.shutdown_wait());
+        let mut completion = Box::pin(self.wait());
         let mut timer = Box::pin(ShutdownDeadline::new(clock, deadline));
         let completed = std::future::poll_fn(|cx| {
             if completion.as_mut().poll(cx).is_ready() {
@@ -83,26 +153,16 @@ impl ShutdownHandle {
         }
     }
 
-    pub fn blocking(&self) -> BlockingShutdown {
-        BlockingShutdown {
-            handle: self.clone(),
-        }
+    pub fn as_sync(&self) -> ShutdownHandle {
+        self.handle.clone()
     }
 }
 
-/// Blocking facade over the same manager shutdown state.
-pub struct BlockingShutdown {
-    handle: ShutdownHandle,
-}
-
-impl BlockingShutdown {
-    pub fn wait_for(&self, timeout: Duration) -> ShutdownWait {
-        if self.handle.core.shutdown_wait_for(timeout) {
-            ShutdownWait::Completed(ShutdownReport {
-                snapshot: self.handle.snapshot(),
-            })
-        } else {
-            ShutdownWait::Pending(self.handle.snapshot())
+impl ShutdownHandle {
+    fn is_empty(&self) -> bool {
+        match &self.target {
+            ShutdownTarget::Manager(core) => core.is_shutdown_empty(),
+            ShutdownTarget::Group(_, group) => group.is_empty(),
         }
     }
 }
@@ -197,7 +257,7 @@ mod tests {
             Err(error) if error.reason() == AdmissionError::Closed
         ));
         assert!(matches!(
-            cancel.blocking().wait_for(Duration::from_secs(2)),
+            cancel.wait_for(Duration::from_secs(2)).unwrap(),
             ShutdownWait::Completed(_)
         ));
     }
@@ -221,7 +281,7 @@ mod tests {
             Err(error) if error.reason() == AdmissionError::Closed
         ));
         assert!(matches!(
-            shutdown.blocking().wait_for(Duration::from_secs(2)),
+            shutdown.wait_for(Duration::from_secs(2)).unwrap(),
             ShutdownWait::Completed(_)
         ));
     }
@@ -258,7 +318,7 @@ mod tests {
         ));
         parent.wait_settlement().unwrap();
         assert!(matches!(
-            shutdown.blocking().wait_for(Duration::from_secs(2)),
+            shutdown.wait_for(Duration::from_secs(2)).unwrap(),
             ShutdownWait::Completed(_)
         ));
     }
@@ -288,7 +348,7 @@ mod tests {
         ));
         parent.wait_settlement().unwrap();
         assert!(matches!(
-            shutdown.blocking().wait_for(Duration::from_secs(2)),
+            shutdown.wait_for(Duration::from_secs(2)).unwrap(),
             ShutdownWait::Completed(_)
         ));
     }

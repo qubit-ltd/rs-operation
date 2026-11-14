@@ -695,6 +695,19 @@ impl ScopeCapacity {
         self.child_with_identity(scope_id.raw(), requested)
     }
 
+    pub(crate) fn resource_scope_for(
+        &self,
+        scope_id: crate::v02::report::ResourceScopeId,
+        capacity: usize,
+    ) -> Self {
+        let limits = ScopeLimits {
+            child_operations: self.limits.child_operations,
+            resources: self.limits.resources.min(capacity),
+            effect_records: self.limits.effect_records,
+        };
+        self.child_with_identity(scope_id.raw(), limits)
+    }
+
     fn child_with_identity(&self, scope_id: u128, requested: ScopeLimits) -> Self {
         let limits = ScopeLimits {
             child_operations: self.limits.child_operations.min(requested.child_operations),

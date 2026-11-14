@@ -13,11 +13,11 @@ use crate::v02::report::{
     AdmissionError, ManagerCreateError, ManagerId, ManagerOptions, OperationId, OperationOptions,
     ResourceScopeId, ScopeLimits,
 };
-use crate::v02::resource::ResourceScope;
 use crate::v02::resource::cleanup::{CleanupDispatcher, CleanupDispatcherError, CleanupPump};
+use crate::v02::resource::ResourceScope;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -105,6 +105,7 @@ struct ProductionSubmissionPort {
     cleanup_workers: Mutex<Vec<JoinHandle<()>>>,
     shutdown_finished: AtomicBool,
     phase: AtomicU8,
+    queued_operations: Arc<AtomicUsize>,
 }
 
 impl ProductionSubmissionPort {
@@ -185,20 +186,29 @@ impl ProductionSubmissionPort {
             cleanup_workers: Mutex::new(cleanup_workers),
             shutdown_finished: AtomicBool::new(false),
             phase: AtomicU8::new(0),
+            queued_operations: Arc::new(AtomicUsize::new(0)),
         })
     }
 
-    fn execution_permit(&self, kind: ExecutionKind) -> Result<ProductionPermit, AdmissionError> {
+    fn execution_permit(
+        &self,
+        kind: ExecutionKind,
+        queue: CapacityPermit,
+    ) -> Result<ProductionPermit, AdmissionError> {
         match kind {
             ExecutionKind::Sync => self
                 .sync
                 .reserve()
-                .map(ProductionPermit::Sync)
+                .map(|permit| {
+                    ProductionPermit::Sync(permit, Arc::clone(&self.queued_operations), queue)
+                })
                 .map_err(map_executor_admission),
             ExecutionKind::Async => self
                 .asynchronous
                 .reserve()
-                .map(ProductionPermit::Async)
+                .map(|permit| {
+                    ProductionPermit::Async(permit, Arc::clone(&self.queued_operations), queue)
+                })
                 .map_err(map_executor_admission),
         }
     }
@@ -247,7 +257,16 @@ impl SubmissionPort for ProductionSubmissionPort {
                 .map_err(|_| AdmissionError::Busy)?;
             (Some(active), None, outcome)
         };
-        let execution = match self.execution_permit(execution) {
+        let queue = match self.capacities.queue_permit() {
+            Ok(queue) => queue,
+            Err(_) => {
+                drop(active_root);
+                drop(child_path);
+                drop(outcome);
+                return Err(AdmissionError::Busy);
+            }
+        };
+        let execution = match self.execution_permit(execution, queue) {
             Ok(permit) => permit,
             Err(error) => {
                 drop(active_root);
@@ -325,6 +344,10 @@ impl SubmissionPort for ProductionSubmissionPort {
         self.cleanup_pump.shutdown();
     }
 
+    fn queued_operation_count(&self) -> usize {
+        self.queued_operations.load(Ordering::Acquire)
+    }
+
     fn service_resource_scope(
         &self,
         capacity: usize,
@@ -358,20 +381,107 @@ impl SubmissionPort for ProductionSubmissionPort {
             dispatcher,
         ))
     }
+
+    fn operation_resource_scope(
+        &self,
+        id: ResourceScopeId,
+        capacity: Arc<ScopeCapacity>,
+    ) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
+        let dispatcher = Arc::new(
+            CleanupDispatcher::new_with_pump(
+                capacity.effective_limits().resources,
+                Arc::clone(&self.cleanup),
+                Arc::clone(&self.cleanup_pump),
+            )
+            .map_err(|_| crate::v02::report::ResourceScopeError::CapacityExceeded)?,
+        );
+        Ok(ResourceScope::new(
+            self.manager_id,
+            id,
+            capacity,
+            dispatcher,
+        ))
+    }
 }
 
 enum ProductionPermit {
-    Sync(crate::v02::executor::ThreadPoolPermit),
-    Async(crate::v02::executor::PortablePermit),
+    Sync(
+        crate::v02::executor::ThreadPoolPermit,
+        Arc<AtomicUsize>,
+        CapacityPermit,
+    ),
+    Async(
+        crate::v02::executor::PortablePermit,
+        Arc<AtomicUsize>,
+        CapacityPermit,
+    ),
 }
 
 impl SubmissionPermit for ProductionPermit {
     fn dispatch(self: Box<Self>, job: OperationJob) {
         match (*self, job) {
-            (Self::Sync(permit), OperationJob::Sync(job)) => permit.submit(job),
-            (Self::Async(permit), OperationJob::Async(future)) => permit.spawn(future),
+            (Self::Sync(permit, queued, queue), OperationJob::Sync(job)) => {
+                queued.fetch_add(1, Ordering::AcqRel);
+                permit.submit(move || {
+                    let _started = QueuedOperationGuard::new(queued, queue);
+                    job();
+                });
+            }
+            (Self::Async(permit, queued, queue), OperationJob::Async(future)) => {
+                queued.fetch_add(1, Ordering::AcqRel);
+                permit.spawn(QueuedOperationFuture {
+                    future,
+                    guard: Some(QueuedOperationGuard::new(queued, queue)),
+                });
+            }
             _ => unreachable!("ManagerCore dispatch kind matches its reservation"),
         }
+    }
+}
+
+struct QueuedOperationGuard {
+    queued: Arc<AtomicUsize>,
+    started: bool,
+    queue_permit: Option<CapacityPermit>,
+}
+
+impl QueuedOperationGuard {
+    fn new(queued: Arc<AtomicUsize>, queue_permit: CapacityPermit) -> Self {
+        Self {
+            queued,
+            started: false,
+            queue_permit: Some(queue_permit),
+        }
+    }
+    fn start(&mut self) {
+        if !self.started {
+            self.started = true;
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            drop(self.queue_permit.take());
+        }
+    }
+}
+
+impl Drop for QueuedOperationGuard {
+    fn drop(&mut self) {
+        if !self.started {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+struct QueuedOperationFuture {
+    future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    guard: Option<QueuedOperationGuard>,
+}
+
+impl Future for QueuedOperationFuture {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if let Some(guard) = self.guard.as_mut() {
+            guard.start();
+        }
+        self.future.as_mut().poll(cx)
     }
 }
 
@@ -479,8 +589,8 @@ mod tests {
         assert!(matches!(
             manager
                 .request_shutdown(ShutdownMode::Drain)
-                .blocking()
-                .wait_for(Duration::from_secs(3)),
+                .wait_for(Duration::from_secs(3))
+                .unwrap(),
             ShutdownWait::Completed(_)
         ));
 
@@ -500,9 +610,32 @@ mod tests {
             manager
                 .as_sync()
                 .request_shutdown(ShutdownMode::Drain)
-                .blocking()
-                .wait_for(Duration::from_secs(3)),
+                .wait_for(Duration::from_secs(3))
+                .unwrap(),
             ShutdownWait::Completed(_)
         ));
+    }
+
+    #[test]
+    fn operation_scope_resource_scope_uses_requested_local_capacity() {
+        let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+        let completion = manager
+            .run_and_settle(OperationOptions::default(), |scope| {
+                let resources = scope
+                    .resource_scope(crate::v02::report::ResourceScopeOptions { capacity: 1 })
+                    .unwrap();
+                let first = resources.manage(11usize).unwrap();
+                let rejected = resources.manage(12usize);
+                assert!(rejected.is_err());
+                assert_eq!(*first, 11);
+                drop(first);
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(matches!(
+            completion.outcome,
+            OperationOutcome::Succeeded(())
+        ));
+        assert!(completion.settlement.all_released());
     }
 }
