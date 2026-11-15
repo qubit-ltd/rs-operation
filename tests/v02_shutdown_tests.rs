@@ -138,6 +138,10 @@ fn test_sync_group_self_wait_returns_would_deadlock() {
     let mut operation = group
         .try_submit(OperationOptions::default(), move |_| {
             let shutdown = inside.request_shutdown(ShutdownMode::Drain);
+            assert!(matches!(
+                shutdown.wait_for(Duration::ZERO).unwrap(),
+                ShutdownWait::Pending(_)
+            ));
             result_tx.send(shutdown.wait()).unwrap();
             Ok::<_, ()>(())
         })
@@ -146,6 +150,26 @@ fn test_sync_group_self_wait_returns_would_deadlock() {
         result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
         Err(ObservationError::WouldDeadlock)
     ));
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+}
+
+#[test]
+fn test_group_operation_can_wait_for_an_independent_group() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let running = manager.group(GroupOptions { capacity: 1 }).unwrap();
+    let observed = manager.group(GroupOptions { capacity: 1 }).unwrap();
+    let (result_tx, result_rx) = mpsc::channel();
+    let mut operation = running
+        .try_submit(OperationOptions::default(), move |_| {
+            let shutdown = observed.request_shutdown(ShutdownMode::Drain);
+            result_tx.send(shutdown.wait()).unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(result_rx.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
     assert!(matches!(
         operation.wait_outcome().unwrap(),
         OperationOutcome::Succeeded(())
