@@ -356,20 +356,32 @@ impl AsyncCleanup<usize> for FailingCleanup {
 #[test]
 fn test_recovery_blocks_shutdown_until_signed_transfer() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let resource_id = Arc::new(Mutex::new(None));
+    let body_resource_id = Arc::clone(&resource_id);
     let completion = manager
-        .run_and_settle(OperationOptions::default(), |scope| {
+        .run_and_settle(OperationOptions::default(), move |scope| {
             let resources = scope.resource_scope(ResourceScopeOptions { capacity: 1 }).unwrap();
-            let resource_id = Arc::new(Mutex::new(None));
             let resource = resources
-                .manage_with(17usize, Arc::new(FailingCleanup(Arc::clone(&resource_id))))
+                .manage_with(17usize, Arc::new(FailingCleanup(Arc::clone(&body_resource_id))))
                 .unwrap();
-            *resource_id.lock().unwrap() = Some(resource.id());
+            *body_resource_id.lock().unwrap() = Some(resource.id());
             drop(resource);
             Ok::<_, ()>(())
         })
         .unwrap();
     assert_eq!(completion.settlement.recovery_count, 1);
     let recovery = completion.settlement.recoveries[0].clone();
+    let resource_id = resource_id.lock().unwrap().expect("cleanup recorded the resource ID");
+    assert_eq!(recovery.snapshot().resources.as_ref(), [resource_id]);
+    let retry_report = recovery.try_retry().unwrap().wait().unwrap();
+    assert_eq!(retry_report.recovery.resources.as_ref(), [resource_id]);
+    assert!(!retry_report.failures.is_empty());
+    assert!(
+        retry_report
+            .failures
+            .iter()
+            .all(|failure| failure.resource_id == resource_id)
+    );
     let shutdown = manager.request_shutdown(ShutdownMode::Drain);
     assert_eq!(shutdown.snapshot().recovery_groups, 1);
     assert!(matches!(

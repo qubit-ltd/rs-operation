@@ -347,7 +347,12 @@ impl ScopeCore {
         value: T,
         reservation: ResourceReservation,
     ) -> ResourceId {
-        self.retain_reserved_inner(value, None, reservation)
+        self.retain_reserved_inner(
+            value,
+            None,
+            reservation,
+            crate::v02::internal::resource_slot_allocator::allocate,
+        )
     }
 
     /// Retains a resource with an asynchronous cleanup policy and no user
@@ -386,7 +391,12 @@ impl ScopeCore {
         T: Send + Sync + 'static,
         C: AsyncCleanup<T>,
     {
-        self.retain_reserved_inner(value, Some(Arc::new(cleanup)), reservation)
+        self.retain_reserved_inner(
+            value,
+            Some(Arc::new(cleanup)),
+            reservation,
+            crate::v02::internal::resource_slot_allocator::allocate,
+        )
     }
 
     /// Installs a resource owner using an already acquired reservation.
@@ -406,6 +416,7 @@ impl ScopeCore {
     /// - `value`: Resource value to install.
     /// - `policy`: Optional asynchronous cleanup policy kept with the owner.
     /// - `reservation`: Matching capacity and cleanup permits to consume.
+    /// - `allocate_slot`: Allocator used to obtain a unique resource identity.
     ///
     /// # Returns
     ///
@@ -420,13 +431,25 @@ impl ScopeCore {
         value: T,
         policy: Option<Arc<dyn AsyncCleanup<T>>>,
         mut reservation: ResourceReservation,
+        allocate_slot: impl FnOnce() -> Option<u64>,
     ) -> ResourceId {
         assert!(Arc::ptr_eq(self, &reservation.scope));
         let (resource_id, registration, cleanup_permit) = {
             let mut state = lock(&self.state);
             assert!(reservation.tracked, "reservation is consumed once");
-            let slot = crate::v02::internal::resource_slot_allocator::allocate()
-                .expect("resource slot space exhausted");
+            let slot = match allocate_slot() {
+                Some(slot) => slot,
+                None => {
+                    drop(state);
+                    // No unique identity is available to register this owner.
+                    // Preserve the value and all reserved capacity rather than
+                    // letting unwinding release an untracked resource.
+                    std::mem::forget(value);
+                    std::mem::forget(policy);
+                    std::mem::forget(reservation);
+                    panic!("resource slot space exhausted");
+                }
+            };
             state.reservations = state.reservations.saturating_sub(1);
             state.retained = state.retained.saturating_add(1);
             reservation.tracked = false;
@@ -450,5 +473,88 @@ impl ScopeCore {
         );
         owner.end();
         resource_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use super::super::internal::State;
+    use super::ScopeCompletion;
+    use super::ScopeCore;
+    use crate::v02::manager::capacity::ManagerCapacityPools;
+    use crate::v02::manager::capacity::ScopeCapacity;
+    use crate::v02::report::ManagerId;
+    use crate::v02::report::ManagerLimits;
+    use crate::v02::report::ResourceScopeId;
+    use crate::v02::report::ScopeLimits;
+    use crate::v02::resource::cleanup_port::CleanupDispatch;
+    use crate::v02::resource::cleanup_port::CleanupDispatchPermit;
+    use crate::v02::resource::cleanup_port::CleanupJob;
+    use crate::v02::resource::cleanup_port::CleanupQueueError;
+
+    struct NoopDispatch;
+
+    struct NoopPermit;
+
+    impl CleanupDispatch for NoopDispatch {
+        fn reserve(&self) -> Result<Box<dyn CleanupDispatchPermit>, CleanupQueueError> {
+            Ok(Box::new(NoopPermit))
+        }
+    }
+
+    impl CleanupDispatchPermit for NoopPermit {
+        fn enqueue(self: Box<Self>, _job: Box<dyn CleanupJob>) {}
+    }
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_retained_resource_slot_exhaustion_preserves_owner_and_reservation() {
+        let pools = ManagerCapacityPools::new(ManagerLimits::default());
+        let capacity = Arc::new(ScopeCapacity::root(
+            &pools,
+            91,
+            ScopeLimits {
+                resources: 1,
+                ..ScopeLimits::default()
+            },
+        ));
+        let core = Arc::new(ScopeCore {
+            manager: ManagerId::new_unique(),
+            id: ResourceScopeId::new_unique(),
+            capacity: Arc::clone(&capacity),
+            cleanup: Arc::new(NoopDispatch),
+            completion: ScopeCompletion::new(),
+            state: Mutex::new(State {
+                open: true,
+                generation: 1,
+                reservations: 0,
+                retained: 0,
+                slots: HashMap::new(),
+            }),
+        });
+        let reservation = core.reserve().unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            core.retain_reserved_inner(DropProbe(Arc::clone(&drops)), None, reservation, || None)
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(capacity.resource_registration().is_err());
     }
 }

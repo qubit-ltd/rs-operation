@@ -5,6 +5,7 @@
 //
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -67,13 +68,15 @@ fn test_open_zero_can_get_again_then_settle_releases_once() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let mut operation = manager
         .try_submit(OperationOptions::default(), move |scope| {
-            let key = {
+            let (key, resource_id) = {
                 let input = scope.manage(Probe(Arc::clone(&body_drops))).map_err(|_| "manage")?;
-                input.key()
+                (input.key(), input.id())
             };
             assert_eq!(body_drops.load(Ordering::SeqCst), 0);
             let again = scope.get_resource(key).map_err(|_| "lookup")?;
             let copied_key_lookup = scope.get_resource(key).map_err(|_| "copied key lookup")?;
+            assert_eq!(again.id(), resource_id);
+            assert_eq!(copied_key_lookup.id(), resource_id);
             assert_eq!(body_drops.load(Ordering::SeqCst), 0);
             drop(again);
             drop(copied_key_lookup);
@@ -340,6 +343,69 @@ fn test_resources_in_distinct_scopes_have_distinct_ids() {
 
             first_scope.end();
             second_scope.end();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    operation.wait_settlement().unwrap();
+    drop(manager.request_shutdown(ShutdownMode::Drain).wait().unwrap());
+}
+
+#[test]
+fn test_resource_ids_are_unique_across_operations_of_one_manager() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let mut first = manager
+        .try_submit(OperationOptions::default(), |scope| {
+            Ok::<_, ()>(scope.manage(String::from("first")).unwrap().id())
+        })
+        .unwrap();
+    let first_id = match first.wait_outcome().unwrap() {
+        OperationOutcome::Succeeded(id) => id,
+        outcome => panic!("unexpected first operation outcome: {outcome:?}"),
+    };
+    first.wait_settlement().unwrap();
+
+    let mut second = manager
+        .try_submit(OperationOptions::default(), |scope| {
+            Ok::<_, ()>(scope.manage(String::from("second")).unwrap().id())
+        })
+        .unwrap();
+    let second_id = match second.wait_outcome().unwrap() {
+        OperationOutcome::Succeeded(id) => id,
+        outcome => panic!("unexpected second operation outcome: {outcome:?}"),
+    };
+    second.wait_settlement().unwrap();
+    assert_ne!(first_id, second_id);
+    drop(manager.request_shutdown(ShutdownMode::Drain).wait().unwrap());
+}
+
+#[test]
+fn test_concurrent_resource_registrations_receive_distinct_ids() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let mut operation = manager
+        .try_submit(OperationOptions::default(), |scope| {
+            let scope = &scope;
+            let ids = std::thread::scope(|threads| {
+                let workers = (0..8)
+                    .map(|worker| {
+                        threads.spawn(move || {
+                            (0..16)
+                                .map(|resource| scope.manage(format!("{worker}-{resource}")).unwrap().id())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                workers
+                    .into_iter()
+                    .flat_map(|worker| worker.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let unique = ids.iter().copied().collect::<HashSet<_>>();
+            assert_eq!(ids.len(), 8 * 16);
+            assert_eq!(unique.len(), ids.len());
             Ok::<_, ()>(())
         })
         .unwrap();

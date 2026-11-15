@@ -58,6 +58,30 @@ fn test_service_refs_delay_close() {
 }
 
 #[test]
+fn test_service_resource_id_is_distinct_from_operation_resource_id() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
+    let service = group.resource_scope(ServiceResourceOptions { capacity: 1 }).unwrap();
+    let service_id = service.manage(String::from("service")).unwrap().id();
+
+    let mut operation = manager
+        .try_submit(qubit_operation::OperationOptions::default(), move |scope| {
+            let operation_id = scope.manage(String::from("operation")).unwrap().id();
+            assert_ne!(service_id, operation_id);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        qubit_operation::OperationOutcome::Succeeded(())
+    ));
+    operation.wait_settlement().unwrap();
+
+    service.close();
+    drop(manager.request_shutdown(ShutdownMode::Drain).wait().unwrap());
+}
+
+#[test]
 fn test_bounded_cleanup_queue_is_consumed_after_worker_capacity_returns() {
     /// Coordinates when cleanup drops may continue on the worker thread.
     struct Gate {

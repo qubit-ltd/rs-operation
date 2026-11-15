@@ -13,30 +13,39 @@ use std::sync::atomic::Ordering;
 
 static NEXT_RESOURCE_SLOT: AtomicU64 = AtomicU64::new(1);
 
-/// Allocates a process-unique slot, returning `None` after the integer space is exhausted.
+/// Allocates a process-unique slot, returning `None` after the integer space is
+/// exhausted.
 pub(crate) fn allocate() -> Option<u64> {
     allocate_from(&NEXT_RESOURCE_SLOT)
 }
 
+/// Allocates from a supplied counter for production and boundary tests.
+///
+/// # Parameters
+///
+/// * `counter` — atomic slot counter whose value advances without wrapping.
+///
+/// # Returns
+///
+/// The previous counter value, or `None` when incrementing would overflow.
 fn allocate_from(counter: &AtomicU64) -> Option<u64> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_add(1)
-        })
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
         .ok()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::allocate_from;
-    use std::sync::atomic::AtomicU64;
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
     use std::thread;
 
+    use super::allocate_from;
+
     #[test]
-    fn allocation_exhaustion_does_not_wrap_or_recover() {
+    fn test_allocation_exhaustion_does_not_wrap_or_recover() {
         let counter = AtomicU64::new(u64::MAX - 1);
         assert_eq!(allocate_from(&counter), Some(u64::MAX - 1));
         assert_eq!(allocate_from(&counter), None);
@@ -45,7 +54,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_allocations_are_unique() {
+    fn test_concurrent_allocations_are_unique() {
         let counter = Arc::new(AtomicU64::new(1));
         let allocated = Arc::new(Mutex::new(Vec::new()));
         let workers = (0..8)
