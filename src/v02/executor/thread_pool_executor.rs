@@ -143,6 +143,17 @@ impl ThreadPoolExecutor {
         })
     }
 
+    /// Reports whether another reservation could be acquired now.
+    pub(crate) fn has_capacity(&self) -> bool {
+        let state = lock(&self.inner.state);
+        state.accepting && state.outstanding < self.inner.capacity
+    }
+
+    /// Installs a callback invoked after a reservation is returned.
+    pub(crate) fn set_capacity_callback(&self, callback: Arc<dyn Fn() + Send + Sync + 'static>) {
+        *lock(&self.inner.capacity_callback) = Some(callback);
+    }
+
     /// Submits a job immediately, returning ownership of it when admission
     /// fails.
     ///

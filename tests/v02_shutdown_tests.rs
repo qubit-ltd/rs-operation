@@ -6,6 +6,7 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 use std::future;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -20,6 +21,7 @@ use qubit_operation::CleanupOutcome;
 use qubit_operation::CleanupStage;
 use qubit_operation::DiagnosticSummary;
 use qubit_operation::GroupOptions;
+use qubit_operation::ManagerLimits;
 use qubit_operation::ManagerOptions;
 use qubit_operation::ObservationError;
 use qubit_operation::OperationManager;
@@ -43,6 +45,56 @@ fn test_drain_closes_roots_and_completes_when_idle() {
     assert_eq!(shutdown.mode(), ShutdownMode::Drain);
     let _ = manager.request_shutdown(ShutdownMode::Cancel);
     assert_eq!(shutdown.mode(), ShutdownMode::Drain);
+}
+
+#[test]
+fn test_root_capacity_wait_is_interrupted_by_drain_and_cancel() {
+    for mode in [ShutdownMode::Drain, ShutdownMode::Cancel] {
+        let manager = OperationManager::new(ManagerOptions {
+            limits: ManagerLimits {
+                active_operations: 1,
+                ..ManagerLimits::default()
+            },
+            ..ManagerOptions::default()
+        })
+        .unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut held = manager
+            .try_submit(OperationOptions::default(), move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let body_owner = Arc::new(());
+        let body = move |_| {
+            let _ = &body_owner;
+            async { Ok::<_, ()>(()) }
+        };
+        let async_manager = manager.as_async();
+        let mut waiting = Box::pin(async_manager.submit(OperationOptions::default(), body));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            waiting.as_mut().poll(&mut context),
+            std::task::Poll::Pending
+        ));
+
+        let shutdown = manager.request_shutdown(mode);
+        let error = match waiting.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(Err(error)) => error,
+            _ => panic!("shutdown should interrupt root admission"),
+        };
+        let (reason, returned_body) = error.into_parts();
+        assert_eq!(reason, AdmissionError::Closed);
+        drop(returned_body);
+
+        release_tx.send(()).unwrap();
+        let _ = held.wait_outcome().unwrap();
+        let _ = shutdown.wait().unwrap();
+    }
 }
 
 #[test]
@@ -122,7 +174,12 @@ fn test_sync_operation_can_wait_for_an_independent_manager() {
             Ok::<_, ()>(())
         })
         .unwrap();
-    assert!(result_rx.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+    assert!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok()
+    );
     assert!(matches!(
         operation.wait_outcome().unwrap(),
         OperationOutcome::Succeeded(())
@@ -169,7 +226,12 @@ fn test_group_operation_can_wait_for_an_independent_group() {
             Ok::<_, ()>(())
         })
         .unwrap();
-    assert!(result_rx.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+    assert!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok()
+    );
     assert!(matches!(
         operation.wait_outcome().unwrap(),
         OperationOutcome::Succeeded(())
@@ -203,7 +265,10 @@ fn test_async_manager_self_wait_returns_would_deadlock() {
 #[test]
 fn test_async_group_self_wait_returns_would_deadlock() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
-    let group = manager.group(GroupOptions { capacity: 1 }).unwrap().as_async();
+    let group = manager
+        .group(GroupOptions { capacity: 1 })
+        .unwrap()
+        .as_async();
     let inside = group.clone();
     let (result_tx, result_rx) = mpsc::channel();
     let mut operation = group
@@ -245,7 +310,10 @@ fn test_drain_rejects_new_roots_but_keeps_open_descendants_admissible() {
     let mut child = bound
         .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()))
         .unwrap();
-    assert!(matches!(child.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
+    assert!(matches!(
+        child.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
     release_tx.send(()).unwrap();
     assert!(matches!(
         parent.wait_outcome().unwrap(),
@@ -309,7 +377,9 @@ fn test_recovery_blocks_shutdown_until_signed_transfer() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let completion = manager
         .run_and_settle(OperationOptions::default(), |scope| {
-            let resources = scope.resource_scope(ResourceScopeOptions { capacity: 1 }).unwrap();
+            let resources = scope
+                .resource_scope(ResourceScopeOptions { capacity: 1 })
+                .unwrap();
             let resource_id = Arc::new(Mutex::new(None));
             let resource = resources
                 .manage_with(17usize, Arc::new(FailingCleanup(Arc::clone(&resource_id))))
@@ -412,7 +482,10 @@ fn test_drain_rejects_root_allows_open_descendants() {
     let mut child = bound
         .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()))
         .unwrap();
-    assert!(matches!(child.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
+    assert!(matches!(
+        child.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
     finish_tx.send(()).unwrap();
     assert!(matches!(
         parent.wait_outcome().unwrap(),
@@ -444,7 +517,10 @@ fn test_cancel_blocks_commit_and_propagates() {
         Err(error) if error.reason() == AdmissionError::Stopped
     ));
     finish_tx.send(()).unwrap();
-    assert!(matches!(parent.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
+    assert!(matches!(
+        parent.wait_outcome().unwrap(),
+        OperationOutcome::Stopped(_)
+    ));
     parent.wait_settlement().unwrap();
     assert!(matches!(
         shutdown.wait_for(Duration::from_secs(2)).unwrap(),

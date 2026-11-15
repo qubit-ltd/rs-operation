@@ -37,7 +37,6 @@ use super::SubmitError;
 use super::child_outcome_summary;
 use super::lock;
 use super::panic_message;
-use super::resolve_wait_parent;
 use crate::v02::scope::ExecutionContextFuture;
 use crate::v02::scope::ExecutionContextGuard;
 
@@ -78,7 +77,9 @@ impl AsyncOperationManager {
     /// Returns [`ManagerCreateError`](crate::v02::report::ManagerCreateError)
     /// when a configured executor, adapter, or cleanup resource cannot be
     /// initialized.
-    pub fn new(options: crate::v02::report::ManagerOptions) -> Result<Self, crate::v02::report::ManagerCreateError> {
+    pub fn new(
+        options: crate::v02::report::ManagerOptions,
+    ) -> Result<Self, crate::v02::report::ManagerCreateError> {
         crate::v02::manager::production::new_async(options)
     }
 
@@ -143,10 +144,15 @@ impl AsyncOperationManager {
         OperationManager::from_parts(Arc::clone(&self.core), self.target.clone())
     }
 
-    /// Submits an async operation, awaiting retryable capacity pressure.
+    /// Submits an async operation, awaiting retryable capacity pressure in its
+    /// group, manager, or selected executor.
     ///
     /// The body is retained and retried only when admission reports `Busy`;
     /// other admission failures return it to the caller in `SubmitError`.
+    /// Dropping this future unregisters its pending capacity waiter. Waiting is
+    /// bounded by the manager's admission-waiter limit and does not guarantee
+    /// FIFO ordering. Root submissions are rejected after manager Drain begins,
+    /// while descendants of accepted scopes may continue.
     ///
     /// # Type Parameters
     ///
@@ -193,11 +199,15 @@ impl AsyncOperationManager {
                     if reason != AdmissionError::Busy {
                         return Err(SubmitError::new(reason, original));
                     }
-                    let parent = match resolve_wait_parent(&self.target) {
-                        Ok(parent) => parent,
-                        Err(reason) => return Err(SubmitError::new(reason, original)),
-                    };
-                    if let Err(reason) = self.core.wait_for_retry_capacity(parent, options.clone()).await {
+                    if let Err(reason) = self
+                        .core
+                        .wait_for_retry_capacity(
+                            &self.target,
+                            ExecutionKind::Async,
+                            options.clone(),
+                        )
+                        .await
+                    {
                         return Err(SubmitError::new(reason, original));
                     }
                     body = Some(original);
@@ -246,7 +256,9 @@ impl AsyncOperationManager {
         let parts: Arc<Mutex<Option<RunnerParts<T, E>>>> = Arc::new(Mutex::new(None));
         let parts_for_job = Arc::clone(&parts);
         let runner = move |scope: OperationScope| {
-            let body = lock(&body_for_job).take().expect("accepted async body is present");
+            let body = lock(&body_for_job)
+                .take()
+                .expect("accepted async body is present");
             let (operation, slot, lease, parent, control) = lock(&parts_for_job)
                 .take()
                 .expect("accepted async runner capsule is present");
@@ -255,10 +267,14 @@ impl AsyncOperationManager {
             async move {
                 let frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
                 operation.set_execution(ExecutionPhase::Running);
-                let manager_core = scope_core.manager().upgrade().expect("active scope manager exists");
+                let manager_core = scope_core
+                    .manager()
+                    .upgrade()
+                    .expect("active scope manager exists");
                 let group = scope_core.group().cloned();
                 let user_future = {
-                    let _context = ExecutionContextGuard::enter(&manager_core, operation_id, group.as_ref());
+                    let _context =
+                        ExecutionContextGuard::enter(&manager_core, operation_id, group.as_ref());
                     body(scope)
                 };
                 let result = ExecutionContextFuture::new(
@@ -303,7 +319,9 @@ impl AsyncOperationManager {
                 Ok(result) => result,
                 Err(error) => {
                     let (reason, _runner) = error.into_parts();
-                    let body = lock(&body_cell).take().expect("rejected async body is retained");
+                    let body = lock(&body_cell)
+                        .take()
+                        .expect("rejected async body is retained");
                     return Err(SubmitError::new(reason, body));
                 }
             };
@@ -335,7 +353,10 @@ impl AsyncOperationManager {
             Arc::clone(&slot),
             Arc::clone(&control) as Arc<dyn StopControl>,
         );
-        let future = runner(OperationScope::new(Arc::clone(&scope), Arc::clone(&self.core)));
+        let future = runner(OperationScope::new(
+            Arc::clone(&scope),
+            Arc::clone(&self.core),
+        ));
         let abandon_scope = Arc::clone(&scope);
         let abandon_operation = Arc::clone(&operation);
         let abandon_slot = Arc::clone(&slot);
@@ -454,7 +475,10 @@ impl AsyncOperationManager {
             .await
             .map_err(crate::v02::report::RunError::Outcome)?;
         let settlement = operation.wait_settlement().await;
-        Ok(crate::v02::report::OperationCompletion { outcome, settlement })
+        Ok(crate::v02::report::OperationCompletion {
+            outcome,
+            settlement,
+        })
     }
 
     /// Submits an async unit-returning body through the test execution port.

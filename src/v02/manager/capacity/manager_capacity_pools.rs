@@ -50,14 +50,24 @@ impl ManagerCapacityPools {
     pub(crate) fn new(limits: ManagerLimits) -> Self {
         let coordinator = AdmissionCoordinator::new(limits.admission_waiters);
         let pool = |capacity, label| {
-            CapacityPool::with_coordinator(ResourceLabel::Manager(label), capacity, Arc::clone(&coordinator))
+            CapacityPool::with_coordinator(
+                ResourceLabel::Manager(label),
+                capacity,
+                Arc::clone(&coordinator),
+            )
         };
         Self {
             active_roots: pool(limits.active_operations, ManagerCapacity::ActiveRoots),
             queued_roots: pool(limits.queued_operations, ManagerCapacity::QueuedRoots),
             admission_waiters: pool(limits.admission_waiters, ManagerCapacity::AdmissionWaiters),
-            unconsumed_outcomes: pool(limits.unconsumed_outcomes, ManagerCapacity::UnconsumedOutcomes),
-            cleanup_concurrency: pool(limits.cleanup_concurrency, ManagerCapacity::CleanupConcurrency),
+            unconsumed_outcomes: pool(
+                limits.unconsumed_outcomes,
+                ManagerCapacity::UnconsumedOutcomes,
+            ),
+            cleanup_concurrency: pool(
+                limits.cleanup_concurrency,
+                ManagerCapacity::CleanupConcurrency,
+            ),
             diagnostic_events: pool(limits.diagnostic_events, ManagerCapacity::DiagnosticEvents),
             coordinator,
         }
@@ -79,11 +89,20 @@ impl ManagerCapacityPools {
     /// # Errors
     ///
     /// Returns an error if either required pool has no available capacity.
-    pub(crate) fn root_lifecycle_permits(&self) -> Result<(CapacityPermit, CapacityPermit), CapacityError> {
-        let mut permits = PermitBundle::try_acquire(&[self.active_roots.clone(), self.unconsumed_outcomes.clone()])?;
+    pub(crate) fn root_lifecycle_permits(
+        &self,
+    ) -> Result<(CapacityPermit, CapacityPermit), CapacityError> {
+        let mut permits = PermitBundle::try_acquire(&[
+            self.active_roots.clone(),
+            self.unconsumed_outcomes.clone(),
+        ])?;
         Ok((
-            permits.take(&self.active_roots).expect("active root permit"),
-            permits.take(&self.unconsumed_outcomes).expect("outcome permit"),
+            permits
+                .take(&self.active_roots)
+                .expect("active root permit"),
+            permits
+                .take(&self.unconsumed_outcomes)
+                .expect("outcome permit"),
         ))
     }
 
@@ -103,13 +122,19 @@ impl ManagerCapacityPools {
     ///
     /// Returns an error if the active-root pool has no available capacity.
     #[cfg(test)]
-    pub(in crate::v02::manager::capacity) fn active_root_permit(&self) -> Result<CapacityPermit, CapacityError> {
+    pub(in crate::v02::manager::capacity) fn active_root_permit(
+        &self,
+    ) -> Result<CapacityPermit, CapacityError> {
         self.active_roots.try_acquire()
     }
 
     /// Returns the capacity pools required before admitting a root operation.
     pub(crate) fn root_pools(&self) -> Vec<CapacityPool> {
-        vec![self.active_roots.clone(), self.unconsumed_outcomes.clone()]
+        vec![
+            self.active_roots.clone(),
+            self.queued_roots.clone(),
+            self.unconsumed_outcomes.clone(),
+        ]
     }
 
     /// Creates a waiter that retries root admission when capacity changes.
@@ -119,7 +144,7 @@ impl ManagerCapacityPools {
     /// Returns an error if a required pool or the admission-waiter pool has no
     /// available capacity.
     pub(crate) fn root_admission_request(&self) -> Result<AdmissionRequest, CapacityError> {
-        self.admission_request(vec![self.active_roots.clone(), self.unconsumed_outcomes.clone()])
+        self.admission_request(self.root_pools())
     }
 
     /// Creates a waiter for the supplied set of pools.
@@ -132,7 +157,10 @@ impl ManagerCapacityPools {
     ///
     /// Returns an error if a requested pool or the admission-waiter pool has no
     /// available capacity.
-    pub(crate) fn admission_request(&self, pools: Vec<CapacityPool>) -> Result<AdmissionRequest, CapacityError> {
+    pub(crate) fn admission_request(
+        &self,
+        pools: Vec<CapacityPool>,
+    ) -> Result<AdmissionRequest, CapacityError> {
         AdmissionRequest::new(pools, Some(self.admission_waiters.clone()))
     }
 
@@ -146,8 +174,12 @@ impl ManagerCapacityPools {
     ///
     /// Returns an error if a required pool or the admission-waiter pool has no
     /// available capacity.
-    pub(crate) fn child_admission_request(&self, scope: &ScopeCapacity) -> Result<AdmissionRequest, CapacityError> {
+    pub(crate) fn child_admission_request(
+        &self,
+        scope: &ScopeCapacity,
+    ) -> Result<AdmissionRequest, CapacityError> {
         let mut pools = scope.child_operation_pools.clone();
+        pools.push(self.queued_roots.clone());
         pools.push(self.unconsumed_outcomes.clone());
         self.admission_request(pools)
     }
@@ -173,7 +205,9 @@ impl ManagerCapacityPools {
             ]
             .concat(),
         )?;
-        let outcome = permits.take(&self.unconsumed_outcomes).expect("outcome permit");
+        let outcome = permits
+            .take(&self.unconsumed_outcomes)
+            .expect("outcome permit");
         Ok((permits, outcome))
     }
 
@@ -184,6 +218,7 @@ impl ManagerCapacityPools {
     /// - `scope`: Supplies the child's hierarchical operation pools.
     pub(crate) fn child_admission_pools(&self, scope: &ScopeCapacity) -> Vec<CapacityPool> {
         let mut pools = scope.child_operation_pools.clone();
+        pools.push(self.queued_roots.clone());
         pools.push(self.unconsumed_outcomes.clone());
         pools
     }
@@ -257,19 +292,19 @@ mod tests {
         });
 
         let root_pools = manager.root_pools();
-        assert_eq!(root_pools.len(), 2);
+        assert_eq!(root_pools.len(), 3);
         let mut root_request = Box::pin(manager.root_admission_request().unwrap());
         let root_bundle = match poll(root_request.as_mut()) {
             Poll::Ready(Ok(bundle)) => bundle,
             _ => panic!("available root capacity should admit immediately"),
         };
-        assert_eq!(root_bundle.len(), 2);
+        assert_eq!(root_bundle.len(), 3);
         drop(root_bundle);
 
         let scope = ScopeCapacity::root(&manager, 31, ScopeLimits::default());
         assert_eq!(
             manager.child_admission_pools(&scope).len(),
-            scope.child_operation_pools.len() + 1
+            scope.child_operation_pools.len() + 2
         );
         let mut child_request = Box::pin(manager.child_admission_request(&scope).unwrap());
         assert!(matches!(poll(child_request.as_mut()), Poll::Ready(Ok(_))));

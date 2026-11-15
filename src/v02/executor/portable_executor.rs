@@ -170,6 +170,12 @@ impl PortableExecutor {
         })
     }
 
+    /// Reports whether another reservation could be acquired now.
+    pub(crate) fn has_capacity(&self) -> bool {
+        let state = lock(&self.inner.state);
+        state.accepting && state.tasks < self.inner.capacity
+    }
+
     /// Polls one correctly-woken task, returning whether a task was polled.
     pub(crate) fn poll_once(&self) -> bool {
         {
@@ -221,7 +227,9 @@ impl PortableExecutor {
 
     /// Polls at most the configured number of tasks for one scheduling turn.
     pub(crate) fn poll_turn(&self) -> usize {
-        (0..self.inner.polls_per_turn).take_while(|_| self.poll_once()).count()
+        (0..self.inner.polls_per_turn)
+            .take_while(|_| self.poll_once())
+            .count()
     }
 
     /// Rejects future reservations and wakes workers to observe shutdown.
@@ -235,7 +243,7 @@ impl PortableExecutor {
     /// # Parameters
     ///
     /// * `callback` is invoked after a task releases its reserved capacity.
-    pub(in crate::v02::executor) fn set_capacity_callback(&self, callback: Arc<dyn Fn() + Send + Sync + 'static>) {
+    pub(crate) fn set_capacity_callback(&self, callback: Arc<dyn Fn() + Send + Sync + 'static>) {
         *lock(&self.inner.capacity_callback) = Some(callback);
     }
 }

@@ -67,6 +67,7 @@ pub(crate) trait SubmissionPort: Send + Sync + 'static {
     fn wait_for_capacity<'a>(
         &'a self,
         parent: Option<Arc<ScopeCore>>,
+        execution: ExecutionKind,
         options: OperationOptions,
     ) -> Pin<Box<dyn Future<Output = Result<(), AdmissionError>> + Send + 'a>>;
 

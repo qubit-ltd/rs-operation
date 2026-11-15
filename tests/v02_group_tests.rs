@@ -6,7 +6,9 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
+use std::future::Future;
 use std::sync::mpsc;
+use std::task::Context;
 
 use qubit_operation::AdmissionError;
 use qubit_operation::GroupOptions;
@@ -42,7 +44,10 @@ fn test_group_limit_is_local_and_released_after_settlement() {
         OperationOutcome::Succeeded(())
     ));
     finish_tx.send(()).unwrap();
-    assert!(matches!(held.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
+    assert!(matches!(
+        held.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
     held.wait_settlement().unwrap();
     assert_eq!(group.snapshot().active_operations, 0);
     assert!(
@@ -53,13 +58,92 @@ fn test_group_limit_is_local_and_released_after_settlement() {
 }
 
 #[test]
+fn test_async_group_submit_waits_without_immediate_retry_when_group_is_full() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut held = group
+        .try_submit(OperationOptions::default(), move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    started_rx.recv().unwrap();
+
+    let async_group = group.as_async();
+    let mut waiting =
+        Box::pin(async_group.submit(OperationOptions::default(), |_| async { Ok::<_, ()>(()) }));
+    let mut context = Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        waiting.as_mut().poll(&mut context),
+        std::task::Poll::Pending
+    ));
+
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        held.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    held.wait_settlement().unwrap();
+    assert!(matches!(
+        waiting.as_mut().poll(&mut context),
+        std::task::Poll::Ready(Ok(_))
+    ));
+}
+
+#[test]
+fn test_group_close_interrupts_a_capacity_waiter() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut held = group
+        .try_submit(OperationOptions::default(), move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    started_rx.recv().unwrap();
+
+    let async_group = group.as_async();
+    let body_owner = std::sync::Arc::new(());
+    let mut waiting = Box::pin(async_group.submit(OperationOptions::default(), move |_| {
+        let _ = &body_owner;
+        async { Ok::<_, ()>(()) }
+    }));
+    let mut context = Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        waiting.as_mut().poll(&mut context),
+        std::task::Poll::Pending
+    ));
+
+    group.close_admission();
+    let error = match waiting.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(Err(error)) => error,
+        _ => panic!("group close should interrupt a root capacity waiter"),
+    };
+    let (reason, body) = error.into_parts();
+    assert_eq!(reason, AdmissionError::Closed);
+    drop(body);
+
+    release_tx.send(()).unwrap();
+    let _ = held.wait_outcome().unwrap();
+}
+
+#[test]
 fn test_sync_group_run_and_settle_uses_group_target() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
     let completion = group
         .run_and_settle(OperationOptions::default(), |_| Ok::<_, ()>(91usize))
         .unwrap();
-    assert!(matches!(completion.outcome, OperationOutcome::Succeeded(91)));
+    assert!(matches!(
+        completion.outcome,
+        OperationOutcome::Succeeded(91)
+    ));
     assert!(completion.settlement.all_released());
 }
 
@@ -88,7 +172,10 @@ fn test_group_wait_for_max_waits_for_active_operation() {
         ShutdownWait::Completed(_)
     ));
     release.join().unwrap();
-    assert!(matches!(outcome.join().unwrap(), OperationOutcome::Succeeded(())));
+    assert!(matches!(
+        outcome.join().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
 }
 
 #[test]
@@ -113,7 +200,10 @@ fn test_local_drain_rejects_group_roots_but_accepts_bound_descendants() {
     let mut child = bound
         .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()))
         .unwrap();
-    assert!(matches!(child.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
+    assert!(matches!(
+        child.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
     finish_tx.send(()).unwrap();
     assert!(matches!(
         parent.wait_outcome().unwrap(),
@@ -161,7 +251,9 @@ fn test_async_group_keeps_group_target_and_local_shutdown() {
     let sync_group = manager.group(GroupOptions { capacity: 1 }).unwrap();
     let async_group = sync_group.as_async();
     let mut operation = async_group
-        .try_submit(OperationOptions::default(), |_| async { Ok::<_, ()>(73usize) })
+        .try_submit(OperationOptions::default(), |_| async {
+            Ok::<_, ()>(73usize)
+        })
         .unwrap()
         .into_sync();
     assert!(matches!(
@@ -171,7 +263,10 @@ fn test_async_group_keeps_group_target_and_local_shutdown() {
     operation.wait_settlement().unwrap();
     let shutdown = async_group.request_shutdown(ShutdownMode::Drain);
     assert!(matches!(
-        shutdown.as_sync().wait_for(std::time::Duration::from_secs(2)).unwrap(),
+        shutdown
+            .as_sync()
+            .wait_for(std::time::Duration::from_secs(2))
+            .unwrap(),
         ShutdownWait::Completed(_)
     ));
     assert!(

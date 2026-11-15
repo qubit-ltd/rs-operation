@@ -86,7 +86,10 @@ impl GroupCore {
     ///
     /// Returns the admission reason when shutdown or capacity prevents
     /// reservation.
-    pub(crate) fn reserve(self: &Arc<Self>, descendant: bool) -> Result<GroupPermit, AdmissionError> {
+    pub(crate) fn reserve(
+        self: &Arc<Self>,
+        descendant: bool,
+    ) -> Result<GroupPermit, AdmissionError> {
         let mut state = lock(&self.state);
         if state.mode == ShutdownMode::Cancel {
             return Err(AdmissionError::Stopped);
@@ -104,6 +107,29 @@ impl GroupCore {
         })
     }
 
+    /// Checks whether a submission can retry group admission without reserving a slot.
+    pub(crate) fn retry_admission(&self, descendant: bool) -> Result<bool, AdmissionError> {
+        let state = lock(&self.state);
+        if state.mode == ShutdownMode::Cancel {
+            return Err(AdmissionError::Stopped);
+        }
+        if !state.accepting && !descendant {
+            return Err(AdmissionError::Closed);
+        }
+        Ok(state.active < self.capacity)
+    }
+
+    pub(crate) fn admission_generation(&self) -> u64 {
+        self.notify.generation()
+    }
+
+    pub(crate) fn admission_notified_since(
+        &self,
+        generation: u64,
+    ) -> crate::v02::internal::notify::Notified {
+        self.notify.notified_since(generation)
+    }
+
     /// Stops new root submissions while preserving accepted descendants.
     ///
     /// # Parameters
@@ -111,6 +137,8 @@ impl GroupCore {
     /// - `self`: Group core whose root admission is closed.
     pub(in crate::v02::manager::group) fn close(&self) {
         lock(&self.state).accepting = false;
+        self.changed.notify_all();
+        self.notify.notify_waiters();
     }
 
     /// Registers an operation scope and marks its operation as queued.
@@ -125,7 +153,11 @@ impl GroupCore {
     ///
     /// `true` if registration succeeded; cancellation mode rejects it.
     #[must_use]
-    pub(crate) fn register_scope(&self, id: OperationId, scope: Weak<crate::v02::scope::ScopeCore>) -> bool {
+    pub(crate) fn register_scope(
+        &self,
+        id: OperationId,
+        scope: Weak<crate::v02::scope::ScopeCore>,
+    ) -> bool {
         let mut state = lock(&self.state);
         if state.mode == ShutdownMode::Cancel {
             return false;
@@ -181,7 +213,11 @@ impl GroupCore {
             if mode == ShutdownMode::Cancel {
                 state.mode = mode;
                 (
-                    state.scopes.values().filter_map(Weak::upgrade).collect::<Vec<_>>(),
+                    state
+                        .scopes
+                        .values()
+                        .filter_map(Weak::upgrade)
+                        .collect::<Vec<_>>(),
                     state
                         .services
                         .values()
@@ -302,7 +338,9 @@ impl GroupCore {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state = next;
                 if result.timed_out()
-                    && (state.active != 0 || !state.services.is_empty() || !state.recoveries.is_empty())
+                    && (state.active != 0
+                        || !state.services.is_empty()
+                        || !state.recoveries.is_empty())
                 {
                     return false;
                 }
@@ -402,7 +440,11 @@ impl GroupCore {
         let (operations, services) = {
             let state = lock(&self.state);
             (
-                state.scopes.values().filter_map(Weak::upgrade).collect::<Vec<_>>(),
+                state
+                    .scopes
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .collect::<Vec<_>>(),
                 state
                     .services
                     .values()
@@ -410,7 +452,10 @@ impl GroupCore {
                     .collect::<Vec<_>>(),
             )
         };
-        operations.iter().map(|scope| scope.cleanup_in_flight()).sum::<usize>()
+        operations
+            .iter()
+            .map(|scope| scope.cleanup_in_flight())
+            .sum::<usize>()
             + services
                 .iter()
                 .map(crate::v02::resource::ResourceScope::cleanup_in_flight)
@@ -457,7 +502,11 @@ impl GroupCore {
     /// - `handle`: Recovery handle whose active state changed.
     /// - `active`: Whether the handle should remain counted as active recovery.
     /// - `self`: Group core whose recovery accounting is updated.
-    pub(crate) fn recovery_changed(&self, handle: crate::v02::resource::RecoveryHandle, active: bool) {
+    pub(crate) fn recovery_changed(
+        &self,
+        handle: crate::v02::resource::RecoveryHandle,
+        active: bool,
+    ) {
         let removed = {
             let mut state = lock(&self.state);
             if active {

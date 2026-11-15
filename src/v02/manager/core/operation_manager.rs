@@ -39,7 +39,6 @@ use super::block_on;
 use super::child_outcome_summary;
 use super::lock;
 use super::panic_message;
-use super::resolve_wait_parent;
 use crate::v02::scope::ExecutionContextGuard;
 
 /// A synchronous submission view over a shared manager coordinator.
@@ -79,7 +78,9 @@ impl OperationManager {
     ///
     /// Returns `ManagerCreateError` if the configured production resources
     /// cannot be initialized.
-    pub fn new(options: crate::v02::report::ManagerOptions) -> Result<Self, crate::v02::report::ManagerCreateError> {
+    pub fn new(
+        options: crate::v02::report::ManagerOptions,
+    ) -> Result<Self, crate::v02::report::ManagerCreateError> {
         crate::v02::manager::production::new_sync(options)
     }
 
@@ -127,7 +128,8 @@ impl OperationManager {
     /// The call stops new submissions while accepted work continues to drain.
     #[inline]
     pub fn close_admission(&self) {
-        self.core.request_shutdown(crate::v02::report::ShutdownMode::Drain);
+        self.core
+            .request_shutdown(crate::v02::report::ShutdownMode::Drain);
     }
 
     /// Requests shutdown and returns a handle for observing its completion.
@@ -168,7 +170,8 @@ impl OperationManager {
     pub fn group(
         &self,
         options: crate::v02::report::GroupOptions,
-    ) -> Result<crate::v02::manager::group::OperationGroup, crate::v02::report::ManagerCreateError> {
+    ) -> Result<crate::v02::manager::group::OperationGroup, crate::v02::report::ManagerCreateError>
+    {
         crate::v02::manager::group::OperationGroup::new(self.clone(), options)
     }
 
@@ -212,12 +215,17 @@ impl OperationManager {
     pub(crate) fn service_resource_scope(
         &self,
         capacity: usize,
-    ) -> Result<crate::v02::resource::service::ServiceResourceScope, crate::v02::report::ResourceScopeError> {
+    ) -> Result<
+        crate::v02::resource::service::ServiceResourceScope,
+        crate::v02::report::ResourceScopeError,
+    > {
         self.core
             .service_resource_scope(
                 capacity,
                 match &self.target {
-                    SubmissionTarget::Root { group } | SubmissionTarget::Parent { group, .. } => group.clone(),
+                    SubmissionTarget::Root { group } | SubmissionTarget::Parent { group, .. } => {
+                        group.clone()
+                    }
                 },
             )
             .map(crate::v02::resource::service::ServiceResourceScope::new)
@@ -245,19 +253,25 @@ impl OperationManager {
     #[inline]
     pub(crate) fn with_group(mut self, group: Arc<crate::v02::manager::group::GroupCore>) -> Self {
         match &mut self.target {
-            SubmissionTarget::Root { group: target_group } => *target_group = Some(group),
+            SubmissionTarget::Root {
+                group: target_group,
+            } => *target_group = Some(group),
             SubmissionTarget::Parent {
-                group: target_group, ..
+                group: target_group,
+                ..
             } => *target_group = Some(group),
         }
         self
     }
 
     /// Submits a synchronous operation, waiting for retryable capacity
-    /// pressure.
+    /// pressure in its group, manager, or selected executor.
     ///
     /// The body is retained and retried only when admission reports `Busy`;
     /// other admission failures return it to the caller in `SubmitError`.
+    /// Waiting is bounded by the manager's admission-waiter limit and does not
+    /// guarantee FIFO ordering. Root submissions are rejected after manager
+    /// Drain begins, while descendants of accepted scopes may continue.
     ///
     /// # Type Parameters
     ///
@@ -279,7 +293,11 @@ impl OperationManager {
     /// # Errors
     ///
     /// Returns the original body with the admission or operation setup error.
-    pub fn submit<T, E, F>(&self, options: OperationOptions, body: F) -> Result<OperationHandle<T, E>, SubmitError<F>>
+    pub fn submit<T, E, F>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<OperationHandle<T, E>, SubmitError<F>>
     where
         T: Send + 'static,
         E: Send + 'static,
@@ -289,7 +307,8 @@ impl OperationManager {
         loop {
             match self.try_submit(
                 options.clone(),
-                body.take().expect("submission body remains available until accepted"),
+                body.take()
+                    .expect("submission body remains available until accepted"),
             ) {
                 Ok(handle) => return Ok(handle),
                 Err(error) => {
@@ -297,11 +316,11 @@ impl OperationManager {
                     if reason != AdmissionError::Busy {
                         return Err(SubmitError::new(reason, original));
                     }
-                    let parent = match resolve_wait_parent(&self.target) {
-                        Ok(parent) => parent,
-                        Err(reason) => return Err(SubmitError::new(reason, original)),
-                    };
-                    if let Err(reason) = block_on(self.core.wait_for_retry_capacity(parent, options.clone())) {
+                    if let Err(reason) = block_on(self.core.wait_for_retry_capacity(
+                        &self.target,
+                        ExecutionKind::Sync,
+                        options.clone(),
+                    )) {
                         return Err(SubmitError::new(reason, original));
                     }
                     body = Some(original);
@@ -351,17 +370,24 @@ impl OperationManager {
         let parts: Arc<Mutex<Option<RunnerParts<T, E>>>> = Arc::new(Mutex::new(None));
         let parts_for_job = Arc::clone(&parts);
         let runner = move |scope: OperationScope| {
-            let body = lock(&body_for_job).take().expect("accepted body is present");
-            let (operation, slot, lease, parent, control) =
-                lock(&parts_for_job).take().expect("accepted runner capsule is present");
+            let body = lock(&body_for_job)
+                .take()
+                .expect("accepted body is present");
+            let (operation, slot, lease, parent, control) = lock(&parts_for_job)
+                .take()
+                .expect("accepted runner capsule is present");
             let scope_core = Arc::clone(&scope.core);
             let operation_id = scope.id();
             let frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
             operation.set_execution(ExecutionPhase::Running);
-            let manager_core = scope_core.manager().upgrade().expect("active scope manager exists");
+            let manager_core = scope_core
+                .manager()
+                .upgrade()
+                .expect("active scope manager exists");
             let group = scope_core.group().cloned();
             let result = {
-                let _context = ExecutionContextGuard::enter(&manager_core, operation_id, group.as_ref());
+                let _context =
+                    ExecutionContextGuard::enter(&manager_core, operation_id, group.as_ref());
                 panic::catch_unwind(AssertUnwindSafe(|| body(scope)))
             };
             operation.set_execution(ExecutionPhase::Finished);
@@ -496,7 +522,9 @@ impl OperationManager {
         let mut operation = self
             .submit(options, body)
             .map_err(crate::v02::report::RunError::Submit)?;
-        operation.wait_outcome().map_err(crate::v02::report::RunError::Outcome)
+        operation
+            .wait_outcome()
+            .map_err(crate::v02::report::RunError::Outcome)
     }
 
     /// Submits a synchronous operation and waits for both outcome and
@@ -540,7 +568,10 @@ impl OperationManager {
         let settlement = operation
             .wait_settlement()
             .map_err(crate::v02::report::RunError::Observation)?;
-        Ok(crate::v02::report::OperationCompletion { outcome, settlement })
+        Ok(crate::v02::report::OperationCompletion {
+            outcome,
+            settlement,
+        })
     }
 
     /// Submits a unit-returning body through the test execution port.
@@ -557,7 +588,8 @@ impl OperationManager {
     where
         F: FnOnce(OperationScope) + Send + 'static,
     {
-        self.core.submit_scope(&self.target, OperationOptions::default(), body)
+        self.core
+            .submit_scope(&self.target, OperationOptions::default(), body)
     }
 
     /// Submits a configured unit-returning body through the test port.
