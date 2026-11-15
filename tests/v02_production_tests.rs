@@ -6,13 +6,13 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
-use std::sync::Arc;
-use std::sync::Barrier;
-use std::sync::mpsc;
 use std::any::Any;
 use std::future::Future;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::Barrier;
+use std::sync::mpsc;
 use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
@@ -260,11 +260,17 @@ fn test_async_body_poll_and_drop_panics_preserve_poll_panic() {
         .unwrap()
         .into_sync();
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || sender.send((operation.wait_outcome(), operation.wait_settlement())).unwrap());
+    std::thread::spawn(move || {
+        sender
+            .send((operation.wait_outcome(), operation.wait_settlement()))
+            .unwrap()
+    });
     let (outcome, settlement) = receiver
         .recv_timeout(Duration::from_secs(3))
         .expect("poll and final drop panics should be contained");
-    let OperationOutcome::Panicked(panic) = outcome.unwrap() else { panic!("poll panic should be reported") };
+    let OperationOutcome::Panicked(panic) = outcome.unwrap() else {
+        panic!("poll panic should be reported")
+    };
     assert!(panic.summary.as_str().contains("future poll failed"));
     assert!(settlement.unwrap().all_released());
     assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -308,7 +314,11 @@ fn test_async_body_drop_panic_safely_discards_error_with_panicking_drop() {
         .unwrap()
         .into_sync();
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || sender.send((operation.wait_outcome(), operation.wait_settlement())).unwrap());
+    std::thread::spawn(move || {
+        sender
+            .send((operation.wait_outcome(), operation.wait_settlement()))
+            .unwrap()
+    });
     let (outcome, settlement) = receiver
         .recv_timeout(Duration::from_secs(3))
         .expect("discarding an error with a panicking destructor should stay contained");

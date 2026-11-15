@@ -15,8 +15,8 @@ use std::task::Poll;
 
 use super::ExecutionContextGuard;
 use crate::v02::manager::core::CatchUnwindFuture;
-use crate::v02::manager::core::dispose_panic_payload;
 use crate::v02::manager::core::ManagerCore;
+use crate::v02::manager::core::dispose_panic_payload;
 use crate::v02::manager::group::GroupCore;
 use crate::v02::report::OperationId;
 
@@ -104,7 +104,9 @@ impl<F: Future> Future for ExecutionContextFuture<F> {
     }
 }
 
+/// Drops the owned future while the operation execution context is installed.
 impl<F> Drop for ExecutionContextFuture<F> {
+    /// Drops the owned future with its execution context installed.
     fn drop(&mut self) {
         let _context = ExecutionContextGuard::enter(&self.manager, self.operation, self.group.as_ref());
         if let Err(payload) = self.future.drop_inner() {

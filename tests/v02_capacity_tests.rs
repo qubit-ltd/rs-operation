@@ -221,10 +221,7 @@ fn test_manager_resource_limit_is_inherited_by_default_root_and_can_be_overridde
             },
         )
         .unwrap();
-    assert!(matches!(
-        three.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(())
-    ));
+    assert!(matches!(three.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
     three.wait_settlement().unwrap();
 
     let mut one = manager
@@ -243,10 +240,7 @@ fn test_manager_resource_limit_is_inherited_by_default_root_and_can_be_overridde
             },
         )
         .unwrap();
-    assert!(matches!(
-        one.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(())
-    ));
+    assert!(matches!(one.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
     one.wait_settlement().unwrap();
 }
 
@@ -288,10 +282,7 @@ fn test_child_resource_request_is_clamped_by_parent_and_capacity_is_reused_after
                         },
                     )
                     .unwrap();
-                assert!(matches!(
-                    child.wait_outcome().unwrap(),
-                    OperationOutcome::Succeeded(())
-                ));
+                assert!(matches!(child.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
                 child.wait_settlement().unwrap();
                 let mut reused = scope
                     .manager()
@@ -353,14 +344,8 @@ fn test_default_limits_are_replaced_as_a_whole_and_changed_limits_are_not_field_
 
     let mut default_limits = manager
         .try_submit(OperationOptions::default(), |scope| {
-            let _first = scope
-                .resource_scope(ResourceScopeOptions { capacity: 1 })
-                .unwrap();
-            assert!(
-                scope
-                    .resource_scope(ResourceScopeOptions { capacity: 1 })
-                    .is_err()
-            );
+            let _first = scope.resource_scope(ResourceScopeOptions { capacity: 1 }).unwrap();
+            assert!(scope.resource_scope(ResourceScopeOptions { capacity: 1 }).is_err());
             Ok::<_, ()>(())
         })
         .unwrap();
@@ -380,12 +365,8 @@ fn test_default_limits_are_replaced_as_a_whole_and_changed_limits_are_not_field_
                 ..OperationOptions::default()
             },
             |scope| {
-                let _first = scope
-                    .resource_scope(ResourceScopeOptions { capacity: 1 })
-                    .unwrap();
-                let _second = scope
-                    .resource_scope(ResourceScopeOptions { capacity: 1 })
-                    .unwrap();
+                let _first = scope.resource_scope(ResourceScopeOptions { capacity: 1 }).unwrap();
+                let _second = scope.resource_scope(ResourceScopeOptions { capacity: 1 }).unwrap();
                 Ok::<_, ()>(())
             },
         )
@@ -425,10 +406,7 @@ fn test_default_child_limits_are_replaced_then_clamped_by_parent_limits() {
                         Ok::<_, ()>(())
                     })
                     .unwrap();
-                assert!(matches!(
-                    child.wait_outcome().unwrap(),
-                    OperationOutcome::Succeeded(())
-                ));
+                assert!(matches!(child.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
                 child.wait_settlement().unwrap();
                 Ok::<_, ()>(())
             },

@@ -14,7 +14,6 @@ use std::sync::Mutex;
 
 use super::AdmissionError;
 use super::AsyncOperationHandle;
-use super::dispose_panic_payload;
 use super::ChildRelease;
 use super::DiagnosticSummary;
 use super::ExecutionFrameGuard;
@@ -37,6 +36,7 @@ use super::StopControl;
 use super::SubmissionTarget;
 use super::SubmitError;
 use super::child_outcome_summary;
+use super::dispose_panic_payload;
 use super::lock;
 use super::panic_message;
 use crate::v02::scope::ExecutionContextFuture;
@@ -273,13 +273,7 @@ impl AsyncOperationManager {
                 };
                 let result = match construction {
                     Ok(user_future) => {
-                        ExecutionContextFuture::new(
-                            user_future,
-                            manager_core,
-                            operation_id,
-                            group,
-                        )
-                        .await
+                        ExecutionContextFuture::new(user_future, manager_core, operation_id, group).await
                     }
                     Err(payload) => Err(payload),
                 };

@@ -31,6 +31,8 @@ use crate::v02::context::OperationContext;
 use crate::v02::manager::core::OperationManager;
 #[cfg(test)]
 use crate::v02::manager::core::TestPort;
+#[cfg(test)]
+use crate::v02::manager::core::dispose_panic_payload;
 use crate::v02::operation::OperationCore;
 use crate::v02::operation::OutcomeSlot;
 use crate::v02::report::AdmissionError;
@@ -397,7 +399,9 @@ impl ManagerCore {
                 let _context = ExecutionContextGuard::enter(&manager, id, group.as_ref());
                 body(scope)
             };
-            ExecutionContextFuture::new(user_future, manager, id, group).await;
+            if let Err(payload) = ExecutionContextFuture::new(user_future, manager, id, group).await {
+                dispose_panic_payload(payload);
+            }
         };
         permit.execution.dispatch(OperationJob::Async(Box::pin(future)));
         Ok(id)

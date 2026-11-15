@@ -15,9 +15,17 @@ use std::task::Context;
 use std::task::Poll;
 
 /// Owned payload returned when a protected user operation unwinds.
+///
+/// # Type Parameters
+///
+/// This alias has no type parameters.
 pub(crate) type PanicPayload = Box<dyn Any + Send>;
 
 /// Owns a pinned future whose poll and final drop can be caught separately.
+///
+/// # Type Parameters
+///
+/// - `F`: Future stored in a pinned allocation.
 pub(crate) struct CatchUnwindFuture<F>(
     /// Pinned allocation that can be moved as a handle and taken exactly once.
     Option<Pin<Box<F>>>,
@@ -25,15 +33,20 @@ pub(crate) struct CatchUnwindFuture<F>(
 
 impl<F> CatchUnwindFuture<F> {
     /// Pins a future in a takeable allocation without moving its value.
+    ///
+    /// # Parameters
+    ///
+    /// - `future`: Future value to pin and own.
     pub(crate) fn new(future: F) -> Self {
         Self(Some(Box::pin(future)))
     }
 
     /// Polls the pinned future and returns any panic payload without unwinding.
-    pub(crate) fn poll(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Result<Poll<F::Output>, PanicPayload>
+    ///
+    /// # Parameters
+    ///
+    /// - `context`: Task context passed to the pinned future.
+    pub(crate) fn poll(&mut self, context: &mut Context<'_>) -> Result<Poll<F::Output>, PanicPayload>
     where
         F: Future,
     {
@@ -51,7 +64,8 @@ impl<F> CatchUnwindFuture<F> {
 }
 
 impl<F> Drop for CatchUnwindFuture<F> {
-    /// Contains a remaining future's drop panic during cancellation or teardown.
+    /// Contains a remaining future's drop panic during cancellation or
+    /// teardown.
     fn drop(&mut self) {
         if let Err(payload) = self.drop_inner() {
             dispose_panic_payload(payload);
@@ -60,6 +74,10 @@ impl<F> Drop for CatchUnwindFuture<F> {
 }
 
 /// Disposes of a panic payload while preventing its destructor from unwinding.
+///
+/// # Parameters
+///
+/// - `payload`: Panic payload to dispose of inside a second unwind boundary.
 pub(crate) fn dispose_panic_payload(payload: PanicPayload) {
     if let Err(secondary) = panic::catch_unwind(AssertUnwindSafe(|| drop(payload))) {
         // A panic payload whose destructor also panics cannot be safely freed.
