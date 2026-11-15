@@ -63,6 +63,25 @@ path = "tests/v02_production_tests.rs"
 name = "v02_service_resource"
 path = "tests/v02_service_resource_tests.rs"
 
+[[example]]
+name = "guide_detect_file"
+path = "doc/examples-0.2.0/detect_file.rs"
+
+[[example]]
+name = "guide_family_and_capacity"
+path = "doc/examples-0.2.0/family_and_capacity.rs"
+crate-type = ["lib"]
+
+[[example]]
+name = "guide_inference"
+path = "doc/examples-0.2.0/inference.rs"
+crate-type = ["lib"]
+
+[[example]]
+name = "guide_submission_context"
+path = "doc/examples-0.2.0/submission_context.rs"
+crate-type = ["lib"]
+
 [features]
 default = []
 

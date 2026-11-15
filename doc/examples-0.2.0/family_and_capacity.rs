@@ -12,17 +12,20 @@ use qubit_operation::ManagerOptions;
 use qubit_operation::OperationOptions;
 use qubit_operation::OperationOutcome;
 
+/// Result produced by the managed file summary child.
 #[derive(Debug)]
-struct FileSummary {
-    byte_count: usize,
-    mime: Option<&'static str>,
+pub struct FileSummary {
+    /// Number of bytes in the source file.
+    pub byte_count: usize,
+    /// Detected MIME type, when the sample header matches.
+    pub mime: Option<&'static str>,
 }
 
 /// Submits a parent operation that summarizes file bytes in a managed child.
 ///
 /// The child uses the manager derived from the parent scope, keeping both
 /// operations in the same operation family.
-fn submit_file_summary(
+pub fn submit_file_summary(
     manager: &AsyncOperationManager,
     bytes: Vec<u8>,
 ) -> Result<AsyncOperationHandle<FileSummary, String>, AdmissionError> {
@@ -57,7 +60,7 @@ fn submit_file_summary(
 ///
 /// The resource limit is supplied by the caller so the example can show how
 /// manager-level scope limits are configured.
-fn create_capacity_demo_manager(resource_limit: usize) -> Result<AsyncOperationManager, String> {
+pub fn create_capacity_demo_manager(resource_limit: usize) -> Result<AsyncOperationManager, String> {
     let mut options = ManagerOptions::default();
     options.scope_limits.child_operations = 2;
     options.scope_limits.resources = resource_limit;
@@ -68,7 +71,7 @@ fn create_capacity_demo_manager(resource_limit: usize) -> Result<AsyncOperationM
 ///
 /// The parent manages input and request metadata; the child manages a copied
 /// portion of that input to demonstrate resource accounting across a family.
-fn submit_capacity_demo(
+pub fn submit_capacity_demo(
     manager: &AsyncOperationManager,
     resource_limit: usize,
 ) -> Result<AsyncOperationHandle<(), String>, AdmissionError> {
