@@ -52,9 +52,10 @@ The crate does not detect MIME types, provide file or command adapters, or imple
 
 ## Learn More
 
-- [0.2.0 中文开发者手册](doc/developer_guide-0.2.0.zh_CN.md) · [0.2 API 设计](doc/design-0.2.0.zh_CN.md)
+- [0.2.0 Developer Guide](doc/developer_guide-0.2.0.md) · [中文开发者手册](doc/developer_guide-0.2.0.zh_CN.md) · [0.2 API 设计](doc/design-0.2.0.zh_CN.md)
+- Migration: [0.1 to 0.2 (English)](doc/migration-0.1-to-0.2.md) · [中文迁移指南](doc/migration-0.1-to-0.2.zh_CN.md)
 - [0.2 adapter integration guide (Chinese)](doc/adapter-guide.zh_CN.md)
-- Historical 0.1 guides: [English](doc/user_guide.md) · [中文](doc/user_guide.zh_CN.md)
+- Historical 0.1 user guides (describe the incompatible 0.1 API): [English](doc/user_guide.md) · [中文](doc/user_guide.zh_CN.md)
 - [API reference](https://docs.rs/qubit-operation)
 - Runnable 0.2 examples: [file detection](examples/detect_file.rs), [inference](examples/inference.rs), [parent and capacity](examples/family_and_capacity.rs), [submission context](examples/submission_context.rs)
 - [中文 README](README.zh_CN.md)

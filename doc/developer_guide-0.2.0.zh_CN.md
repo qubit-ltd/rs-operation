@@ -909,7 +909,11 @@ OperationOptions.context 接受 ContextOptions，其中可以配置 ClockSource�
 
 关闭顺序是停止准入，再等待操作和资源。Drain 允许已接纳操作完成必要子工作；Cancel 进一步请求停止并禁止新子提交。Drain 可以升级到 Cancel，不可重新开放准入。
 
-request_shutdown 立即返回 ShutdownHandle 或 AsyncShutdownHandle。wait 等待最终关闭，wait_for/wait_until 返回 Completed 或 Pending。Pending 时保留 handle，检查活动任务、未确认使用者、清理、恢复和服务资源计数，再次等待。
+`request_shutdown` 立即返回 `ShutdownHandle` 或 `AsyncShutdownHandle`。同步和异步 `wait()` 都返回 `Result<ShutdownReport, ObservationError>`；在目标自身操作中等待会得到 `WouldDeadlock`。同步 `wait_for(Duration::ZERO)` 只做快照检查，即使从目标操作内调用也不会阻塞；正时长等待若依赖当前操作结束则返回 `WouldDeadlock`。异步 `wait_until` 先验证时钟和时间域，再检查完成状态；已过期的 deadline 返回 `Pending`，不等待也不报自等待错误。
+
+`wait_for` 的 deadline 若无法由平台 `Instant` 表示，会等待至关闭完成，而不会把超大时长当作零。`Pending` 时保留 handle，检查活动任务、未确认使用者、清理、恢复和服务资源计数，再次等待。Drain 完成后策略仍为 Drain；收到 Cancel 后策略单调升级为 Cancel，后续 Drain 不会降级它。
+
+自等待检查覆盖框架执行上下文中直接等待自身 manager 或 group 的情况，并保守拒绝会阻塞当前执行器进展的同步等待。它无法发现任意脱离框架的跨任务依赖环；若外部任务仍需等待当前主体返回，应用应把最终关闭等待移到主体之外。
 
 服务状态中保存的 ResourceRef 也算使用引用。关闭资源范围不会强行撤销它们，应用需要结束这些使用，才能让计数归零。runtime 和领域执行器应保持可用到其清理责任完成，再按各自协议关闭。
 
@@ -989,4 +993,4 @@ Result<Arc<SettlementReport>, ObservationError>
 - [中文 README](../README.zh_CN.md)：项目定位和场景。
 - [0.2 适配器接入指南](adapter-guide.zh_CN.md)：围绕 ResourceRef、scope.manager() 和 settlement 组织领域资源接入。
 
-本文目前仅提供中文版本。四个 Cargo 示例以本目录源码为单一依据；请在 0.2 实现整合后编译并运行目标路径，验证结果应以实际运行记录为准。
+英文对应版本见 [0.2.0 Developer Guide](developer_guide-0.2.0.md)。四个 Cargo 示例以本目录源码为单一依据；本指南解释其接入路径，实际输出以示例运行结果为准。

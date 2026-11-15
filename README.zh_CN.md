@@ -52,9 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 延伸阅读
 
-- [0.2.0 中文开发者手册](doc/developer_guide-0.2.0.zh_CN.md) · [0.2 API 设计](doc/design-0.2.0.zh_CN.md)
+- [0.2.0 Developer Guide](doc/developer_guide-0.2.0.md) · [0.2.0 中文开发者手册](doc/developer_guide-0.2.0.zh_CN.md) · [0.2 API 设计](doc/design-0.2.0.zh_CN.md)
+- 迁移说明：[0.1 到 0.2（English）](doc/migration-0.1-to-0.2.md) · [中文迁移指南](doc/migration-0.1-to-0.2.zh_CN.md)
 - [0.2 适配器接入指南（中文）](doc/adapter-guide.zh_CN.md)
-- 历史 0.1 用户指南：[中文](doc/user_guide.zh_CN.md) · [English](doc/user_guide.md)
+- 历史版 0.1 用户指南（介绍不兼容的 0.1 API）：[中文](doc/user_guide.zh_CN.md) · [English](doc/user_guide.md)
 - [API 文档](https://docs.rs/qubit-operation)
 - 0.2 可运行示例：[文件检测](examples/detect_file.rs)、[推理](examples/inference.rs)、[父子操作与容量](examples/family_and_capacity.rs)、[提交上下文](examples/submission_context.rs)
 - [English README](README.md)
