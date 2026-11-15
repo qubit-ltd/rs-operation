@@ -267,7 +267,7 @@ impl ScopeCore {
     /// Validates a reservation and transfers its permits into a new resource
     /// owner.
     ///
-    /// Advances the scope's slot counter and decrements its in-progress
+    /// Allocates a process-wide slot and decrements the scope's in-progress
     /// reservation count. The caller must hold the state mutex for the duration
     /// of this operation so closure cannot race the commit.
     ///
