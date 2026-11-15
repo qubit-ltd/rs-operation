@@ -111,6 +111,25 @@ fn test_sync_manager_self_wait_returns_would_deadlock() {
 }
 
 #[test]
+fn test_sync_operation_can_wait_for_an_independent_manager() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let observed = OperationManager::new(ManagerOptions::default()).unwrap();
+    let (result_tx, result_rx) = mpsc::channel();
+    let mut operation = manager
+        .try_submit(OperationOptions::default(), move |_| {
+            let shutdown = observed.request_shutdown(ShutdownMode::Drain);
+            result_tx.send(shutdown.wait()).unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(result_rx.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+}
+
+#[test]
 fn test_sync_group_self_wait_returns_would_deadlock() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
