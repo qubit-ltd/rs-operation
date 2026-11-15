@@ -1,4 +1,14 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
+use std::any::TypeId;
 use std::sync::Arc;
+use std::sync::PoisonError;
 
 use super::ResourceKey;
 use super::ResourceRef;
@@ -8,25 +18,63 @@ use super::resource_error::ManageResourceError;
 use super::resource_error::ManageWithError;
 use crate::v02::manager::capacity::ScopeCapacity;
 use crate::v02::report::ManagerId;
+use crate::v02::report::RecoveryHandle;
 use crate::v02::report::ResourceCapacityError;
 use crate::v02::report::ResourceLookupError;
 use crate::v02::report::ResourceManageErrorKind;
+use crate::v02::report::ResourceProgress;
 use crate::v02::report::ResourceScopeId;
 use crate::v02::report::ResourceScopeReport;
+#[cfg(test)]
 use crate::v02::report::TransferReceipt;
 use crate::v02::resource::cleanup_port::CleanupDispatch;
 
-/// Independently endable heterogeneous resource scope.
+/// Independently endable scope that owns heterogeneous managed resources.
+///
+/// An operation obtains this scope from its body context with
+/// [`crate::OperationScope::resource_scope`].
+/// Registered values remain readable through live [`ResourceRef`] handles
+/// after the scope ends, while cleanup waits until users release those handles.
+/// The public scope handle is not cloneable; the framework retains internal
+/// references as needed to finish cleanup and settlement reporting.
+///
+/// # Examples
+///
+/// ```
+/// use qubit_operation::ResourceScope;
+///
+/// // An operation body receives its independent resource scope from the
+/// // OperationScope context.
+/// fn use_resource_scope(scope: &ResourceScope) {
+///     match scope.manage(String::from("temporary")) {
+///         Ok(resource) => {
+///             assert_eq!(&*resource, "temporary");
+///             drop(resource);
+///         }
+///         Err(_error) => return,
+///     }
+///     scope.end();
+/// }
+/// ```
+#[must_use = "keep the scope alive while managing its resources"]
 pub struct ResourceScope {
+    /// Shared internal state retained while resources or cleanup remain active.
     state: Arc<ScopeState>,
 }
 impl ResourceScope {
-    pub(crate) fn id(&self) -> ResourceScopeId {
-        self.state.core.id
-    }
-    pub(crate) fn cleanup_in_flight(&self) -> usize {
-        self.state.cleanup_in_flight()
-    }
+    /// Creates a scope with manager identity, capacity accounting, and cleanup
+    /// dispatch.
+    ///
+    /// # Parameters
+    ///
+    /// * `manager` — identity of the manager that owns the scope.
+    /// * `id` — unique identity assigned to this resource scope.
+    /// * `capacity` — hierarchical resource capacity inherited by this scope.
+    /// * `cleanup` — dispatcher that accepts reserved cleanup jobs.
+    ///
+    /// # Returns
+    ///
+    /// A new resource scope with open admission and empty ownership state.
     pub(crate) fn new(
         manager: ManagerId,
         id: ResourceScopeId,
@@ -37,67 +85,32 @@ impl ResourceScope {
             state: ScopeState::new(manager, id, capacity, cleanup),
         }
     }
-    pub(crate) fn reserve(&self) -> Result<ResourceReservation, ResourceCapacityError> {
-        self.state.core.reserve()
-    }
 
-    pub(crate) fn internal_clone(&self) -> Self {
-        Self {
-            state: Arc::clone(&self.state),
-        }
-    }
-
-    pub(crate) fn set_settlement_callback(&self, callback: Box<dyn FnOnce(ResourceScopeReport) + Send + 'static>) {
-        self.state.set_settlement_callback(callback);
-    }
-
-    pub(crate) fn set_progress_callback(
-        &self,
-        callback: Arc<dyn Fn(crate::v02::report::ResourceProgress) + Send + Sync + 'static>,
-    ) {
-        self.state.set_progress_callback(callback);
-    }
-
-    pub(crate) fn set_recovery_callback(
-        &self,
-        callback: Arc<dyn Fn(crate::v02::report::RecoveryHandle, bool) + Send + Sync + 'static>,
-    ) {
-        self.state.set_recovery_callback(callback);
-    }
-
-    pub(crate) fn record_transfer_receipt(&self, receipt: TransferReceipt) -> bool {
-        self.state.record_transfer(receipt)
-    }
-    pub fn manage<T: Send + Sync + 'static>(&self, value: T) -> Result<ResourceRef<T>, ManageResourceError<T>> {
-        let reservation = match self.reserve() {
-            Ok(reservation) => reservation,
-            Err(error) => return Err(ManageResourceError::new(manage_kind(error), value)),
-        };
-        reservation.commit(value).map_err(|error| {
-            let (reason, value, reservation) = error.into_parts();
-            drop(reservation);
-            ManageResourceError::new(reason, value)
-        })
-    }
-
-    pub fn manage_with<T, C>(&self, value: T, policy: C) -> Result<ResourceRef<T>, ManageWithError<T, C>>
-    where
-        T: Send + Sync + 'static,
-        C: super::cleanup::AsyncCleanup<T>,
-    {
-        let reservation = match self.reserve() {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                return Err(ManageWithError::new(manage_kind(error), value, policy));
-            }
-        };
-        reservation.commit_with(value, policy).map_err(|error| {
-            let (reason, value, policy, reservation) = error.into_parts();
-            drop(reservation);
-            ManageWithError::new(reason, value, policy)
-        })
-    }
-
+    /// Reacquires a resource while this owning scope is still open.
+    ///
+    /// Lookup validates the key's manager, scope, type, slot, and generation.
+    /// The returned reference participates in the same user-reference gate as
+    /// the original handle.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — the scope that owns the resource.
+    /// * `key` — typed credential returned when the resource was registered.
+    ///
+    /// # Type Parameters
+    ///
+    /// `T` is the value type bound into the lookup key.
+    ///
+    /// # Returns
+    ///
+    /// A new user reference to the registered value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceLookupError::ScopeEnded`] after closure,
+    /// [`ResourceLookupError::WrongScope`] for a different owner, and
+    /// [`ResourceLookupError::StaleKey`] when the key no longer identifies a
+    /// matching resource.
     pub fn get_resource<T: Send + Sync + 'static>(
         &self,
         key: ResourceKey<T>,
@@ -106,10 +119,10 @@ impl ResourceScope {
         if key.manager != core.manager || key.scope != core.id {
             return Err(ResourceLookupError::WrongScope);
         }
-        if key.type_id != std::any::TypeId::of::<T>() {
+        if key.type_id != TypeId::of::<T>() {
             return Err(ResourceLookupError::StaleKey);
         }
-        let state = core.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = core.state.lock().unwrap_or_else(PoisonError::into_inner);
         if !state.open {
             return Err(ResourceLookupError::ScopeEnded);
         }
@@ -130,11 +143,224 @@ impl ResourceScope {
             slot: key.slot,
         })
     }
+    /// Registers a value for drop-based cleanup and returns a user reference.
+    ///
+    /// Registration reserves both scope resource capacity and cleanup dispatch
+    /// capacity before committing the value. If reservation or commit fails,
+    /// the error returns ownership of `value` to the caller.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — this open scope that will own the registered resource.
+    /// * `value` — resource whose lifetime the scope will manage.
+    ///
+    /// # Type Parameters
+    ///
+    /// `T` must be `Send + Sync + 'static` because the owner and readers may
+    /// outlive the call and move between executor threads.
+    ///
+    /// # Returns
+    ///
+    /// A [`ResourceRef`] that keeps the resource available to its user while
+    /// cleanup remains deferred.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManageResourceError`] with the original value when the scope
+    /// has ended, is stopped, or has exhausted resource or cleanup capacity.
+    pub fn manage<T: Send + Sync + 'static>(&self, value: T) -> Result<ResourceRef<T>, ManageResourceError<T>> {
+        let reservation = match self.reserve() {
+            Ok(reservation) => reservation,
+            Err(error) => return Err(ManageResourceError::new(manage_kind(error), value)),
+        };
+        reservation.commit(value).map_err(|error| {
+            let (reason, value, reservation) = error.into_parts();
+            drop(reservation);
+            ManageResourceError::new(reason, value)
+        })
+    }
+
+    /// Registers a resource with a caller-defined asynchronous cleanup policy.
+    ///
+    /// Capacity and cleanup dispatch are reserved before the value and policy
+    /// are committed. On failure, the returned error preserves both so the
+    /// caller can retry or dispose of them.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — this open scope that will own the registered resource.
+    /// * `value` — managed resource whose lifetime the scope will own.
+    /// * `policy` — asynchronous action used to release the resource.
+    ///
+    /// # Type Parameters
+    ///
+    /// `T` is the shared resource value; `C` is its `AsyncCleanup<T>` policy.
+    ///
+    /// # Returns
+    ///
+    /// A [`ResourceRef`] that allows reads while the value remains available.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManageWithError`] containing the value and policy if the scope
+    /// is ended, stopped, or at capacity.
+    pub fn manage_with<T, C>(&self, value: T, policy: C) -> Result<ResourceRef<T>, ManageWithError<T, C>>
+    where
+        T: Send + Sync + 'static,
+        C: super::cleanup::AsyncCleanup<T>,
+    {
+        let reservation = match self.reserve() {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return Err(ManageWithError::new(manage_kind(error), value, policy));
+            }
+        };
+        reservation.commit_with(value, policy).map_err(|error| {
+            let (reason, value, policy, reservation) = error.into_parts();
+            drop(reservation);
+            ManageWithError::new(reason, value, policy)
+        })
+    }
+
+    /// Ends admission to this scope and begins cleanup when users release
+    /// values.
+    ///
+    /// Existing [`ResourceRef`] handles remain readable. Cleanup and settlement
+    /// callbacks run after outstanding users release their references and the
+    /// cleanup dispatcher confirms the resource outcomes.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — this scope whose admission and resource owners are ended.
+    #[inline]
     pub fn end(&self) {
         self.state.end();
     }
+    /// Returns the internal identity used to associate reports and resources.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — this scope whose identity is read.
+    ///
+    /// # Returns
+    ///
+    /// The stable identifier assigned to this resource scope.
+    #[must_use = "use the scope identifier to associate its resources and reports"]
+    #[inline]
+    pub(crate) fn id(&self) -> ResourceScopeId {
+        self.state.core.id
+    }
+    /// Counts cleanup tasks currently running for this scope.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — this scope whose active cleanup tasks are counted.
+    ///
+    /// # Returns
+    ///
+    /// The number of cleanup tasks currently in flight.
+    #[must_use = "use the cleanup count to observe this scope's progress"]
+    #[inline]
+    pub(crate) fn cleanup_in_flight(&self) -> usize {
+        self.state.cleanup_in_flight()
+    }
+    /// Reserves one resource slot and cleanup queue entry before resource
+    /// creation.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — this scope whose capacity is reserved.
+    ///
+    /// # Returns
+    ///
+    /// A reservation for one resource and its cleanup dispatch entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceCapacityError::ScopeEnded`] after closure,
+    /// [`ResourceCapacityError::Stopped`] after shutdown, or
+    /// [`ResourceCapacityError::CapacityExceeded`] when a capacity limit is
+    /// reached.
+    #[inline]
+    pub(crate) fn reserve(&self) -> Result<ResourceReservation, ResourceCapacityError> {
+        self.state.core.reserve()
+    }
+
+    /// Retains another internal handle to shared scope state.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — this scope whose state is shared with the new handle.
+    ///
+    /// # Returns
+    ///
+    /// Another internal handle referencing the same scope state.
+    #[inline]
+    pub(crate) fn internal_clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Registers the callback invoked after this scope's resources settle.
+    ///
+    /// The callback is internal to operation accounting and runs only after
+    /// cleanup results are available.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — this scope whose completed report is observed.
+    /// * `callback` — callback invoked with the completed scope report.
+    #[inline]
+    pub(crate) fn set_settlement_callback(&self, callback: Box<dyn FnOnce(ResourceScopeReport) + Send + 'static>) {
+        self.state.set_settlement_callback(callback);
+    }
+
+    /// Registers an internal observer for resource cleanup progress changes.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — this scope whose cleanup progress is observed.
+    /// * `callback` — observer notified when cleanup progress changes.
+    #[inline]
+    pub(crate) fn set_progress_callback(&self, callback: Arc<dyn Fn(ResourceProgress) + Send + Sync + 'static>) {
+        self.state.set_progress_callback(callback);
+    }
+
+    /// Registers an internal callback for recovery records created by cleanup.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — this scope whose recovery records are observed.
+    /// * `callback` — callback receiving each recovery record and its status.
+    #[inline]
+    pub(crate) fn set_recovery_callback(&self, callback: Arc<dyn Fn(RecoveryHandle, bool) + Send + Sync + 'static>) {
+        self.state.set_recovery_callback(callback);
+    }
+
+    /// Adds a transfer receipt to the eventual settlement report.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — this scope receiving the transfer evidence.
+    /// * `receipt` — accepted transfer to include in the settlement report.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the receipt is accepted; `false` when settlement has sealed
+    /// the report against further updates.
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn record_transfer_receipt(&self, receipt: TransferReceipt) -> bool {
+        self.state.record_transfer(receipt)
+    }
 }
 impl Drop for ResourceScope {
+    /// Ends the scope when this is its final internal handle.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — the final handle being dropped.
     fn drop(&mut self) {
         if Arc::strong_count(&self.state) == 1 {
             self.end();
@@ -142,6 +368,17 @@ impl Drop for ResourceScope {
     }
 }
 
+/// Converts an internal capacity failure to the resource-management error kind.
+///
+/// # Parameters
+///
+/// * `error` — capacity failure reported by scope admission.
+///
+/// # Returns
+///
+/// The corresponding resource-management failure category.
+#[must_use = "use the mapped failure category to report or handle the error"]
+#[inline]
 fn manage_kind(error: ResourceCapacityError) -> ResourceManageErrorKind {
     match error {
         ResourceCapacityError::ScopeEnded => ResourceManageErrorKind::ScopeEnded,
@@ -152,408 +389,23 @@ fn manage_kind(error: ResourceCapacityError) -> ResourceManageErrorKind {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-
-    use super::ResourceScope;
-    use crate::v02::executor::CleanupExecutor;
-    use crate::v02::manager::capacity::ManagerCapacityPools;
-    use crate::v02::manager::capacity::ScopeCapacity;
-    use crate::v02::report::ManagerId;
-    use crate::v02::report::ManagerLimits;
-    use crate::v02::report::PortableExecutorOptions;
-    use crate::v02::report::ResourceId;
+    use super::manage_kind;
+    use crate::v02::report::ResourceCapacityError;
     use crate::v02::report::ResourceManageErrorKind;
-    use crate::v02::report::ResourceScopeId;
-    use crate::v02::report::ScopeLimits;
-    use crate::v02::report::ThreadPoolExecutorOptions;
-    use crate::v02::resource::cleanup::CleanupTransferReceiver;
-    use crate::v02::resource::cleanup_port::CleanupDispatch;
-    use crate::v02::resource::cleanup_port::CleanupDispatchPermit;
-    use crate::v02::resource::cleanup_port::CleanupJob;
-    use crate::v02::resource::cleanup_port::CleanupQueueError;
-
-    struct QueueSlot {
-        reserved: bool,
-        job: Option<Box<dyn CleanupJob>>,
-    }
-    struct ManualCleanup {
-        slots: Arc<Mutex<Vec<QueueSlot>>>,
-    }
-    impl ManualCleanup {
-        fn new(limit: usize) -> Arc<Self> {
-            Arc::new(Self {
-                slots: Arc::new(Mutex::new(
-                    (0..limit)
-                        .map(|_| QueueSlot {
-                            reserved: false,
-                            job: None,
-                        })
-                        .collect(),
-                )),
-            })
-        }
-        fn run_all(&self, executor: &Arc<CleanupExecutor>) {
-            let slot_count = self.slots.lock().unwrap().len();
-            for index in 0..slot_count {
-                let job = { self.slots.lock().unwrap()[index].job.take() };
-                let Some(job) = job else { continue };
-                match job.schedule(Arc::clone(executor)) {
-                    Ok(()) => self.slots.lock().unwrap()[index].reserved = false,
-                    Err(job) => {
-                        self.slots.lock().unwrap()[index].job = Some(job);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    impl CleanupDispatch for ManualCleanup {
-        fn reserve(&self) -> Result<Box<dyn CleanupDispatchPermit>, CleanupQueueError> {
-            let mut slots = self.slots.lock().unwrap();
-            let (index, slot) = slots
-                .iter_mut()
-                .enumerate()
-                .find(|(_, slot)| !slot.reserved)
-                .ok_or(CleanupQueueError::Full)?;
-            slot.reserved = true;
-            Ok(Box::new(ManualPermit {
-                slots: Arc::clone(&self.slots),
-                index,
-            }))
-        }
-    }
-    struct ManualPermit {
-        slots: Arc<Mutex<Vec<QueueSlot>>>,
-        index: usize,
-    }
-    impl CleanupDispatchPermit for ManualPermit {
-        fn enqueue(self: Box<Self>, job: Box<dyn CleanupJob>) {
-            let mut slots = self.slots.lock().unwrap();
-            let slot = &mut slots[self.index];
-            assert!(slot.reserved && slot.job.is_none());
-            slot.job = Some(job);
-        }
-    }
-    impl Drop for ManualPermit {
-        fn drop(&mut self) {
-            let mut slots = self.slots.lock().unwrap();
-            let slot = &mut slots[self.index];
-            if slot.job.is_none() {
-                slot.reserved = false;
-            }
-        }
-    }
-
-    fn scope() -> (ResourceScope, Arc<ManualCleanup>) {
-        let manager = ManagerCapacityPools::new(ManagerLimits::default());
-        let cleanup = ManualCleanup::new(16);
-        let scope = ResourceScope::new(
-            ManagerId::new_unique(),
-            ResourceScopeId::new_unique(),
-            Arc::new(ScopeCapacity::root(&manager, 42, ScopeLimits::default())),
-            cleanup.clone(),
-        );
-        (scope, cleanup)
-    }
-    fn executor() -> Arc<CleanupExecutor> {
-        Arc::new(
-            CleanupExecutor::new(
-                ThreadPoolExecutorOptions {
-                    worker_count: 1,
-                    queue_capacity: 16,
-                },
-                PortableExecutorOptions::default(),
-            )
-            .unwrap(),
-        )
-    }
 
     #[test]
-    fn resource_drop_waits_for_manual_cleanup_dispatch() {
-        struct DropCount(Arc<AtomicUsize>);
-        impl Drop for DropCount {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-        let (scope, cleanup) = scope();
-        let executor = executor();
-        let drops = Arc::new(AtomicUsize::new(0));
-        let resource = scope.manage(DropCount(Arc::clone(&drops))).unwrap();
-        drop(resource);
-        scope.end();
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        cleanup.run_all(&executor);
-        executor.shutdown().wait().unwrap();
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn live_resource_reference_reports_waiting_then_cleanup_progress() {
-        let (scope, cleanup) = scope();
-        let progress = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&progress);
-        scope.set_progress_callback(Arc::new(move |value| {
-            observed.lock().unwrap().push(value);
-        }));
-        let resource = scope.manage(String::from("live")).unwrap();
-        scope.end();
+    fn test_capacity_failures_map_to_the_matching_manage_error_kind() {
         assert_eq!(
-            *progress.lock().unwrap(),
-            vec![
-                crate::v02::report::ResourceProgress::ScopeOpen,
-                crate::v02::report::ResourceProgress::WaitingForUsers,
-            ]
+            manage_kind(ResourceCapacityError::ScopeEnded),
+            ResourceManageErrorKind::ScopeEnded,
         );
-        drop(resource);
         assert_eq!(
-            *progress.lock().unwrap(),
-            vec![
-                crate::v02::report::ResourceProgress::ScopeOpen,
-                crate::v02::report::ResourceProgress::WaitingForUsers,
-                crate::v02::report::ResourceProgress::Cleaning,
-            ]
+            manage_kind(ResourceCapacityError::Stopped),
+            ResourceManageErrorKind::Stopped,
         );
-        let executor = executor();
-        cleanup.run_all(&executor);
-        executor.shutdown().wait().unwrap();
-    }
-
-    #[test]
-    fn open_scope_reacquires_resource_by_typed_key() {
-        let (scope, _) = scope();
-        let first = scope.manage(String::from("ready")).unwrap();
-        let key = first.key();
-        let second = scope.get_resource(key).unwrap();
-        assert_eq!(&*second, "ready");
-        assert_eq!(first.id(), second.id());
-    }
-
-    #[test]
-    fn ended_scope_keeps_live_reference_readable_and_disallows_get() {
-        let (scope, _) = scope();
-        let resource = scope.manage(18_u32).unwrap();
-        let key = resource.key();
-        scope.end();
-        assert_eq!(*resource, 18);
-        assert!(matches!(
-            scope.get_resource(key),
-            Err(crate::v02::report::ResourceLookupError::ScopeEnded)
-        ));
-    }
-
-    #[test]
-    fn ended_reservation_commit_returns_resource_and_bound_reservation() {
-        let (scope, _) = scope();
-        let reservation = scope.reserve().unwrap();
-        scope.end();
-        let error = match reservation.commit(String::from("owner")) {
-            Ok(_) => panic!("ended scope accepted commit"),
-            Err(error) => error,
-        };
-        let (reason, resource, reservation) = error.into_parts();
-        assert_eq!(reason, ResourceManageErrorKind::ScopeEnded);
-        assert_eq!(resource, "owner");
-        drop(reservation);
-    }
-
-    #[test]
-    fn retained_cleanup_uses_reservation_after_scope_end() {
-        use std::sync::atomic::AtomicBool;
-
-        use crate::v02::context::CleanupContext;
-        use crate::v02::resource::AsyncCleanup;
-        use crate::v02::resource::CleanupFuture;
-
-        struct CleanupMarker(Arc<AtomicBool>);
-        impl AsyncCleanup<String> for CleanupMarker {
-            fn cleanup(self: Arc<Self>, resource: String, _context: CleanupContext) -> CleanupFuture<String> {
-                Box::pin(async move {
-                    self.0.store(true, Ordering::SeqCst);
-                    drop(resource);
-                    crate::v02::resource::CleanupOutcome::Released
-                })
-            }
-        }
-
-        let (scope, cleanup) = scope();
-        let executor = executor();
-        let progress = Arc::new(Mutex::new(Vec::new()));
-        let observed_progress = Arc::clone(&progress);
-        scope.set_progress_callback(Arc::new(move |value| {
-            observed_progress.lock().unwrap().push(value);
-        }));
-        let reports = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&reports);
-        scope.set_settlement_callback(Box::new(move |report| {
-            observed.lock().unwrap().push(report);
-        }));
-        let reservation = scope.reserve().unwrap();
-        scope.end();
-        let ran_cleanup = Arc::new(AtomicBool::new(false));
-        let policy = CleanupMarker(Arc::clone(&ran_cleanup));
-        let error = match reservation.commit_with(String::from("partial session"), policy) {
-            Ok(_) => panic!("closed resource scope must reject commit"),
-            Err(error) => error,
-        };
-        let (reason, resource, policy, reservation) = error.into_parts();
-        assert_eq!(reason, ResourceManageErrorKind::ScopeEnded);
-        assert_eq!(resource, "partial session");
-        let resource_id = reservation.retain_with_for_cleanup(resource, policy);
-
         assert_eq!(
-            *progress.lock().unwrap(),
-            vec![
-                crate::v02::report::ResourceProgress::ScopeOpen,
-                crate::v02::report::ResourceProgress::WaitingForUsers,
-                crate::v02::report::ResourceProgress::Cleaning,
-            ]
+            manage_kind(ResourceCapacityError::CapacityExceeded),
+            ResourceManageErrorKind::CapacityExceeded,
         );
-
-        assert_eq!(resource_id.manager(), scope.state.core.manager);
-        assert!(!ran_cleanup.load(Ordering::SeqCst));
-        assert!(reports.lock().unwrap().is_empty());
-        cleanup.run_all(&executor);
-        while executor.poll_async_turn() > 0 {}
-        executor.shutdown().wait().unwrap();
-
-        assert!(ran_cleanup.load(Ordering::SeqCst));
-        let reports = reports.lock().unwrap();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].resources.len(), 1);
-        assert_eq!(reports[0].resources[0].resource_id, resource_id);
-    }
-
-    #[test]
-    fn settlement_callback_waits_for_real_cleanup_completion() {
-        struct Probe(Arc<AtomicUsize>);
-        impl Drop for Probe {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let (scope, cleanup) = scope();
-        let executor = executor();
-        let resource_drops = Arc::new(AtomicUsize::new(0));
-        let reports = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&reports);
-        scope.set_settlement_callback(Box::new(move |report| {
-            observed.lock().unwrap().push(report);
-        }));
-        let resource = scope.manage(Probe(Arc::clone(&resource_drops))).unwrap();
-        scope.end();
-        assert!(reports.lock().unwrap().is_empty());
-
-        drop(resource);
-        assert_eq!(resource_drops.load(Ordering::SeqCst), 0);
-        assert!(reports.lock().unwrap().is_empty());
-        cleanup.run_all(&executor);
-        executor.shutdown().wait().unwrap();
-
-        assert_eq!(resource_drops.load(Ordering::SeqCst), 1);
-        let reports = reports.lock().unwrap();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].resources.len(), 1);
-        assert_eq!(reports[0].failures.len(), 0);
-    }
-
-    struct AcceptedOwner(Arc<AtomicUsize>);
-    impl Drop for AcceptedOwner {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-    impl CleanupJob for AcceptedOwner {
-        fn schedule(self: Box<Self>, executor: Arc<CleanupExecutor>) -> Result<(), Box<dyn CleanupJob>> {
-            match executor.reserve_drop() {
-                Ok(permit) => {
-                    permit.drop_value(self);
-                    Ok(())
-                }
-                Err(_) => Err(self),
-            }
-        }
-    }
-
-    #[test]
-    fn accepted_cleanup_transfer_receipt_reaches_resource_scope_report() {
-        let manager_id = ManagerId::new_unique();
-        let source_id = ResourceScopeId::new_unique();
-        let target_id = ResourceScopeId::new_unique();
-        let pools = ManagerCapacityPools::new(ManagerLimits::default());
-        let source = ResourceScope::new(
-            manager_id,
-            source_id,
-            Arc::new(ScopeCapacity::root(&pools, 77, ScopeLimits::default())),
-            ManualCleanup::new(1),
-        );
-        let report = Arc::new(Mutex::new(None));
-        let report_slot = Arc::clone(&report);
-        source.set_settlement_callback(Box::new(move |report| {
-            *report_slot.lock().unwrap() = Some(report);
-        }));
-        let reporting_scope = source.internal_clone();
-        let executor = executor();
-        let receiver = CleanupTransferReceiver::new_with_receipt_callback(
-            manager_id,
-            target_id,
-            1,
-            Arc::clone(&executor),
-            move |receipt| {
-                assert!(reporting_scope.record_transfer_receipt(receipt));
-            },
-        )
-        .unwrap();
-        let drops = Arc::new(AtomicUsize::new(0));
-        let resource_id = ResourceId::new(manager_id, 12, 1);
-        let receipt = match receiver.accept(resource_id, source_id, Box::new(AcceptedOwner(Arc::clone(&drops)))) {
-            Ok(receipt) => receipt,
-            Err(_) => panic!("open receiver should accept transfer"),
-        };
-        assert_eq!(receipt.resource(), resource_id);
-        assert_eq!(receiver.drive(1), 1);
-        executor.shutdown().wait().unwrap();
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-        source.end();
-        let report = report.lock().unwrap().take().unwrap();
-        assert_eq!(report.transfers_total, 1);
-        assert!(!report.transfers_truncated);
-        assert_eq!(report.transfers[0].resource(), resource_id);
-        assert_eq!(report.transfers[0].source_scope(), source_id);
-        assert_eq!(report.transfers[0].target_scope(), target_id);
-    }
-
-    struct PanicOnDrop;
-    impl Drop for PanicOnDrop {
-        fn drop(&mut self) {
-            panic!("resource cleanup did not confirm release");
-        }
-    }
-
-    #[test]
-    fn resource_drop_panic_has_no_released_evidence() {
-        let (scope, cleanup) = scope();
-        let report = Arc::new(Mutex::new(None));
-        let report_slot = Arc::clone(&report);
-        scope.set_settlement_callback(Box::new(move |report| {
-            *report_slot.lock().unwrap() = Some(report);
-        }));
-        let resource = match scope.manage(PanicOnDrop) {
-            Ok(resource) => resource,
-            Err(_) => panic!("open resource scope should accept resource"),
-        };
-        scope.end();
-        drop(resource);
-        let executor = executor();
-        cleanup.run_all(&executor);
-        executor.shutdown().wait().unwrap();
-        let report = report.lock().unwrap().take().unwrap();
-        assert!(report.resources.is_empty());
-        assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.failures[0].stage, crate::v02::report::CleanupStage::Drop);
     }
 }

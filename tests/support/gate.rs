@@ -48,16 +48,6 @@ impl Gate {
         }
     }
 
-    /// Report whether a waiter has actually polled the gate.
-    pub fn started(&self) -> bool {
-        self.inner.state.lock().expect("gate mutex poisoned").started
-    }
-
-    /// Report whether the release phase has been opened.
-    pub fn is_released(&self) -> bool {
-        self.inner.state.lock().expect("gate mutex poisoned").released
-    }
-
     /// Open the release phase and wake futures that reached the gate.
     pub fn release(&self) {
         let waiters = {
@@ -79,11 +69,7 @@ impl Gate {
         self.wait_for_phase(|state| state.started, "gate was not started before watchdog");
     }
 
-    /// Wait for the released phase, failing after a bounded test watchdog.
-    pub fn wait_released(&self) {
-        self.wait_for_phase(|state| state.released, "gate was not released before watchdog");
-    }
-
+    /// Wait until a phase predicate is true, panicking if the watchdog expires.
     fn wait_for_phase(&self, ready: impl Fn(&GateState) -> bool, message: &str) {
         let state = self.inner.state.lock().expect("gate mutex poisoned");
         let (state, timeout) = self

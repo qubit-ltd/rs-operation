@@ -1,3 +1,11 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -10,7 +18,10 @@ use std::task::Wake;
 use std::task::Waker;
 use std::time::Duration;
 
-use super::*;
+use super::AdapterErrorKind;
+use super::AdapterReservation;
+use super::ExternalTask;
+use super::recover_lost_input;
 use crate::v02::executor::CleanupExecutor;
 use crate::v02::manager::capacity::ManagerCapacityPools;
 use crate::v02::manager::capacity::ScopeCapacity;
@@ -237,7 +248,7 @@ fn context(waker: &Waker) -> Context<'_> {
 }
 
 #[test]
-fn stop_before_commit_abandons_once() {
+fn test_stop_before_commit_abandons_once() {
     let id = OperationId::new_unique();
     let (scope, input, cleanup, dropped) = managed_input();
     let (payload, control) = ExternalTask::new(id, input);
@@ -283,7 +294,7 @@ fn stop_before_commit_abandons_once() {
 }
 
 #[test]
-fn commit_rejection_drops_payload_before_abandon_notification() {
+fn test_commit_rejection_drops_payload_before_abandon_notification() {
     let id = OperationId::new_unique();
     let (scope, input, cleanup, dropped) = managed_input();
     let (task, control) = ExternalTask::new(id, input);
@@ -321,7 +332,7 @@ fn commit_rejection_drops_payload_before_abandon_notification() {
 }
 
 #[test]
-fn activation_rejection_drops_payload_before_abandon_notification() {
+fn test_activation_rejection_drops_payload_before_abandon_notification() {
     let id = OperationId::new_unique();
     let (scope, input, cleanup, dropped) = managed_input();
     let (task, control) = ExternalTask::new(id, input);
@@ -361,7 +372,7 @@ fn activation_rejection_drops_payload_before_abandon_notification() {
 }
 
 #[test]
-fn dropping_reservation_releases_admission_before_abandon_notification() {
+fn test_dropping_reservation_releases_admission_before_abandon_notification() {
     let admission_dropped = Arc::new(AtomicBool::new(false));
     let abandoned = Arc::new(AtomicUsize::new(0));
     let reservation = AdapterReservation::new(
@@ -383,7 +394,7 @@ fn dropping_reservation_releases_admission_before_abandon_notification() {
 }
 
 #[test]
-fn dropping_attached_child_releases_payload_before_abandon_notification() {
+fn test_dropping_attached_child_releases_payload_before_abandon_notification() {
     let id = OperationId::new_unique();
     let (scope, input, cleanup, dropped) = managed_input();
     let (task, control) = ExternalTask::new(id, input);
@@ -414,7 +425,7 @@ fn dropping_attached_child_releases_payload_before_abandon_notification() {
 }
 
 #[test]
-fn dropping_start_permit_releases_payload_before_abandon_notification() {
+fn test_dropping_start_permit_releases_payload_before_abandon_notification() {
     let id = OperationId::new_unique();
     let (scope, input, cleanup, dropped) = managed_input();
     let (task, control) = ExternalTask::new(id, input);
@@ -447,7 +458,7 @@ fn dropping_start_permit_releases_payload_before_abandon_notification() {
 }
 
 #[test]
-fn activate_is_once() {
+fn test_child_activation_is_one_shot() {
     let id = OperationId::new_unique();
     let (_scope, input, cleanup, dropped) = managed_input();
     let (payload, control) = ExternalTask::new(id, input);
@@ -480,7 +491,7 @@ fn activate_is_once() {
 }
 
 #[test]
-fn business_result_does_not_confirm_release() {
+fn test_business_result_does_not_confirm_input_release() {
     let id = OperationId::new_unique();
     let (scope, input, cleanup, dropped) = managed_input();
     let (task, control) = ExternalTask::new(id, input);
@@ -517,7 +528,7 @@ fn business_result_does_not_confirm_release() {
 }
 
 #[test]
-fn input_release_does_not_confirm_settlement() {
+fn test_input_release_does_not_confirm_settlement() {
     let id = OperationId::new_unique();
     let (scope, input, cleanup, dropped) = managed_input();
     let (task, control) = ExternalTask::new(id, input);
@@ -551,7 +562,7 @@ fn input_release_does_not_confirm_settlement() {
 }
 
 #[test]
-fn runtime_lost_retains_unconfirmed_owner() {
+fn test_runtime_loss_retains_unconfirmed_input_owner() {
     let id = OperationId::new_unique();
     let (scope, input, cleanup, dropped) = managed_input();
     let (task, control) = ExternalTask::new(id, input);
@@ -572,7 +583,7 @@ fn runtime_lost_retains_unconfirmed_owner() {
 }
 
 #[test]
-fn stopped_noninterruptible_work_keeps_input_until_return() {
+fn test_stopped_noninterruptible_work_retains_input_until_return() {
     let id = OperationId::new_unique();
     let (scope, input, cleanup, dropped) = managed_input();
     let (task, control) = ExternalTask::new(id, input);
@@ -595,6 +606,51 @@ fn stopped_noninterruptible_work_keeps_input_until_return() {
 
     gate.allow_return();
     worker.join().expect("noninterruptible worker should return");
+    cleanup.schedule_all();
+    dropped.wait_dropped();
+}
+
+#[test]
+fn test_stop_after_commit_prevents_child_activation() {
+    let id = OperationId::new_unique();
+    let (scope, input, cleanup, dropped) = managed_input();
+    let (task, control) = ExternalTask::new(id, input);
+    let activated = Arc::new(AtomicUsize::new(0));
+    let abandoned = Arc::new(AtomicUsize::new(0));
+    let permit = AdapterReservation::new(
+        Box::new(()),
+        {
+            let activated = Arc::clone(&activated);
+            move |_| {
+                activated.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+        {
+            let abandoned = Arc::clone(&abandoned);
+            move || {
+                abandoned.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+    )
+    .attach(control.clone(), task.clone())
+    .expect("attach should succeed")
+    .commit()
+    .expect("no stop was accepted before commit");
+
+    control.request_stop(StopReason::UserCancelled);
+    let error = permit.activate().expect_err("stop before activation must reject start");
+    assert_eq!(error.reason, AdapterErrorKind::Stopped);
+    drop(error.payload);
+
+    assert_eq!(activated.load(Ordering::SeqCst), 0);
+    assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+    assert!(matches!(control.snapshot().stop, Some(stop) if stop.reason == StopReason::UserCancelled));
+    task.confirm_input_release(ChildRelease {
+        operation_id: id,
+        confirmed_at: None,
+    })
+    .expect("rejected child still confirms input release");
+    scope.end();
     cleanup.schedule_all();
     dropped.wait_dropped();
 }

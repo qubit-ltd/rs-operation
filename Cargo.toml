@@ -13,10 +13,55 @@ readme = "README.md"
 keywords = ["operation", "lifecycle", "cancellation", "async", "composition"]
 categories = ["asynchronous", "concurrency", "rust-patterns"]
 include = ["/Cargo.toml", "/LICENSE", "/README.md", "/README.zh_CN.md", "/src/**", "/doc/**", "/examples/**"]
+autotests = false
 
 [lib]
 name = "qubit_operation"
 doctest = true
+
+[[test]]
+name = "v02_adapters"
+path = "tests/v02_adapters_tests.rs"
+
+[[test]]
+name = "v02_api"
+path = "tests/v02_api_tests.rs"
+
+[[test]]
+name = "v02_group"
+path = "tests/v02_group_tests.rs"
+
+[[test]]
+name = "v02_capacity"
+path = "tests/v02_capacity_tests.rs"
+
+[[test]]
+name = "v02_cleanup"
+path = "tests/v02_cleanup_tests.rs"
+
+[[test]]
+name = "v02_resources"
+path = "tests/v02_resources_tests.rs"
+
+[[test]]
+name = "v02_shutdown"
+path = "tests/v02_shutdown_tests.rs"
+
+[[test]]
+name = "v02_tree"
+path = "tests/v02_tree_tests.rs"
+
+[[test]]
+name = "v02_report"
+path = "tests/v02_report_tests.rs"
+
+[[test]]
+name = "v02_production"
+path = "tests/v02_production_tests.rs"
+
+[[test]]
+name = "v02_service_resource"
+path = "tests/v02_service_resource_tests.rs"
 
 [features]
 default = []

@@ -1,3 +1,11 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -8,19 +16,30 @@ use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
 
-use super::*;
+use super::AsyncOperationHandle;
+use super::OperationHandle;
+use super::internal::OperationCore;
+use super::internal::OutcomeDelivery;
+use super::internal::OutcomeSlot;
+use super::internal::StopControl;
 use crate::v02::protocol::ClockDomainId;
 use crate::v02::protocol::ClockSource;
 use crate::v02::protocol::Deadline;
 use crate::v02::protocol::MonotonicTime;
 use crate::v02::protocol::TimerRegistration;
+use crate::v02::report::ExecutionPhase;
 use crate::v02::report::OperationId;
 use crate::v02::report::OperationOutcome;
+use crate::v02::report::OutcomeAvailability;
+use crate::v02::report::OutcomeError;
 use crate::v02::report::ResourceProgress;
 use crate::v02::report::SettlementReport;
 use crate::v02::report::SettlementStatus;
+use crate::v02::report::SettlementWait;
 use crate::v02::report::StopReason;
+use crate::v02::report::StopRequestStatus;
 
+/// Builds a minimal immutable settlement report for handle state tests.
 fn settlement(operation_id: OperationId, status: SettlementStatus) -> SettlementReport {
     SettlementReport {
         operation_id,
@@ -49,11 +68,13 @@ fn settlement(operation_id: OperationId, status: SettlementStatus) -> Settlement
     }
 }
 
+/// Polls a future once with a no-op waker for deterministic unit tests.
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     let mut context = Context::from_waker(Waker::noop());
     future.poll(&mut context)
 }
 
+/// Creates a synchronous handle and the outcome slot shared with its core.
 fn handle<T: Send + 'static, E: Send + 'static>() -> (OperationHandle<T, E>, Arc<OutcomeSlot<T, E>>) {
     let core = OperationCore::new(OperationId::new_unique());
     let slot = Arc::new(OutcomeSlot::new(Arc::clone(&core)));
@@ -61,6 +82,7 @@ fn handle<T: Send + 'static, E: Send + 'static>() -> (OperationHandle<T, E>, Arc
     (handle, slot)
 }
 
+/// Creates an asynchronous handle and its shared outcome slot for tests.
 fn async_handle<T: Send + 'static, E: Send + 'static>() -> (AsyncOperationHandle<T, E>, Arc<OutcomeSlot<T, E>>) {
     let core = OperationCore::new(OperationId::new_unique());
     let slot = Arc::new(OutcomeSlot::new(Arc::clone(&core)));
@@ -75,21 +97,18 @@ impl StopControl for NoopStop {
 }
 
 #[test]
-fn take_outcome_exactly_once() {
+fn test_take_outcome_exactly_once() {
     let (mut handle, slot) = handle::<u32, ()>();
     assert!(slot.publish(OperationOutcome::Succeeded(73)).is_ok());
     assert!(matches!(
         handle.try_take_outcome(),
         Ok(Some(OperationOutcome::Succeeded(73)))
     ));
-    assert_eq!(
-        handle.try_take_outcome().unwrap_err(),
-        crate::v02::report::OutcomeError::AlreadyTaken
-    );
+    assert_eq!(handle.try_take_outcome().unwrap_err(), OutcomeError::AlreadyTaken);
 }
 
 #[test]
-fn cancel_wait_does_not_take_outcome() {
+fn test_cancel_wait_does_not_take_outcome() {
     let (mut handle, slot) = async_handle::<u32, ()>();
     let mut wait = Box::pin(handle.wait_outcome());
     assert!(poll_once(wait.as_mut()).is_pending());
@@ -104,7 +123,7 @@ fn cancel_wait_does_not_take_outcome() {
 }
 
 #[test]
-fn observer_does_not_keep_typed_result() {
+fn test_observer_does_not_keep_typed_result() {
     struct DropCount(Arc<AtomicUsize>);
     impl Drop for DropCount {
         fn drop(&mut self) {
@@ -125,7 +144,7 @@ fn observer_does_not_keep_typed_result() {
 }
 
 #[test]
-fn into_async_moves_delivery_without_stop() {
+fn test_into_async_moves_delivery_without_stop() {
     let (handle, slot) = handle::<u32, ()>();
     assert!(slot.publish(OperationOutcome::Succeeded(8)).is_ok());
     let mut handle = handle.into_async();
@@ -138,7 +157,7 @@ fn into_async_moves_delivery_without_stop() {
 }
 
 #[test]
-fn into_sync_moves_delivery_without_stop() {
+fn test_into_sync_moves_delivery_without_stop() {
     let (handle, slot) = async_handle::<u32, ()>();
     assert!(slot.publish(OperationOutcome::Succeeded(14)).is_ok());
     let mut handle = handle.into_sync();
@@ -150,7 +169,7 @@ fn into_sync_moves_delivery_without_stop() {
 }
 
 #[test]
-fn into_observer_discards_without_stop() {
+fn test_into_observer_discards_without_stop() {
     let (handle, slot) = handle::<u32, ()>();
     assert!(slot.publish(OperationOutcome::Succeeded(8)).is_ok());
     let observer = handle.into_observer();
@@ -159,7 +178,7 @@ fn into_observer_discards_without_stop() {
 }
 
 #[test]
-fn unfinished_handle_drop_requests_stop() {
+fn test_unfinished_handle_drop_requests_stop() {
     let (handle, _) = handle::<u32, ()>();
     let observer = handle.observer();
     drop(handle);
@@ -171,7 +190,39 @@ fn unfinished_handle_drop_requests_stop() {
 }
 
 #[test]
-fn settlement_is_published_once_and_stays_immutable() {
+fn test_async_handle_stop_request_records_first_reason() {
+    let (handle, slot) = async_handle::<u32, ()>();
+
+    assert_eq!(
+        handle.request_stop(StopReason::UserCancelled),
+        StopRequestStatus::Accepted
+    );
+    assert_eq!(
+        handle.request_stop(StopReason::Timeout),
+        StopRequestStatus::AlreadyRequested
+    );
+    assert_eq!(slot.stop_report().unwrap().reason, StopReason::UserCancelled);
+}
+
+#[test]
+fn test_handle_stop_request_after_finish_is_rejected() {
+    let (sync, _) = handle::<u32, ()>();
+    sync.parts().core.set_execution(ExecutionPhase::Finished);
+    assert_eq!(
+        sync.request_stop(StopReason::UserCancelled),
+        StopRequestStatus::AlreadyFinished
+    );
+
+    let (async_handle, _) = async_handle::<u32, ()>();
+    async_handle.parts().core.set_execution(ExecutionPhase::Finished);
+    assert_eq!(
+        async_handle.request_stop(StopReason::UserCancelled),
+        StopRequestStatus::AlreadyFinished
+    );
+}
+
+#[test]
+fn test_settlement_is_published_once_and_stays_immutable() {
     let (handle, _) = handle::<u32, ()>();
     let id = handle.id();
     handle.parts().core.set_execution(ExecutionPhase::Running);
@@ -187,7 +238,7 @@ fn settlement_is_published_once_and_stays_immutable() {
 }
 
 #[test]
-fn outcome_and_settlement_are_independent_facts() {
+fn test_outcome_and_settlement_are_independent_facts() {
     let (handle, slot) = handle::<u32, ()>();
     let id = handle.id();
     handle
@@ -203,7 +254,7 @@ fn outcome_and_settlement_are_independent_facts() {
 }
 
 #[test]
-fn operation_types_do_not_require_clone_or_debug() {
+fn test_operation_types_do_not_require_clone_or_debug() {
     struct Opaque;
 
     let (mut handle, slot) = handle::<Opaque, Opaque>();
@@ -215,7 +266,7 @@ fn operation_types_do_not_require_clone_or_debug() {
 }
 
 #[test]
-fn observer_conversion_and_resource_progress_keep_the_untyped_core() {
+fn test_observer_conversion_and_resource_progress_keep_the_untyped_core() {
     let (handle, _) = handle::<u32, ()>();
     let observer = handle.observer();
     let async_observer = observer.as_async();
@@ -230,7 +281,7 @@ fn observer_conversion_and_resource_progress_keep_the_untyped_core() {
 }
 
 #[test]
-fn bounded_settlement_wait_returns_pending_snapshot() {
+fn test_bounded_settlement_wait_returns_pending_snapshot() {
     let (handle, _) = handle::<u32, ()>();
     let observer = handle.observer();
     assert!(matches!(
@@ -240,7 +291,7 @@ fn bounded_settlement_wait_returns_pending_snapshot() {
 }
 
 #[test]
-fn async_settlement_deadline_only_limits_observation() {
+fn test_async_settlement_deadline_only_limits_observation() {
     struct FixedClock(MonotonicTime);
 
     impl ClockSource for FixedClock {
@@ -277,7 +328,7 @@ fn async_settlement_deadline_only_limits_observation() {
 }
 
 #[test]
-fn outcome_delivery_hook_notifies_take_and_discard_once() {
+fn test_outcome_delivery_hook_notifies_take_and_discard_once() {
     let core = OperationCore::new(OperationId::new_unique());
     let slot = OutcomeSlot::<u8, ()>::new(Arc::clone(&core));
     let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -297,5 +348,26 @@ fn outcome_delivery_hook_notifies_take_and_discard_once() {
         .publish(OperationOutcome::Succeeded(9))
         .expect_err("discarded result remains unavailable");
     assert!(matches!(rejected, OperationOutcome::Succeeded(9)));
+    assert_eq!(*events.lock().unwrap(), vec![OutcomeDelivery::Discarded]);
+}
+
+#[test]
+fn test_delivery_hook_installed_after_delivery_runs_immediately() {
+    let taken = OutcomeSlot::<u8, ()>::new(OperationCore::new(OperationId::new_unique()));
+    taken.publish(OperationOutcome::Succeeded(1)).unwrap();
+    assert!(matches!(
+        taken.take_if_ready(),
+        Ok(Some(OperationOutcome::Succeeded(1)))
+    ));
+    let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&delivered);
+    taken.set_delivery_hook(move |delivery| observed.lock().unwrap().push(delivery));
+    assert_eq!(*delivered.lock().unwrap(), vec![OutcomeDelivery::Delivered]);
+
+    let discarded = OutcomeSlot::<u8, ()>::new(OperationCore::new(OperationId::new_unique()));
+    discarded.discard();
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    discarded.set_delivery_hook(move |delivery| observed.lock().unwrap().push(delivery));
     assert_eq!(*events.lock().unwrap(), vec![OutcomeDelivery::Discarded]);
 }

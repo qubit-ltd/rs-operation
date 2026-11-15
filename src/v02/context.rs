@@ -1,432 +1,39 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
 //! Context cancellation, deadlines, clock-domain validation, and budget checks.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::Weak;
-use std::task::Context;
-use std::task::Poll;
-use std::task::Waker;
+mod cleanup_context;
+mod deadline_signal;
+mod internal;
+mod operation_context;
+mod stop_signal;
 
-use crate::v02::protocol::BudgetPolicy;
-use crate::v02::protocol::ClockSource;
-use crate::v02::protocol::Deadline;
-use crate::v02::protocol::TimerRegistration;
-use crate::v02::report::ContextError;
-use crate::v02::report::ContextOptions;
-use crate::v02::report::StopReason;
-
-/// A cancellation node shared with its descendants.
-struct StopNode {
-    state: Mutex<StopState>,
-}
-
-struct StopState {
-    reason: Option<StopReason>,
-    children: Vec<Weak<StopNode>>,
-    waiters: Vec<(u64, Waker)>,
-    next_waiter: u64,
-}
-
-impl StopNode {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new(StopState {
-                reason: None,
-                children: Vec::new(),
-                waiters: Vec::new(),
-                next_waiter: 1,
-            }),
-        })
-    }
-
-    fn reason(&self) -> Option<StopReason> {
-        lock(&self.state).reason
-    }
-
-    fn request_stop(&self, reason: StopReason) -> bool {
-        let (children, waiters) = {
-            let mut state = lock(&self.state);
-            if state.reason.is_some() {
-                return false;
-            }
-            state.reason = Some(reason);
-            state.children.retain(|child| child.strong_count() != 0);
-            let children = state.children.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
-            let waiters = std::mem::take(&mut state.waiters);
-            (children, waiters)
-        };
-        for (_, waiter) in waiters {
-            waiter.wake();
-        }
-        for child in children {
-            child.request_stop(StopReason::ParentStopped);
-        }
-        true
-    }
-}
-
-/// Shared stop tree and inherited time and budget policy for one operation.
-pub struct OperationContext {
-    node: Arc<StopNode>,
-    clock: Option<Arc<dyn ClockSource>>,
-    deadline: Option<Deadline>,
-    policies: Vec<Arc<dyn BudgetPolicy>>,
-}
-
-impl Clone for OperationContext {
-    fn clone(&self) -> Self {
-        Self {
-            node: Arc::clone(&self.node),
-            clock: self.clock.clone(),
-            deadline: self.deadline,
-            policies: self.policies.clone(),
-        }
-    }
-}
-
-impl OperationContext {
-    /// Constructs a root context after validating its clock and deadline.
-    pub fn new(options: ContextOptions) -> Result<Self, ContextError> {
-        validate_clock(options.clock.as_deref(), options.deadline)?;
-        Ok(Self {
-            node: StopNode::new(),
-            clock: options.clock,
-            deadline: options.deadline,
-            policies: options.budget.into_iter().collect(),
-        })
-    }
-
-    /// Constructs a descendant with a deadline no later than its parent's.
-    pub fn child(&self, options: ContextOptions) -> Result<Self, ContextError> {
-        let clock = options.clock.or_else(|| self.clock.clone());
-        if let (Some(parent_clock), Some(child_clock)) = (self.clock.as_deref(), clock.as_deref()) {
-            if parent_clock.now().domain() != child_clock.now().domain() {
-                return Err(ContextError::ClockDomainMismatch);
-            }
-        }
-        let deadline = match (self.deadline, options.deadline) {
-            (Some(parent), Some(child)) => Some(parent.earliest(child).map_err(|_| ContextError::ClockDomainMismatch)?),
-            (Some(parent), None) => Some(parent),
-            (None, child) => child,
-        };
-        validate_clock(clock.as_deref(), deadline)?;
-        let node = StopNode::new();
-        let parent_stopped = {
-            let mut state = lock(&self.node.state);
-            if state.reason.is_some() {
-                true
-            } else {
-                state.children.retain(|child| child.strong_count() != 0);
-                state.children.push(Arc::downgrade(&node));
-                false
-            }
-        };
-        if parent_stopped {
-            node.request_stop(StopReason::ParentStopped);
-        }
-        let mut policies = self.policies.clone();
-        policies.extend(options.budget);
-        Ok(Self {
-            node,
-            clock,
-            deadline,
-            policies,
-        })
-    }
-
-    /// Creates an independent cleanup context from explicit cleanup options.
-    pub fn cleanup_context(&self, options: ContextOptions) -> Result<CleanupContext, ContextError> {
-        CleanupContext::new(options)
-    }
-
-    /// Returns the first accepted stop reason.
-    pub fn stop_reason(&self) -> Option<StopReason> {
-        self.node.reason()
-    }
-
-    /// Requests stop and propagates it to descendants exactly once.
-    pub fn request_stop(&self, reason: StopReason) -> bool {
-        self.node.request_stop(reason)
-    }
-
-    /// Returns the effective deadline inherited from this context's ancestry.
-    pub const fn deadline(&self) -> Option<Deadline> {
-        self.deadline
-    }
-
-    pub(crate) fn clock_source(&self) -> Option<Arc<dyn ClockSource>> {
-        self.clock.clone()
-    }
-
-    /// Returns true when the configured clock has reached this context's
-    /// deadline.
-    pub fn is_expired(&self) -> bool {
-        match (self.clock.as_deref(), self.deadline) {
-            (Some(clock), Some(deadline)) => {
-                let now = clock.now();
-                now.domain() == deadline.time_point().domain() && now.ticks() >= deadline.time_point().ticks()
-            }
-            _ => false,
-        }
-    }
-
-    /// Checks stop, deadline, and every inherited policy without reserving
-    /// capacity.
-    pub fn check(&self) -> Result<(), ContextError> {
-        if self.node.reason().is_some() {
-            return Err(ContextError::Stopped);
-        }
-        if self.is_expired() {
-            self.request_stop(StopReason::Timeout);
-            return Err(ContextError::Stopped);
-        }
-        let mut first_error = None;
-        for policy in &self.policies {
-            if let Err(error) = policy.check() {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        first_error.map_or(Ok(()), |error| Err(ContextError::BudgetRejected(error)))
-    }
-
-    /// Returns a future which resolves with the first accepted stop reason.
-    pub fn stop_requested(&self) -> StopSignal {
-        StopSignal {
-            node: Arc::clone(&self.node),
-            waiter: None,
-            completed: false,
-        }
-    }
-
-    /// Creates a signal that registers and cancels its deadline timer.
-    pub fn deadline_signal(&self) -> Option<DeadlineSignal> {
-        Some(DeadlineSignal {
-            node: Arc::downgrade(&self.node),
-            clock: Arc::clone(self.clock.as_ref()?),
-            deadline: self.deadline?,
-            registration: None,
-            registered_waker: None,
-            fired: false,
-        })
-    }
-}
-
-/// Independent cleanup authority with its own optional deadline and policy.
-pub struct CleanupContext {
-    clock: Option<Arc<dyn ClockSource>>,
-    deadline: Option<Deadline>,
-    policies: Vec<Arc<dyn BudgetPolicy>>,
-}
-
-impl CleanupContext {
-    /// Constructs a cleanup context without inheriting business context state.
-    pub fn new(options: ContextOptions) -> Result<Self, ContextError> {
-        validate_clock(options.clock.as_deref(), options.deadline)?;
-        Ok(Self {
-            clock: options.clock,
-            deadline: options.deadline,
-            policies: options.budget.into_iter().collect(),
-        })
-    }
-
-    /// Checks only the cleanup context's independent deadline and policies.
-    pub fn check(&self) -> Result<(), ContextError> {
-        if let (Some(clock), Some(deadline)) = (self.clock.as_deref(), self.deadline) {
-            let now = clock.now();
-            if now.domain() != deadline.time_point().domain() || now.ticks() >= deadline.time_point().ticks() {
-                return Err(ContextError::Stopped);
-            }
-        }
-        let mut first_error = None;
-        for policy in &self.policies {
-            if let Err(error) = policy.check() {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        first_error.map_or(Ok(()), |error| Err(ContextError::BudgetRejected(error)))
-    }
-}
-
-/// Future resolving when the context accepts its first stop request.
-pub struct StopSignal {
-    node: Arc<StopNode>,
-    waiter: Option<u64>,
-    completed: bool,
-}
-
-impl Future for StopSignal {
-    type Output = StopReason;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.as_mut().get_mut();
-        assert!(!this.completed, "stop signal polled after completion");
-        let node = Arc::clone(&this.node);
-        let mut replacement = Some(cx.waker().clone());
-        let mut removed = None;
-        let mut result = None;
-        {
-            let mut state = lock(&node.state);
-            if let Some(reason) = state.reason {
-                if let Some(id) = this.waiter.take()
-                    && let Some(index) = state.waiters.iter().position(|(candidate, _)| *candidate == id)
-                {
-                    let (_, waker) = state.waiters.swap_remove(index);
-                    removed = Some(waker);
-                }
-                result = Some(reason);
-            } else if let Some(id) = this.waiter {
-                if let Some((_, registered)) = state.waiters.iter_mut().find(|(candidate, _)| *candidate == id) {
-                    if !registered.will_wake(replacement.as_ref().expect("replacement is present")) {
-                        removed = Some(std::mem::replace(
-                            registered,
-                            replacement.take().expect("replacement is present"),
-                        ));
-                    }
-                } else {
-                    result = Some(StopReason::ParentStopped);
-                }
-            } else {
-                let id = state.next_waiter;
-                state.next_waiter = state.next_waiter.wrapping_add(1).max(1);
-                state
-                    .waiters
-                    .push((id, replacement.take().expect("replacement is present")));
-                this.waiter = Some(id);
-            }
-        }
-        // A user-provided RawWaker can run arbitrary code in clone/drop. Keep
-        // both callbacks outside the context state lock.
-        drop(replacement);
-        drop(removed);
-        if let Some(reason) = result {
-            this.completed = true;
-            Poll::Ready(reason)
-        } else {
-            Poll::Pending
-        }
-    }
-}
-
-impl Drop for StopSignal {
-    fn drop(&mut self) {
-        let removed = if let Some(id) = self.waiter.take() {
-            let mut state = lock(&self.node.state);
-            if let Some(index) = state.waiters.iter().position(|(candidate, _)| *candidate == id) {
-                let (_, waker) = state.waiters.swap_remove(index);
-                Some(waker)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        drop(removed);
-    }
-}
-
-/// Future which requests timeout once its registered deadline is reached.
-pub struct DeadlineSignal {
-    node: Weak<StopNode>,
-    clock: Arc<dyn ClockSource>,
-    deadline: Deadline,
-    registration: Option<Box<dyn TimerRegistration>>,
-    registered_waker: Option<Waker>,
-    fired: bool,
-}
-
-impl Future for DeadlineSignal {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.fired {
-            return Poll::Ready(());
-        }
-        if deadline_reached(&*self.clock, self.deadline) {
-            fire_timeout(&mut self);
-            return Poll::Ready(());
-        }
-        let changed = self
-            .registered_waker
-            .as_ref()
-            .is_none_or(|old| !old.will_wake(cx.waker()));
-        if changed {
-            if let Some(registration) = self.registration.take() {
-                registration.cancel();
-            }
-            self.registered_waker = Some(cx.waker().clone());
-            self.registration = Some(
-                self.clock
-                    .register_deadline(self.deadline.time_point(), cx.waker().clone()),
-            );
-        }
-        // Close the check/register race even for a clock that advances before
-        // its registration handle becomes visible to this future.
-        if deadline_reached(&*self.clock, self.deadline) {
-            fire_timeout(&mut self);
-            return Poll::Ready(());
-        }
-        Poll::Pending
-    }
-}
-
-impl Drop for DeadlineSignal {
-    fn drop(&mut self) {
-        if let Some(registration) = self.registration.take() {
-            registration.cancel();
-        }
-    }
-}
-
-fn fire_timeout(signal: &mut DeadlineSignal) {
-    if let Some(node) = signal.node.upgrade() {
-        node.request_stop(StopReason::Timeout);
-    }
-    signal.fired = true;
-    if let Some(registration) = signal.registration.take() {
-        registration.cancel();
-    }
-    signal.registered_waker = None;
-}
-
-fn deadline_reached(clock: &dyn ClockSource, deadline: Deadline) -> bool {
-    let now = clock.now();
-    now.domain() != deadline.time_point().domain() || now.ticks() >= deadline.time_point().ticks()
-}
-
-fn validate_clock(clock: Option<&dyn ClockSource>, deadline: Option<Deadline>) -> Result<(), ContextError> {
-    if let Some(deadline) = deadline {
-        let Some(clock) = clock else {
-            return Err(ContextError::ClockUnavailable);
-        };
-        if clock.now().domain() != deadline.time_point().domain() {
-            return Err(ContextError::ClockDomainMismatch);
-        }
-    }
-    Ok(())
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+pub use cleanup_context::CleanupContext;
+pub use deadline_signal::DeadlineSignal;
+pub(in crate::v02::context) use internal::StopNode;
+pub(in crate::v02::context) use internal::deadline_reached;
+pub(in crate::v02::context) use internal::fire_timeout;
+pub(in crate::v02::context) use internal::lock;
+pub(in crate::v02::context) use internal::validate_clock;
+pub use operation_context::OperationContext;
+pub use stop_signal::StopSignal;
 
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::task::RawWaker;
     use std::task::RawWakerVTable;
     use std::task::Wake;
     use std::task::Waker;
-    use std::thread::JoinHandle;
 
     use super::OperationContext;
     use crate::v02::protocol::BudgetError;
@@ -502,11 +109,18 @@ mod tests {
         context: Arc<OperationContext>,
         clone_lock_violations: AtomicUsize,
         drop_lock_violations: AtomicUsize,
-        reentries: Mutex<Vec<JoinHandle<Option<StopReason>>>>,
+        clone_callbacks: AtomicUsize,
+        other_callbacks: AtomicUsize,
     }
 
     impl ReentrantWakerProbe {
         fn callback(&self, is_clone: bool) {
+            let callbacks = if is_clone {
+                &self.clone_callbacks
+            } else {
+                &self.other_callbacks
+            };
+            callbacks.fetch_add(1, Ordering::SeqCst);
             if self.context.node.state.try_lock().is_err() {
                 let counter = if is_clone {
                     &self.clone_lock_violations
@@ -514,15 +128,6 @@ mod tests {
                     &self.drop_lock_violations
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
-            }
-            let context = Arc::clone(&self.context);
-            let reentry = std::thread::spawn(move || context.stop_reason());
-            self.reentries.lock().unwrap().push(reentry);
-        }
-
-        fn join_reentries(&self) {
-            for reentry in self.reentries.lock().unwrap().drain(..) {
-                reentry.join().unwrap();
             }
         }
     }
@@ -582,7 +187,44 @@ mod tests {
     }
 
     #[test]
-    fn parent_stop_reaches_descendants() {
+    fn test_stop_signal_resolves_after_first_stop_request() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let context = OperationContext::new(ContextOptions::default()).unwrap();
+        let mut signal = Box::pin(context.stop_requested());
+        let waker = Waker::noop();
+        let mut task = std::task::Context::from_waker(waker);
+
+        assert!(matches!(signal.as_mut().poll(&mut task), Poll::Pending));
+        assert!(context.request_stop(StopReason::ManagerShutdown));
+        assert!(matches!(
+            signal.as_mut().poll(&mut task),
+            Poll::Ready(StopReason::ManagerShutdown)
+        ));
+    }
+
+    #[test]
+    fn test_cleanup_context_rejects_its_own_budget() {
+        let policy = Arc::new(Policy {
+            calls: AtomicUsize::new(0),
+            reject: true,
+        });
+        let cleanup = OperationContext::new(ContextOptions::default())
+            .unwrap()
+            .cleanup_context(ContextOptions {
+                clock: None,
+                deadline: None,
+                budget: Some(policy.clone()),
+            })
+            .unwrap();
+
+        assert!(matches!(cleanup.check(), Err(ContextError::BudgetRejected(_))));
+        assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_parent_stop_reaches_descendants() {
         let root = OperationContext::new(ContextOptions::default()).unwrap();
         let child = root.child(ContextOptions::default()).unwrap();
         let grandchild = child.child(ContextOptions::default()).unwrap();
@@ -593,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn child_stop_does_not_unconditionally_stop_parent() {
+    fn test_child_stop_does_not_unconditionally_stop_parent() {
         let root = OperationContext::new(ContextOptions::default()).unwrap();
         let child = root.child(ContextOptions::default()).unwrap();
 
@@ -602,7 +244,21 @@ mod tests {
     }
 
     #[test]
-    fn first_stop_cause_wins() {
+    fn test_context_clone_shares_stop_state_and_clock() {
+        let domain = ClockDomainId::new_unique();
+        let clock = ManualClock::new(domain, 3);
+        let clock_source: Arc<dyn ClockSource> = clock.clone();
+        let context = OperationContext::new(options(clock_source, domain, 9)).unwrap();
+        let cloned = context.clone();
+
+        assert!(cloned.clock_source().is_some());
+        assert_eq!(domain.raw(), clock.domain.raw());
+        assert!(context.request_stop(StopReason::UserCancelled));
+        assert_eq!(cloned.stop_reason(), Some(StopReason::UserCancelled));
+    }
+
+    #[test]
+    fn test_first_stop_cause_wins() {
         let context = OperationContext::new(ContextOptions::default()).unwrap();
 
         assert!(context.request_stop(StopReason::UserCancelled));
@@ -611,13 +267,14 @@ mod tests {
     }
 
     #[test]
-    fn stop_signal_waker_callbacks_run_outside_context_lock() {
+    fn test_stop_signal_waker_callbacks_run_outside_context_lock() {
         let context = Arc::new(OperationContext::new(ContextOptions::default()).unwrap());
         let probe = Arc::new(ReentrantWakerProbe {
             context: Arc::clone(&context),
             clone_lock_violations: AtomicUsize::new(0),
             drop_lock_violations: AtomicUsize::new(0),
-            reentries: Mutex::new(Vec::new()),
+            clone_callbacks: AtomicUsize::new(0),
+            other_callbacks: AtomicUsize::new(0),
         });
         let waker = reentrant_waker(Arc::clone(&probe));
         let mut task = std::task::Context::from_waker(&waker);
@@ -626,16 +283,22 @@ mod tests {
         use std::task::Poll;
 
         assert!(matches!(Pin::as_mut(&mut signal).poll(&mut task), Poll::Pending));
+        waker.wake_by_ref();
+        #[allow(clippy::waker_clone_wake)]
+        {
+            // Exercise the consuming RawWaker callback separately from wake_by_ref.
+            waker.clone().wake();
+        }
         drop(signal);
         drop(waker);
-        probe.join_reentries();
-
+        assert!(probe.clone_callbacks.load(Ordering::SeqCst) >= 1);
+        assert!(probe.other_callbacks.load(Ordering::SeqCst) >= 1);
         assert_eq!(probe.clone_lock_violations.load(Ordering::SeqCst), 0);
         assert_eq!(probe.drop_lock_violations.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn deadline_registration_races_expiry() {
+    fn test_deadline_registration_races_expiry() {
         let domain = ClockDomainId::new_unique();
         let clock = ManualClock::new(domain, 0);
         let context = OperationContext::new(options(clock.clone(), domain, 4)).unwrap();
@@ -655,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn child_deadline_cannot_extend_parent() {
+    fn test_child_deadline_cannot_extend_parent() {
         let domain = ClockDomainId::new_unique();
         let clock: Arc<dyn ClockSource> = ManualClock::new(domain, 0);
         let root = OperationContext::new(options(clock.clone(), domain, 10)).unwrap();
@@ -671,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_clock_domain_is_rejected() {
+    fn test_wrong_clock_domain_is_rejected() {
         let first = ClockDomainId::new_unique();
         let second = ClockDomainId::new_unique();
         let context = OperationContext::new(options(ManualClock::new(first, 0), second, 1));
@@ -680,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_and_child_policies_both_checked() {
+    fn test_parent_and_child_policies_are_both_checked() {
         let parent_policy = Arc::new(Policy {
             calls: AtomicUsize::new(0),
             reject: true,
@@ -709,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_context_does_not_inherit_expired_business_deadline() {
+    fn test_cleanup_context_does_not_inherit_expired_business_deadline() {
         let domain = ClockDomainId::new_unique();
         let clock: Arc<dyn ClockSource> = ManualClock::new(domain, 10);
         let business = OperationContext::new(options(clock, domain, 10)).unwrap();

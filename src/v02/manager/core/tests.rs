@@ -1,9 +1,19 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Barrier;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 
 use super::ExecutionKind;
 use super::ManagerCore;
@@ -36,12 +46,14 @@ use crate::v02::report::ResourceScopeId;
 use crate::v02::report::ScopeLimits;
 use crate::v02::report::ShutdownMode;
 use crate::v02::report::StopReason;
+use crate::v02::report::SubmitError;
 use crate::v02::report::ThreadPoolExecutorOptions;
 use crate::v02::resource::cleanup::CleanupTransferReceiver;
 use crate::v02::resource::cleanup_port::CleanupDispatch;
 use crate::v02::resource::cleanup_port::CleanupDispatchPermit;
 use crate::v02::resource::cleanup_port::CleanupJob;
 use crate::v02::resource::cleanup_port::CleanupQueueError;
+use crate::v02::scope::ScopeCoreInit;
 
 struct PayloadDropFlag(Arc<std::sync::atomic::AtomicBool>);
 
@@ -78,6 +90,15 @@ impl WaitPort {
 
 struct WaiterCount(Arc<AtomicUsize>);
 impl WaiterCount {
+    /// Records a waiter and returns an owner that decrements the count on drop.
+    ///
+    /// # Parameters
+    ///
+    /// - `waiters`: The shared waiter counter.
+    ///
+    /// # Returns
+    ///
+    /// A guard that decrements the counter when dropped.
     fn new(waiters: Arc<AtomicUsize>) -> Self {
         waiters.fetch_add(1, Ordering::SeqCst);
         Self(waiters)
@@ -155,12 +176,34 @@ impl SubmissionPort for WaitPort {
     }
 }
 
+/// Polls a future once using a no-op waker.
+///
+/// # Type Parameters
+///
+/// - `F`: The future type being polled.
+///
+/// # Parameters
+///
+/// - `future`: The pinned future to poll.
+///
+/// # Returns
+///
+/// The result of the single poll.
 fn poll_once<F: Future>(future: Pin<&mut F>) -> std::task::Poll<F::Output> {
     let waker = std::task::Waker::noop();
     let mut context = std::task::Context::from_waker(waker);
     future.poll(&mut context)
 }
 
+/// Builds a test manager backed by the supplied wait port.
+///
+/// # Parameters
+///
+/// - `port`: Supplies controlled admission and capacity waiting.
+///
+/// # Returns
+///
+/// The manager core and its root operation manager.
 fn wait_test_manager(port: Arc<WaitPort>) -> (Arc<ManagerCore>, OperationManager) {
     let core = ManagerCore::new(
         port,
@@ -172,7 +215,7 @@ fn wait_test_manager(port: Arc<WaitPort>) -> (Arc<ManagerCore>, OperationManager
 }
 
 #[test]
-fn async_submit_is_lazy_and_cancel_releases_waiter() {
+fn test_async_submit_is_lazy_and_cancel_releases_waiter() {
     let port = Arc::new(WaitPort::new());
     let (_, root) = wait_test_manager(Arc::clone(&port));
     let async_manager = root.as_async();
@@ -194,7 +237,7 @@ fn async_submit_is_lazy_and_cancel_releases_waiter() {
 }
 
 #[test]
-fn async_submit_retries_after_capacity_wake_without_losing_notification() {
+fn test_async_submit_retries_after_capacity_wake_without_losing_notification() {
     let port = Arc::new(WaitPort::new());
     let (_, root) = wait_test_manager(Arc::clone(&port));
     let async_manager = root.as_async();
@@ -221,25 +264,24 @@ fn async_submit_retries_after_capacity_wake_without_losing_notification() {
 }
 
 #[test]
-fn async_submit_parent_close_and_stop_interrupt_wait_and_preserve_body() {
+fn test_async_submit_parent_close_and_stop_interrupt_wait_and_preserve_body() {
     for stop in [false, true] {
         let port = Arc::new(WaitPort::new());
         let (core, _) = wait_test_manager(Arc::clone(&port));
         let id = crate::v02::report::OperationId::new_unique();
         let options = crate::v02::report::OperationOptions::default();
         let (capacity, resource_scope) = super::test_resources(id, None, &options);
-        let parent = super::ScopeCore::new(
+        let parent = super::ScopeCore::new(ScopeCoreInit {
             id,
-            Arc::downgrade(&core),
-            None,
-            None,
-            crate::v02::context::OperationContext::new(ContextOptions::default()).unwrap(),
+            manager: Arc::downgrade(&core),
+            parent: None,
+            context: crate::v02::context::OperationContext::new(ContextOptions::default()).unwrap(),
             options,
-            8,
+            diagnostic_limit: 8,
             capacity,
             resource_scope,
-            None,
-        );
+            group: None,
+        });
         let child_manager = OperationManager::bound(Arc::clone(&core), &parent);
         let async_child_manager = child_manager.as_async();
         let body_calls = Arc::new(AtomicUsize::new(0));
@@ -281,7 +323,7 @@ fn async_submit_parent_close_and_stop_interrupt_wait_and_preserve_body() {
 }
 
 #[test]
-fn sync_submit_waits_without_busy_retry_and_resumes_on_capacity() {
+fn test_sync_submit_waits_without_busy_retry_and_resumes_on_capacity() {
     let port = Arc::new(WaitPort::new());
     let (started, waiting) = mpsc::channel();
     *port.wait_started.lock().unwrap() = Some(started);
@@ -305,11 +347,8 @@ fn sync_submit_waits_without_busy_retry_and_resumes_on_capacity() {
         Some(crate::v02::report::OperationOutcome::Succeeded(5))
     ));
 }
-use std::sync::Mutex;
-use std::sync::mpsc;
-
 #[test]
-fn typed_sync_submission_publishes_outcome_and_settlement() {
+fn test_typed_sync_submission_publishes_outcome_and_settlement() {
     let (_, root) = ManagerCore::for_test();
     let mut handle = root
         .try_submit(crate::v02::report::OperationOptions::default(), |_| {
@@ -330,8 +369,10 @@ impl CleanupDispatch for ClosedCleanupDispatch {
     }
 }
 
+type OneSlotCleanupState = Arc<Mutex<(bool, Option<Box<dyn CleanupJob>>)>>;
+
 struct OneSlotCleanup {
-    state: Arc<Mutex<(bool, Option<Box<dyn CleanupJob>>)>>,
+    state: OneSlotCleanupState,
 }
 
 impl OneSlotCleanup {
@@ -341,6 +382,11 @@ impl OneSlotCleanup {
         })
     }
 
+    /// Dispatches the stored cleanup job to the executor.
+    ///
+    /// # Parameters
+    ///
+    /// - `executor`: The executor that should run the cleanup job.
     fn drive(&self, executor: Arc<CleanupExecutor>) {
         let job = self.state.lock().unwrap().1.take().unwrap();
         match job.schedule(executor) {
@@ -351,7 +397,7 @@ impl OneSlotCleanup {
 }
 
 struct OneSlotPermit {
-    state: Arc<Mutex<(bool, Option<Box<dyn CleanupJob>>)>>,
+    state: OneSlotCleanupState,
 }
 
 impl CleanupDispatchPermit for OneSlotPermit {
@@ -385,7 +431,7 @@ impl CleanupDispatch for OneSlotCleanup {
 }
 
 #[test]
-fn recovery_required_overrides_real_transfer_in_operation_settlement() {
+fn test_recovery_required_overrides_real_transfer_in_operation_settlement() {
     struct PanicsOnDrop;
     impl Drop for PanicsOnDrop {
         fn drop(&mut self) {
@@ -471,7 +517,7 @@ impl CleanupJob for TransferOwner {
 }
 
 #[test]
-fn accepted_cleanup_transfer_is_in_operation_settlement() {
+fn test_accepted_cleanup_transfer_is_in_operation_settlement() {
     let (_, root) = ManagerCore::for_test();
     let mut handle = root
         .try_submit(OperationOptions::default(), |scope| {
@@ -531,7 +577,7 @@ fn accepted_cleanup_transfer_is_in_operation_settlement() {
 }
 
 #[test]
-fn typed_async_submission_preserves_target_and_publishes_lifecycle() {
+fn test_typed_async_submission_preserves_target_and_publishes_lifecycle() {
     let (_, root) = ManagerCore::for_test();
     let mut handle = root
         .as_async()
@@ -605,7 +651,7 @@ impl SubmissionPermit for SingleWorkerPermit {
 }
 
 #[test]
-fn typed_sync_parent_settles_after_child_on_one_worker() {
+fn test_typed_sync_parent_settles_after_child_on_one_worker() {
     let (sender, receiver) = mpsc::channel::<OperationJob>();
     let worker = std::thread::spawn(move || {
         while let Ok(job) = receiver.recv() {
@@ -656,7 +702,7 @@ fn typed_sync_parent_settles_after_child_on_one_worker() {
 }
 
 #[test]
-fn typed_async_parent_settles_after_child_on_one_worker() {
+fn test_typed_async_parent_settles_after_child_on_one_worker() {
     let (sender, receiver) = mpsc::channel::<OperationJob>();
     let worker = std::thread::spawn(move || {
         while let Ok(job) = receiver.recv() {
@@ -704,7 +750,7 @@ fn typed_async_parent_settles_after_child_on_one_worker() {
 }
 
 #[test]
-fn required_child_failure_changes_parent_outcome_but_not_settlement_fact() {
+fn test_required_child_failure_changes_parent_outcome_but_not_settlement_fact() {
     let (sender, receiver) = mpsc::channel::<OperationJob>();
     let worker = std::thread::spawn(move || {
         while let Ok(job) = receiver.recv() {
@@ -758,7 +804,7 @@ impl Drop for DropCounter {
 }
 
 #[test]
-fn rejected_typed_submission_retains_original_body() {
+fn test_rejected_typed_submission_retains_original_body() {
     let (core, root) = ManagerCore::for_test();
     super::lock(&core.state).phase = super::ManagerPhase::Closed;
     let drops = Arc::new(AtomicUsize::new(0));
@@ -777,6 +823,16 @@ fn rejected_typed_submission_retains_original_body() {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
+/// Submits nested test work through the same manager helper.
+///
+/// # Parameters
+///
+/// - `manager`: The manager used to submit the root operation.
+/// - `value`: The value recorded by the grandchild operation.
+///
+/// # Errors
+///
+/// Returns an admission error if any operation in the hierarchy is rejected.
 fn submit_work(manager: &OperationManager, value: usize) -> Result<(), AdmissionError> {
     manager
         .try_submit_body(move |scope| {
@@ -788,11 +844,11 @@ fn submit_work(manager: &OperationManager, value: usize) -> Result<(), Admission
                 .unwrap();
         })
         .map(|_| ())
-        .map_err(|error| error.into_parts().0)
+        .map_err(|error: SubmitError<_>| error.into_parts().0)
 }
 
 #[test]
-fn same_helper_works_at_every_depth() {
+fn test_same_helper_works_at_every_depth() {
     let (core, root) = ManagerCore::for_test();
     submit_work(&root, 7).unwrap();
     let relationships = core.test_relationships();
@@ -803,7 +859,7 @@ fn same_helper_works_at_every_depth() {
 }
 
 #[test]
-fn manager_conversion_preserves_parent() {
+fn test_manager_conversion_preserves_parent() {
     let (core, root) = ManagerCore::for_test();
     root.try_submit_body(|scope| {
         let parent = scope.id();
@@ -817,7 +873,7 @@ fn manager_conversion_preserves_parent() {
 }
 
 #[test]
-fn root_manager_inside_operation_stays_root() {
+fn test_root_manager_inside_operation_stays_root() {
     let (core, root) = ManagerCore::for_test();
     let root_clone = root.clone();
     root.try_submit_body(move |_| {
@@ -830,7 +886,7 @@ fn root_manager_inside_operation_stays_root() {
 }
 
 #[test]
-fn expired_parent_does_not_fall_back_to_root() {
+fn test_expired_parent_does_not_fall_back_to_root() {
     let saved = Arc::new(Mutex::new(None));
     let saved_in_body = Arc::clone(&saved);
     let (_, root) = ManagerCore::for_test();
@@ -846,7 +902,7 @@ fn expired_parent_does_not_fall_back_to_root() {
 }
 
 #[test]
-fn frame_end_closes_scope_even_when_scope_moves_out() {
+fn test_frame_end_closes_scope_even_when_scope_moves_out() {
     let escaped = Arc::new(Mutex::new(None));
     let escaped_in_body = Arc::clone(&escaped);
     let (_, root) = ManagerCore::for_test();
@@ -863,7 +919,7 @@ fn frame_end_closes_scope_even_when_scope_moves_out() {
 }
 
 #[test]
-fn async_manager_conversion_keeps_parent_and_runs_grandchildren() {
+fn test_async_manager_conversion_keeps_parent_and_runs_grandchildren() {
     let (core, root) = ManagerCore::for_test();
     root.try_submit_body(|scope| {
         let async_manager = scope.manager().as_async();
@@ -882,6 +938,15 @@ fn async_manager_conversion_keeps_parent_and_runs_grandchildren() {
     assert_eq!(relationships[2].1, Some(relationships[1].0));
 }
 
+/// Reserves a root operation from a production manager for lifecycle tests.
+///
+/// # Parameters
+///
+/// - `manager`: The production manager used for reservation.
+///
+/// # Returns
+///
+/// The core, operation ID, scope, and complete reservation.
 fn reserve_production_root(
     manager: &OperationManager,
 ) -> (
@@ -900,7 +965,7 @@ fn reserve_production_root(
 }
 
 #[test]
-fn production_cancel_abandons_adapter_without_running_unstarted_body() {
+fn test_production_cancel_abandons_adapter_without_running_unstarted_body() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let (core, id, scope, reservation) = reserve_production_root(&manager);
     let operation = OperationCore::new(id);
@@ -982,7 +1047,7 @@ fn production_cancel_abandons_adapter_without_running_unstarted_body() {
 }
 
 #[test]
-fn production_parent_stop_and_adapter_activation_have_one_gate_winner() {
+fn test_production_parent_stop_and_adapter_activation_have_one_gate_winner() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let (core, _id, scope, reservation) = reserve_production_root(&manager);
     scope.commit_start().unwrap();
@@ -1015,7 +1080,7 @@ fn production_parent_stop_and_adapter_activation_have_one_gate_winner() {
 }
 
 #[test]
-fn production_scope_stop_and_adapter_commit_have_one_gate_winner() {
+fn test_production_scope_stop_and_adapter_commit_have_one_gate_winner() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let (core, id, scope, reservation) = reserve_production_root(&manager);
     let operation = OperationCore::new(id);
@@ -1057,4 +1122,40 @@ fn production_scope_stop_and_adapter_commit_have_one_gate_winner() {
     scope.end();
     drop(reservation);
     core.finish_shutdown();
+}
+
+#[test]
+fn test_async_manager_run_and_run_and_settle_return_outcomes() {
+    let (_, root) = ManagerCore::for_test();
+    let async_manager = root.as_async();
+
+    let mut run = Box::pin(async_manager.run(OperationOptions::default(), |_| async { Ok::<_, ()>(17usize) }));
+    assert!(matches!(
+        poll_once(run.as_mut()),
+        std::task::Poll::Ready(Ok(crate::v02::report::OperationOutcome::Succeeded(17)))
+    ));
+
+    let mut run_and_settle =
+        Box::pin(async_manager.run_and_settle(OperationOptions::default(), |_| async { Ok::<_, ()>(23usize) }));
+    match poll_once(run_and_settle.as_mut()) {
+        std::task::Poll::Ready(Ok(completion)) => {
+            assert!(matches!(
+                completion.outcome,
+                crate::v02::report::OperationOutcome::Succeeded(23)
+            ));
+            assert!(completion.settlement.all_released());
+        }
+        _ => panic!("inline async operation should complete with its settlement"),
+    }
+}
+
+#[test]
+fn test_async_shutdown_wait_completes_after_admission_is_closed() {
+    let (_, root) = ManagerCore::for_test();
+    let shutdown = root.as_async().request_shutdown(ShutdownMode::Drain);
+    let mut wait = Box::pin(shutdown.wait());
+    match poll_once(wait.as_mut()) {
+        std::task::Poll::Ready(report) => assert_eq!(report.snapshot.active_operations, 0),
+        std::task::Poll::Pending => panic!("an idle manager shutdown should complete immediately"),
+    }
 }
