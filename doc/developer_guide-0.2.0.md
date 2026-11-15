@@ -2,13 +2,14 @@
 
 [0.2 API design (Chinese)](design-0.2.0.zh_CN.md) · [中文开发者手册](developer_guide-0.2.0.zh_CN.md) · [README](../README.md) · [Historical 0.1 guide](user_guide.md)
 
-This guide is for Rust developers building services that must keep resources alive while child work or native calls still use them. It covers the `qubit-operation` 0.2 API. Examples use crates.io dependencies and assume the crate and its dependencies have been published:
+This guide is for Rust developers building services that must keep resources alive while child work or native calls still use them. It covers the `qubit-operation` 0.2 API. Until the crate is published, use the checked-out `rs-operation` source with a Cargo path dependency. In your application's `Cargo.toml`, replace the placeholder with the path to that local checkout:
 
 ```toml
 [dependencies]
-qubit-operation = "^0.2"
-qubit-budget = "^0.10"
+qubit-operation = { path = "<path-to-rs-operation>" }
 ```
+
+Cargo resolves `qubit-operation`'s dependencies from the checked-out crate manifest. After `qubit-operation` 0.2 is published, applications can instead use `qubit-operation = "^0.2"` (and any direct dependencies they use) from crates.io.
 
 The 0.2 API is incompatible with 0.1. See the [migration guide](migration-0.1-to-0.2.md) before upgrading. The Chinese guide follows the same 11 sections and carries the same behavior and limits.
 
@@ -26,7 +27,7 @@ The running example is file type detection. The sections below move from a compl
 
 The service opens an input file, reads its first five bytes, and checks for the PDF signature. This is a small file-header check, not full MIME detection. The same ownership rules apply when the application later calls `file`, `ffprobe`, or a model.
 
-The complete target is [detect_file.rs](examples-0.2.0/detect_file.rs). `InputFile` is an application type; the manager and operation APIs come from `qubit-operation`.
+The complete target is [detect_file.rs](examples-0.2.0/detect_file.rs). `InputFile` is an application type; the manager and operation APIs come from `qubit-operation`. Use the path dependency above until the crate is available from crates.io.
 
 ```rust,ignore
 use std::error::Error;

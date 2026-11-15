@@ -13,13 +13,14 @@
 
 A service can register uploaded bytes with an operation scope, inspect a PDF signature, then observe the business result separately from resource settlement. The application still owns file staging, MIME policy, external commands, and recovery decisions.
 
-Add the dependency (assuming the latest published crate versions):
+Until `qubit-operation` 0.2 is published, point your application at the local `rs-operation` checkout. Replace the placeholder with its actual path:
 
 ```toml
 [dependencies]
-qubit-operation = "^0.2"
-qubit-budget = "^0.10"
+qubit-operation = { path = "<path-to-rs-operation>" }
 ```
+
+After the crate is published, you can use `qubit-operation = "^0.2"` from crates.io. Its own dependencies are declared in the local crate manifest.
 
 This small runnable path checks a memory buffer. Save it as `src/main.rs` and run `cargo run`:
 

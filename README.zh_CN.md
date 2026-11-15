@@ -13,13 +13,14 @@
 
 服务可以把上传字节登记到操作 scope，检查 PDF 文件头，再分别观察业务结果和资源结算。文件暂存、MIME 策略、外部命令及恢复决策仍由应用负责。
 
-以下依赖假设 crate 及其依赖均已发布到 crates.io：
+`qubit-operation` 0.2 发布前，请在应用中依赖本地 `rs-operation` checkout，并将占位值替换为本机的实际路径：
 
 ```toml
 [dependencies]
-qubit-operation = "^0.2"
-qubit-budget = "^0.10"
+qubit-operation = { path = "<path-to-rs-operation>" }
 ```
+
+crate 发布后，可改用 crates.io 依赖 `qubit-operation = "^0.2"`。本地 crate 的其他依赖由其自身的 manifest 声明。
 
 这个最小示例检查内存缓冲区。保存为 `src/main.rs` 后运行 `cargo run`：
 

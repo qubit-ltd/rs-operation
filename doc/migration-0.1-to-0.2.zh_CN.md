@@ -4,6 +4,17 @@
 
 0.2 将 0.1 的 supervisor/request 协议改为 manager、operation scope 和资源引用，属于源码不兼容升级。迁移时应按新公开接口改调用点；0.1 指南仅供查阅旧代码，不代表当前用法。
 
+## Cargo 使用本地 checkout
+
+`qubit-operation` 0.2 发布前，请让应用依赖本地 `rs-operation` checkout。在应用的 `Cargo.toml` 中，将占位值换成该 checkout 在本机的实际路径：
+
+```toml
+[dependencies]
+qubit-operation = { path = "<path-to-rs-operation>" }
+```
+
+这只是路径占位写法，Cargo 使用前必须替换为真实本地路径。crate 自身的依赖由 checkout 中的 `Cargo.toml` 声明。0.2 发布后，应用可以改用 registry 依赖 `qubit-operation = "^0.2"`。
+
 ## 主要接口对应
 
 | 0.1 | 0.2 | 迁移要点 |

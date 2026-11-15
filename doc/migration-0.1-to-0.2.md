@@ -4,6 +4,17 @@
 
 Version 0.2 replaces the supervisor/request protocol with managers, operation scopes, and resource references. This is a source-breaking migration. Update call sites to the 0.2 public API; do not treat the retained 0.1 guide as current usage.
 
+## Point Cargo at the local checkout
+
+Until `qubit-operation` 0.2 is published, use the local `rs-operation` checkout. In the consuming application's `Cargo.toml`, replace the placeholder with the path to that checkout:
+
+```toml
+[dependencies]
+qubit-operation = { path = "<path-to-rs-operation>" }
+```
+
+This is a placeholder expression: Cargo requires you to replace it with the actual local path. The checkout's own `Cargo.toml` declares its dependencies. After 0.2 is published, you can switch to the registry dependency `qubit-operation = "^0.2"`.
+
 ## API mapping
 
 | 0.1 | 0.2 | Migration note |

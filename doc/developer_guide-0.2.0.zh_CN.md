@@ -4,7 +4,7 @@
 
 本文面向有经验的 Rust 开发者，介绍如何组织操作、共享资源和处理收尾，重点说明 API 的输入输出、所有权和失败边界。
 
-**版本说明：本文介绍 qubit-operation 0.2 API。代码示例按 crate 及其依赖均已发布到 crates.io 的场景编写，版本依赖使用主次版本范围；旧版 API 不兼容，不能套用 0.1 的类型和方法。精确签名与状态契约见 [0.2 API 设计](design-0.2.0.zh_CN.md)。
+**版本说明：**本文介绍 qubit-operation 0.2 API。当前请在应用的 `Cargo.toml` 中通过 `path` 依赖指向本地 `rs-operation` checkout；占位路径必须替换为你机器上该仓库的实际位置。待 0.2 发布到 crates.io 后，再改用版本依赖。旧版 API 不兼容，不能套用 0.1 的类型和方法。精确签名与状态契约见 [0.2 API 设计](design-0.2.0.zh_CN.md)。
 
 ## 1. 这个库解决什么问题
 
@@ -26,9 +26,10 @@
 
 ```toml
 [dependencies]
-qubit-operation = "^0.2"
-qubit-budget = "^0.10"
+qubit-operation = { path = "<path-to-rs-operation>" }
 ```
+
+例如，将 `<path-to-rs-operation>` 替换为本机 `rs-operation` 仓库的路径。Cargo 会根据本地 crate 的 `Cargo.toml` 解析它自身的依赖。crate 发布 0.2 后，应用可改为 `qubit-operation = "^0.2"`；只有应用代码直接使用其他 crate 时，才需要把它们列为直接依赖。
 
 下面是一份完整的目标程序，另存于 [detect_file.rs](examples-0.2.0/detect_file.rs)。InputFile 是应用定义的资源类型，框架类型均来自 qubit-operation。
 
