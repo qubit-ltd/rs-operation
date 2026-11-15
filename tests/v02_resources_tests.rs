@@ -321,3 +321,32 @@ fn test_ended_scope_keeps_live_reference_readable_and_disallows_get() {
     operation.wait_settlement().unwrap();
     drop(manager.request_shutdown(ShutdownMode::Drain).wait().unwrap());
 }
+
+#[test]
+fn test_resources_in_distinct_scopes_have_distinct_ids() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let mut operation = manager
+        .try_submit(OperationOptions::default(), |scope| {
+            let operation_resource = scope.manage(String::from("operation")).unwrap();
+            let first_scope = scope.resource_scope(ResourceScopeOptions { capacity: 1 }).unwrap();
+            let first = first_scope.manage(String::from("first")).unwrap();
+            let second_scope = scope.resource_scope(ResourceScopeOptions { capacity: 1 }).unwrap();
+            let second = second_scope.manage(String::from("second")).unwrap();
+
+            assert_ne!(operation_resource.id(), first.id());
+            assert_ne!(operation_resource.id(), second.id());
+            assert_ne!(first.id(), second.id());
+            assert_eq!(first.id(), first.clone().id());
+
+            first_scope.end();
+            second_scope.end();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    operation.wait_settlement().unwrap();
+    drop(manager.request_shutdown(ShutdownMode::Drain).wait().unwrap());
+}

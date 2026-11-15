@@ -18,8 +18,6 @@ use super::Entry;
 pub(in crate::v02::resource) struct State {
     /// Whether the scope may still accept resource registrations.
     pub(in crate::v02::resource) open: bool,
-    /// Next unique slot identifier allocated within this scope.
-    pub(in crate::v02::resource) next_slot: u64,
     /// Current key generation; incremented when the scope closes to invalidate
     /// old keys.
     pub(in crate::v02::resource) generation: u64,

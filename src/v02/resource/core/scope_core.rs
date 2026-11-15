@@ -305,14 +305,13 @@ impl ScopeCore {
         if !state.open || !reservation.tracked {
             return Err(ResourceManageErrorKind::ScopeEnded);
         }
-        let slot = state.next_slot;
-        let next_slot = slot.checked_add(1).ok_or(ResourceManageErrorKind::CapacityExceeded)?;
+        let slot = crate::v02::internal::resource_slot_allocator::allocate()
+            .ok_or(ResourceManageErrorKind::CapacityExceeded)?;
         let registration = reservation
             .registration
             .take()
             .expect("reservation has resource permit");
         let cleanup_permit = reservation.cleanup_permit.take().expect("reservation has cleanup slot");
-        state.next_slot = next_slot;
         state.reservations = state.reservations.saturating_sub(1);
         reservation.tracked = false;
         Ok((slot, state.generation, registration, cleanup_permit))
@@ -426,8 +425,8 @@ impl ScopeCore {
         let (resource_id, registration, cleanup_permit) = {
             let mut state = lock(&self.state);
             assert!(reservation.tracked, "reservation is consumed once");
-            let slot = state.next_slot;
-            state.next_slot = slot.checked_add(1).expect("resource slot space exhausted");
+            let slot = crate::v02::internal::resource_slot_allocator::allocate()
+                .expect("resource slot space exhausted");
             state.reservations = state.reservations.saturating_sub(1);
             state.retained = state.retained.saturating_add(1);
             reservation.tracked = false;

@@ -10,8 +10,13 @@ use crate::v02::report::ManagerId;
 
 /// Identifies one resource slot and generation within a manager.
 ///
-/// A generation changes when a slot is reused, so stale references cannot
-/// identify a later resource occupying the same slot.
+/// Resource IDs are opaque, process-local identities. Their slots come from a
+/// process-wide monotonic allocator, so slot numbers do not restart at one for
+/// each resource scope. Callers should compare IDs for equality rather than
+/// infer meaning from their numeric representation.
+///
+/// Slots are not currently reused. The generation field remains part of the
+/// identity so future slot reuse can distinguish stale references.
 ///
 /// # Examples
 ///

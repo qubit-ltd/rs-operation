@@ -61,7 +61,6 @@ impl ScopeState {
                 completion: Arc::clone(&completion),
                 state: Mutex::new(State {
                     open: true,
-                    next_slot: 1,
                     generation: 1,
                     reservations: 0,
                     retained: 0,
