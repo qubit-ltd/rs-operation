@@ -128,17 +128,18 @@ impl RecoveryAttempt {
     ///
     /// `Ok(())` resolves the recovery group; an error records the failure and
     /// returns the group to a retryable phase. If a waiter already took the
-    /// run, this call only publishes the current snapshot.
+    /// run, this call leaves report publication to that waiter.
     ///
     /// # Parameters
     ///
     /// - `self`: Observer whose run is being completed.
     /// - `result`: Confirmation or failure produced by the cleanup action.
     pub fn finish(&self, result: Result<(), CleanupFailure>) {
-        if let Some(mut run) = lock(&self.run).take() {
+        let run = lock(&self.run).take();
+        if let Some(mut run) = run {
             run.complete(result);
+            publish_attempt(&self.observation, self.core.snapshot());
         }
-        publish_attempt(&self.observation, self.core.snapshot());
     }
 
     /// Clones only the shared observation handles, not the recovery run.

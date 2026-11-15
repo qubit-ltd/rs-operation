@@ -260,6 +260,61 @@ mod tests {
     }
 
     #[test]
+    fn test_finish_does_not_publish_while_an_async_retry_owns_the_run() {
+        struct BlockedRetry(Arc<Gate>);
+
+        impl RecoveryAction for BlockedRetry {
+            fn retry(
+                &self,
+                _payload: Arc<dyn std::any::Any + Send + Sync>,
+            ) -> super::RecoveryFuture {
+                let gate = Arc::clone(&self.0);
+                Box::pin(async move {
+                    gate.wait().await;
+                    Ok(())
+                })
+            }
+        }
+
+        let (started_tx, _started_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new(Gate {
+            state: Mutex::new((false, None)),
+            started: started_tx,
+        });
+        let group = Arc::new(RecoveryCore::new(
+            vec![ResourceId::new(ManagerId::new_unique(), 1, 1)],
+            Arc::new(()),
+            Arc::new(BlockedRetry(Arc::clone(&gate))),
+        ));
+        let attempt = group.try_retry().unwrap();
+        let first_async_attempt = attempt.as_async();
+        let second_async_attempt = attempt.as_async();
+        let mut first_observer = Box::pin(first_async_attempt.wait());
+        let mut second_observer = Box::pin(second_async_attempt.wait());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(first_observer.as_mut().poll(&mut context).is_pending());
+        assert!(second_observer.as_mut().poll(&mut context).is_pending());
+        assert_eq!(group.snapshot().phase, RecoveryPhase::Running);
+
+        attempt.finish(Ok(()));
+        assert!(first_observer.as_mut().poll(&mut context).is_pending());
+        assert!(second_observer.as_mut().poll(&mut context).is_pending());
+
+        gate.open();
+        let first_report = match first_observer.as_mut().poll(&mut context) {
+            Poll::Ready(report) => report,
+            Poll::Pending => panic!("first observer did not receive the completed retry"),
+        };
+        let second_report = match second_observer.as_mut().poll(&mut context) {
+            Poll::Ready(report) => report,
+            Poll::Pending => panic!("second observer did not receive the completed retry"),
+        };
+        assert_eq!(first_report.recovery.id, second_report.recovery.id);
+        assert_eq!(first_report.recovery.phase, second_report.recovery.phase);
+        assert_eq!(group.snapshot().phase, RecoveryPhase::Resolved);
+    }
+
+    #[test]
     fn test_shutdown_handle_async_wait_and_clones_share_completion() {
         let store = super::RecoveryStore::new(super::RecoveryStoreOptions::default()).unwrap();
         let handle = store.request_shutdown();
