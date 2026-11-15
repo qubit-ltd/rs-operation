@@ -14,7 +14,7 @@ use std::sync::Mutex;
 
 use super::AdmissionError;
 use super::AsyncOperationHandle;
-use super::CatchUnwindFuture;
+use super::dispose_panic_payload;
 use super::ChildRelease;
 use super::DiagnosticSummary;
 use super::ExecutionFrameGuard;
@@ -153,9 +153,10 @@ impl AsyncOperationManager {
     /// bounded by the manager's admission-waiter limit and does not guarantee
     /// FIFO ordering. Root submissions are rejected after manager Drain begins,
     /// while descendants of accepted scopes may continue.
-    /// Panics while constructing or polling the returned future are reported
-    /// as [`OperationOutcome::Panicked`] and still complete operation
-    /// settlement.
+    /// Panics while constructing, polling, or finally dropping the returned
+    /// future are reported as [`OperationOutcome::Panicked`] and still
+    /// complete operation settlement when the panic is unwind-catchable.
+    /// Panics configured to abort the process cannot be recovered.
     ///
     /// # Type Parameters
     ///
@@ -273,7 +274,7 @@ impl AsyncOperationManager {
                 let result = match construction {
                     Ok(user_future) => {
                         ExecutionContextFuture::new(
-                            CatchUnwindFuture(Box::pin(user_future)),
+                            user_future,
                             manager_core,
                             operation_id,
                             group,
@@ -292,11 +293,15 @@ impl AsyncOperationManager {
                 scope_core.on_outcomes_ready(move || {
                     let outcome = match result {
                         Ok(result) => callback_scope.resolve_outcome(result),
-                        Err(payload) => OperationOutcome::Panicked(PanicSummary {
-                            operation_id,
-                            phase: ExecutionPhase::Running,
-                            summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
-                        }),
+                        Err(payload) => {
+                            let summary = DiagnosticSummary::new(&panic_message(payload.as_ref()));
+                            dispose_panic_payload(payload);
+                            OperationOutcome::Panicked(PanicSummary {
+                                operation_id,
+                                phase: ExecutionPhase::Running,
+                                summary,
+                            })
+                        }
                     };
                     let summary = child_outcome_summary(operation_id, &outcome);
                     control.publish_outcome(summary.clone());

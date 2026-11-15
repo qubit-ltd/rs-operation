@@ -14,39 +14,55 @@ use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
 
-/// Future adapter that converts a panic during polling into an owned payload.
-///
-/// # Type Parameters
-///
-/// `F` is the inner future whose poll operation is protected by `catch_unwind`.
-#[must_use]
-pub(in crate::v02::manager::core) struct CatchUnwindFuture<F>(
-    /// Pinned inner future that is polled by this adapter.
-    pub(in crate::v02::manager::core) Pin<Box<F>>,
+/// Owned payload returned when a protected user operation unwinds.
+pub(crate) type PanicPayload = Box<dyn Any + Send>;
+
+/// Owns a pinned future whose poll and final drop can be caught separately.
+pub(crate) struct CatchUnwindFuture<F>(
+    /// Pinned allocation that can be moved as a handle and taken exactly once.
+    Option<Pin<Box<F>>>,
 );
 
-impl<F: Future> Future for CatchUnwindFuture<F> {
-    /// Inner future output or the payload from a panic during polling.
-    type Output = Result<F::Output, Box<dyn Any + Send>>;
+impl<F> CatchUnwindFuture<F> {
+    /// Pins a future in a takeable allocation without moving its value.
+    pub(crate) fn new(future: F) -> Self {
+        Self(Some(Box::pin(future)))
+    }
 
-    /// Polls the inner future under `catch_unwind`, preserving pending
-    /// behavior.
-    ///
-    /// # Parameters
-    ///
-    /// - `context`: task context used to poll the inner future and register its
-    ///   waker.
-    ///
-    /// # Returns
-    ///
-    /// `Pending` is propagated, `Ready(Ok(_))` carries the inner output, and
-    /// `Ready(Err(_))` carries a panic payload.
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let future = self.get_mut();
-        match panic::catch_unwind(AssertUnwindSafe(|| future.0.as_mut().poll(context))) {
-            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
-            Ok(Poll::Pending) => Poll::Pending,
-            Err(payload) => Poll::Ready(Err(payload)),
+    /// Polls the pinned future and returns any panic payload without unwinding.
+    pub(crate) fn poll(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Result<Poll<F::Output>, PanicPayload>
+    where
+        F: Future,
+    {
+        let future = self.0.as_mut().expect("future is present while polling");
+        panic::catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(context)))
+    }
+
+    /// Takes the pinned allocation before dropping it and reports a drop panic.
+    pub(crate) fn drop_inner(&mut self) -> Result<(), PanicPayload> {
+        let Some(future) = self.0.take() else {
+            return Ok(());
+        };
+        panic::catch_unwind(AssertUnwindSafe(|| drop(future)))
+    }
+}
+
+impl<F> Drop for CatchUnwindFuture<F> {
+    /// Contains a remaining future's drop panic during cancellation or teardown.
+    fn drop(&mut self) {
+        if let Err(payload) = self.drop_inner() {
+            dispose_panic_payload(payload);
         }
+    }
+}
+
+/// Disposes of a panic payload while preventing its destructor from unwinding.
+pub(crate) fn dispose_panic_payload(payload: PanicPayload) {
+    if let Err(secondary) = panic::catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        // A panic payload whose destructor also panics cannot be safely freed.
+        std::mem::forget(secondary);
     }
 }

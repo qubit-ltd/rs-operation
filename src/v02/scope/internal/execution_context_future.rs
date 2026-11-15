@@ -6,6 +6,7 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,18 +14,20 @@ use std::task::Context;
 use std::task::Poll;
 
 use super::ExecutionContextGuard;
+use crate::v02::manager::core::CatchUnwindFuture;
+use crate::v02::manager::core::dispose_panic_payload;
 use crate::v02::manager::core::ManagerCore;
 use crate::v02::manager::group::GroupCore;
 use crate::v02::report::OperationId;
 
-/// Future that installs an operation context around each call to `poll`.
+/// Future that installs an operation context around each poll and final drop.
 ///
 /// # Type Parameters
 ///
 /// - `F`: User future whose poll runs within the managed operation context.
 pub(crate) struct ExecutionContextFuture<F> {
-    /// Pinned user future, kept separately so this wrapper remains movable.
-    future: Pin<Box<F>>,
+    /// User future with an explicitly takeable pinned allocation.
+    future: CatchUnwindFuture<F>,
     /// Manager identity exposed during each future poll.
     manager: Arc<ManagerCore>,
     /// Operation identity exposed during each future poll.
@@ -53,7 +56,7 @@ impl<F> ExecutionContextFuture<F> {
         group: Option<Arc<GroupCore>>,
     ) -> Self {
         Self {
-            future: Box::pin(future),
+            future: CatchUnwindFuture::new(future),
             manager,
             operation,
             group,
@@ -62,8 +65,8 @@ impl<F> ExecutionContextFuture<F> {
 }
 
 impl<F: Future> Future for ExecutionContextFuture<F> {
-    /// Output produced by the wrapped future.
-    type Output = F::Output;
+    /// Output or a panic payload from polling or final future destruction.
+    type Output = Result<F::Output, Box<dyn Any + Send>>;
 
     /// Polls the wrapped future with the owning operation context installed.
     ///
@@ -80,6 +83,32 @@ impl<F: Future> Future for ExecutionContextFuture<F> {
         // movable and can stay Send when F is Send.
         let this = self.as_mut().get_mut();
         let _context = ExecutionContextGuard::enter(&this.manager, this.operation, this.group.as_ref());
-        this.future.as_mut().poll(cx)
+        match this.future.poll(cx) {
+            Err(poll_panic) => {
+                if let Err(drop_panic) = this.future.drop_inner() {
+                    dispose_panic_payload(drop_panic);
+                }
+                Poll::Ready(Err(poll_panic))
+            }
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(output)) => match this.future.drop_inner() {
+                Ok(()) => Poll::Ready(Ok(output)),
+                Err(drop_panic) => {
+                    if let Err(output_panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(output))) {
+                        dispose_panic_payload(output_panic);
+                    }
+                    Poll::Ready(Err(drop_panic))
+                }
+            },
+        }
+    }
+}
+
+impl<F> Drop for ExecutionContextFuture<F> {
+    fn drop(&mut self) {
+        let _context = ExecutionContextGuard::enter(&self.manager, self.operation, self.group.as_ref());
+        if let Err(payload) = self.future.drop_inner() {
+            dispose_panic_payload(payload);
+        }
     }
 }

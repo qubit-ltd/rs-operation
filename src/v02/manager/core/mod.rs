@@ -20,7 +20,8 @@ use std::sync::Mutex;
 use std::task::Poll;
 
 pub use async_operation_manager::AsyncOperationManager;
-use internal::CatchUnwindFuture;
+pub(crate) use internal::CatchUnwindFuture;
+pub(crate) use internal::dispose_panic_payload;
 pub(crate) use internal::ExecutionKind;
 pub(crate) use internal::ManagerCore;
 pub(crate) use internal::ManagerPhase;

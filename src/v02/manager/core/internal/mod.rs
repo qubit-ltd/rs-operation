@@ -20,7 +20,8 @@ mod submission_reservation;
 mod submission_target;
 mod thread_unparker;
 
-pub(super) use catch_unwind_future::CatchUnwindFuture;
+pub(crate) use catch_unwind_future::CatchUnwindFuture;
+pub(crate) use catch_unwind_future::dispose_panic_payload;
 pub(crate) use execution_kind::ExecutionKind;
 pub(crate) use manager_core::ManagerCore;
 pub(crate) use manager_phase::ManagerPhase;
