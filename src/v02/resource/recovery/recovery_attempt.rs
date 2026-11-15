@@ -25,6 +25,8 @@ use crate::v02::resource::recovery::wait_attempt_async;
 /// A synchronous or asynchronous observer can wait on the same attempt. If
 /// every observer is dropped before completion, the retained owner remains in
 /// recovery and its phase becomes `Unconfirmed`; it is never marked released.
+/// Panics from retry action construction or polling are also reported as
+/// `Unconfirmed`, with the resource responsibility retained.
 /// Attempts are created by [`crate::RecoveryHandle::try_retry`] or
 /// [`crate::RecoveryStore::try_retry`].
 ///
@@ -103,7 +105,8 @@ impl RecoveryAttempt {
     /// # Returns
     ///
     /// The report containing the recovery snapshot and failures from the
-    /// completed attempt.
+    /// completed attempt. An unwind panic from retry construction or polling
+    /// produces an `Unconfirmed` report rather than escaping this wait.
     pub async fn wait_async(&self) -> crate::v02::report::RecoveryAttemptReport {
         let run = { lock(&self.run).take() };
         if let Some(mut run) = run {
@@ -113,7 +116,7 @@ impl RecoveryAttempt {
                     let payload = run.payload.as_ref().expect("attempt owns payload").clone();
                     match retry_catching_panic(Arc::clone(&run.action), payload).await {
                         Ok(result) => run.complete(result),
-                        Err(panic) => run.complete_unconfirmed(panic),
+                        Err((panic, future)) => run.complete_unconfirmed(panic, future),
                     }
                     publish_attempt(&observation, run.core.snapshot());
                 });
@@ -121,7 +124,7 @@ impl RecoveryAttempt {
                 let payload = run.payload.as_ref().expect("attempt owns payload").clone();
                 match retry_catching_panic(Arc::clone(&run.action), payload).await {
                     Ok(result) => run.complete(result),
-                    Err(panic) => run.complete_unconfirmed(panic),
+                    Err((panic, future)) => run.complete_unconfirmed(panic, future),
                 }
                 publish_attempt(&self.observation, self.core.snapshot());
             }
@@ -165,35 +168,41 @@ impl RecoveryAttempt {
     }
 }
 
-/// Runs both action construction and future polling behind unwind boundaries.
+/// Runs action construction and polling behind unwind boundaries.
+///
+/// # Parameters
+///
+/// * `action` — recovery strategy whose construction and polling are guarded.
+/// * `payload` — retained owner payload supplied to the recovery strategy.
+///
+/// # Returns
+///
+/// The action result, or the panic payload with any future that must remain
+/// retained because its cleanup outcome is unknown.
 async fn retry_catching_panic(
     action: Arc<dyn crate::v02::resource::recovery::RecoveryAction>,
     payload: crate::v02::resource::recovery::RecoveryPayload,
-) -> Result<Result<(), CleanupFailure>, Box<dyn std::any::Any + Send>> {
-    let future =
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action.retry(payload))) {
-            Ok(future) => future,
-            Err(panic) => return Err(panic),
-        };
+) -> Result<
+    Result<(), CleanupFailure>,
+    (
+        Box<dyn std::any::Any + Send>,
+        Option<crate::v02::resource::recovery::RecoveryFuture>,
+    ),
+> {
+    let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action.retry(payload))) {
+        Ok(future) => future,
+        Err(panic) => return Err((panic, None)),
+    };
     let mut future = Some(future);
     std::future::poll_fn(|cx| {
-        let future_ref = future
-            .as_mut()
-            .expect("future remains present until completion");
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            future_ref.as_mut().poll(cx)
-        })) {
+        let future_ref = future.as_mut().expect("future remains present until completion");
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future_ref.as_mut().poll(cx))) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(result)) => {
                 future.take();
                 Poll::Ready(Ok(result))
             }
-            Err(panic) => {
-                if let Some(future) = future.take() {
-                    std::mem::forget(future);
-                }
-                Poll::Ready(Err(panic))
-            }
+            Err(panic) => Poll::Ready(Err((panic, future.take()))),
         }
     })
     .await

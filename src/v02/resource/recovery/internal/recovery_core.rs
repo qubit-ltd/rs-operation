@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use super::State;
+use crate::v02::report::CleanupFailure;
+use crate::v02::report::CleanupStage;
+use crate::v02::report::DiagnosticSummary;
 use crate::v02::report::RecoveryId;
 use crate::v02::report::RecoveryPhase;
 use crate::v02::report::RecoverySnapshot;
@@ -67,6 +70,12 @@ impl Drop for RecoveryCore {
             if let Some(action) = state.action.take() {
                 std::mem::forget(action);
             }
+            if let Some(future) = state.unconfirmed_future.take() {
+                std::mem::forget(future);
+            }
+            if let Some(panic) = state.panic.take() {
+                std::mem::forget(panic);
+            }
         }
     }
 }
@@ -96,6 +105,7 @@ impl RecoveryCore {
                 failures: Vec::new(),
                 retry_disabled: false,
                 panic: None,
+                unconfirmed_future: None,
             }),
             terminal: Mutex::new(None),
             executor: Mutex::new(None),
@@ -129,6 +139,7 @@ impl RecoveryCore {
                 failures: Vec::new(),
                 retry_disabled: true,
                 panic: None,
+                unconfirmed_future: None,
             }),
             terminal: Mutex::new(None),
             executor: Mutex::new(None),
@@ -240,16 +251,42 @@ impl RecoveryCore {
     }
 
     /// Marks a panicked attempt unconfirmed while retaining owner and action.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — recovery core whose active retry panicked.
+    /// * `generation` — active retry token used to reject stale completion.
+    /// * `panic` — panic payload retained for diagnosis.
+    /// * `future` — panicked action future retained without dropping it.
     pub(in crate::v02::resource::recovery) fn mark_unconfirmed(
         &self,
         generation: u64,
         panic: Box<dyn std::any::Any + Send + 'static>,
+        future: Option<crate::v02::resource::recovery::RecoveryFuture>,
     ) {
+        let summary = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("recovery action panicked; cleanup outcome is unconfirmed");
+        let failures = self
+            .resources
+            .iter()
+            .copied()
+            .map(|resource_id| CleanupFailure {
+                resource_id,
+                stage: CleanupStage::AsyncRelease,
+                summary: DiagnosticSummary::new(summary),
+                source: None,
+            })
+            .collect::<Vec<_>>();
         let mut state = lock(&self.state);
         if state.phase == RecoveryPhase::Running && state.generation == generation {
             state.phase = RecoveryPhase::Unconfirmed;
             state.retry_disabled = true;
             state.panic = Some(panic);
+            state.unconfirmed_future = future;
+            state.failures.extend(failures);
         }
     }
 

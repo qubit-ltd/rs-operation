@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::v02::report::CleanupFailure;
 use crate::v02::report::RecoveryPhase;
 use crate::v02::resource::recovery::RecoveryAction;
+use crate::v02::resource::recovery::RecoveryFuture;
 use crate::v02::resource::recovery::RecoveryPayload;
 
 /// Mutable phase, payload, action, and failure state for one recovery group.
@@ -32,4 +33,6 @@ pub(in crate::v02::resource::recovery) struct State {
     pub(super) retry_disabled: bool,
     /// Panic payload retained after a retry becomes unconfirmed.
     pub(super) panic: Option<Box<dyn std::any::Any + Send + 'static>>,
+    /// Panicked action future retained without polling or dropping it.
+    pub(super) unconfirmed_future: Option<RecoveryFuture>,
 }

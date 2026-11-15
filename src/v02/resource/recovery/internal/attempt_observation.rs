@@ -25,7 +25,9 @@ pub(in crate::v02::resource::recovery) struct AttemptObservation {
     changed: Notify,
 }
 
+/// Creates an empty report slot and notification set for one retry.
 impl Default for AttemptObservation {
+    /// Returns an observation with no report and no registered waiters.
     fn default() -> Self {
         Self {
             report: Mutex::new(None),
@@ -129,18 +131,14 @@ mod tests {
         RecoverySnapshot {
             id: RecoveryId::from_raw(7),
             phase,
-            resources: Arc::from([ResourceId::new(
-                crate::v02::report::ManagerId::from_raw(1),
-                2,
-                3,
-            )]),
+            resources: Arc::from([ResourceId::new(crate::v02::report::ManagerId::from_raw(1), 2, 3)]),
             attempts,
             last_failures: Arc::from([]),
         }
     }
 
     #[test]
-    fn all_observers_wake_and_receive_the_first_published_report() {
+    fn test_all_observers_wake_and_receive_the_first_published_report() {
         let observation = AttemptObservation::default();
         let first_wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let second_wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -153,9 +151,7 @@ mod tests {
             Poll::Pending
         ));
         assert!(matches!(
-            second
-                .as_mut()
-                .poll(&mut Context::from_waker(&second_waker)),
+            second.as_mut().poll(&mut Context::from_waker(&second_waker)),
             Poll::Pending
         ));
 
@@ -167,10 +163,7 @@ mod tests {
             Poll::Ready(report) => report,
             Poll::Pending => panic!("first observer was not ready after notification"),
         };
-        let second_report = match second
-            .as_mut()
-            .poll(&mut Context::from_waker(&second_waker))
-        {
+        let second_report = match second.as_mut().poll(&mut Context::from_waker(&second_waker)) {
             Poll::Ready(report) => report,
             Poll::Pending => panic!("second observer was not ready after notification"),
         };
@@ -180,14 +173,7 @@ mod tests {
 
         publish_attempt(&observation, snapshot(RecoveryPhase::Pending, 2));
         assert_eq!(
-            observation
-                .report
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .recovery
-                .attempts,
+            observation.report.lock().unwrap().as_ref().unwrap().recovery.attempts,
             1
         );
         let mut late = Box::pin(wait_attempt_async(&observation));
@@ -198,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_waiter_unregisters_and_repoll_replaces_its_waker() {
+    fn test_cancelled_waiter_unregisters_and_repoll_replaces_its_waker() {
         let observation = AttemptObservation::default();
         let old_wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let new_wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -218,15 +204,11 @@ mod tests {
 
         let mut replacement = Box::pin(wait_attempt_async(&observation));
         assert!(matches!(
-            replacement
-                .as_mut()
-                .poll(&mut Context::from_waker(&old_waker)),
+            replacement.as_mut().poll(&mut Context::from_waker(&old_waker)),
             Poll::Pending
         ));
         assert!(matches!(
-            replacement
-                .as_mut()
-                .poll(&mut Context::from_waker(&new_waker)),
+            replacement.as_mut().poll(&mut Context::from_waker(&new_waker)),
             Poll::Pending
         ));
         publish_attempt(&observation, snapshot(RecoveryPhase::Resolved, 1));
@@ -235,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn notification_wakes_after_releasing_the_report_lock() {
+    fn test_notification_wakes_after_releasing_the_report_lock() {
         let observation = Arc::new(AttemptObservation::default());
         let callback_observation = Arc::clone(&observation);
         let waker = Waker::from(Arc::new(CallbackWake(Box::new(move || {

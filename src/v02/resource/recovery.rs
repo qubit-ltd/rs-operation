@@ -144,10 +144,7 @@ mod tests {
         }
     }
 
-    fn panic_cleanup_group(
-        poll: bool,
-        store: bool,
-    ) -> (Arc<RecoveryCore>, Option<super::RecoveryStore>) {
+    fn panic_cleanup_group(poll: bool, store: bool) -> (Arc<RecoveryCore>, Option<super::RecoveryStore>) {
         use crate::v02::manager::capacity::ManagerCapacityPools;
         use crate::v02::manager::capacity::ScopeCapacity;
         use crate::v02::report::ManagerLimits;
@@ -163,20 +160,15 @@ mod tests {
             calls: AtomicUsize::new(0),
             poll,
         });
-        let (payload, action) = super::async_owner(
-            resource_id,
-            Probe(Arc::new(AtomicUsize::new(0))),
-            policy,
-            registration,
-        );
+        let (payload, action) =
+            super::async_owner(resource_id, Probe(Arc::new(AtomicUsize::new(0))), policy, registration);
         let group = Arc::new(RecoveryCore::new(vec![resource_id], payload, action));
-        let recovery_store = store.then(|| {
-            super::RecoveryStore::new(crate::v02::report::RecoveryStoreOptions::default()).unwrap()
-        });
-        if let Some(recovery_store) = &recovery_store {
-            if let Err((_error, _group)) = recovery_store.accept(Arc::clone(&group)) {
-                panic!("store rejected recovery group");
-            }
+        let recovery_store =
+            store.then(|| super::RecoveryStore::new(crate::v02::report::RecoveryStoreOptions::default()).unwrap());
+        if let Some(recovery_store) = &recovery_store
+            && let Err((_error, _group)) = recovery_store.accept(Arc::clone(&group))
+        {
+            panic!("store rejected recovery group");
         }
         (group, recovery_store)
     }
@@ -325,10 +317,7 @@ mod tests {
         struct BlockedRetry(Arc<Gate>);
 
         impl RecoveryAction for BlockedRetry {
-            fn retry(
-                &self,
-                _payload: Arc<dyn std::any::Any + Send + Sync>,
-            ) -> super::RecoveryFuture {
+            fn retry(&self, _payload: Arc<dyn std::any::Any + Send + Sync>) -> super::RecoveryFuture {
                 let gate = Arc::clone(&self.0);
                 Box::pin(async move {
                     gate.wait().await;
@@ -531,9 +520,33 @@ mod tests {
     struct PanicPoll;
     impl RecoveryAction for PanicPoll {
         fn retry(&self, _payload: Arc<dyn std::any::Any + Send + Sync>) -> super::RecoveryFuture {
-            Box::pin(std::future::poll_fn(
-                |_| -> Poll<Result<(), CleanupFailure>> { panic!("retry poll panic") },
-            ))
+            Box::pin(std::future::poll_fn(|_| -> Poll<Result<(), CleanupFailure>> {
+                panic!("retry poll panic")
+            }))
+        }
+    }
+
+    struct PanicFutureDropProbe(Arc<AtomicUsize>);
+
+    impl Future for PanicFutureDropProbe {
+        type Output = Result<(), CleanupFailure>;
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            panic!("retry poll panic with retained future")
+        }
+    }
+
+    impl Drop for PanicFutureDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct PanicPollWithDrop(Arc<AtomicUsize>);
+
+    impl RecoveryAction for PanicPollWithDrop {
+        fn retry(&self, _payload: Arc<dyn std::any::Any + Send + Sync>) -> super::RecoveryFuture {
+            Box::pin(PanicFutureDropProbe(Arc::clone(&self.0)))
         }
     }
 
@@ -547,14 +560,8 @@ mod tests {
         ));
         let attempt = group.try_retry().unwrap();
         let report = super::block_on(attempt.wait_async());
-        assert_eq!(
-            report.recovery.phase,
-            crate::v02::report::RecoveryPhase::Unconfirmed
-        );
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Unconfirmed
-        );
+        assert_eq!(report.recovery.phase, crate::v02::report::RecoveryPhase::Unconfirmed);
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Unconfirmed);
         assert!(group.try_retry().is_err());
     }
 
@@ -568,15 +575,33 @@ mod tests {
         ));
         let attempt = group.try_retry().unwrap();
         let report = super::block_on(attempt.wait_async());
-        assert_eq!(
-            report.recovery.phase,
-            crate::v02::report::RecoveryPhase::Unconfirmed
-        );
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Unconfirmed
-        );
+        assert_eq!(report.recovery.phase, crate::v02::report::RecoveryPhase::Unconfirmed);
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Unconfirmed);
         assert!(group.try_retry().is_err());
+    }
+
+    #[test]
+    fn test_retry_poll_panic_retains_future_and_records_cleanup_failure() {
+        let manager = ManagerId::new_unique();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let group = Arc::new(RecoveryCore::new(
+            vec![ResourceId::new(manager, 10, 1), ResourceId::new(manager, 11, 1)],
+            Arc::new(()),
+            Arc::new(PanicPollWithDrop(Arc::clone(&drops))),
+        ));
+        let report = group.try_retry().unwrap().wait().unwrap();
+
+        assert_eq!(report.recovery.phase, RecoveryPhase::Unconfirmed);
+        assert_eq!(report.failures.len(), 2);
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|failure| failure.stage == CleanupStage::AsyncRelease)
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(group);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -587,27 +612,17 @@ mod tests {
             Arc::new(()),
             Arc::new(PanicPoll),
         ));
-        let store =
-            super::RecoveryStore::new(crate::v02::report::RecoveryStoreOptions::default()).unwrap();
+        let store = super::RecoveryStore::new(crate::v02::report::RecoveryStoreOptions::default()).unwrap();
         let id = group.id();
         if let Err((_error, _group)) = store.accept(Arc::clone(&group)) {
             panic!("store rejected recovery group");
         }
         let report = store.try_retry(id).unwrap().wait().unwrap();
-        assert_eq!(
-            report.recovery.phase,
-            crate::v02::report::RecoveryPhase::Unconfirmed
-        );
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Unconfirmed
-        );
+        assert_eq!(report.recovery.phase, crate::v02::report::RecoveryPhase::Unconfirmed);
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Unconfirmed);
         assert!(store.contains(id));
         assert!(store.try_retry(id).is_err());
-        store
-            .request_shutdown()
-            .wait_for(Duration::from_secs(2))
-            .unwrap();
+        store.request_shutdown().wait_for(Duration::from_secs(2)).unwrap();
     }
 
     #[test]
@@ -632,10 +647,7 @@ mod tests {
             assert!(group.try_retry().is_err());
             if let Some(store) = store {
                 assert!(store.contains(group.id()));
-                store
-                    .request_shutdown()
-                    .wait_for(Duration::from_secs(2))
-                    .unwrap();
+                store.request_shutdown().wait_for(Duration::from_secs(2)).unwrap();
             }
         }
     }

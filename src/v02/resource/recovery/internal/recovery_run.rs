@@ -38,11 +38,18 @@ pub(in crate::v02::resource::recovery) struct RecoveryRun {
 impl RecoveryRun {
     /// Records an unconfirmed outcome after an action panic without releasing
     /// the payload or action retained by the recovery core.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — run completing after an action panic.
+    /// * `panic` — panic payload retained by the recovery core.
+    /// * `future` — panicked future retained without polling or dropping it.
     pub(in crate::v02::resource::recovery) fn complete_unconfirmed(
         &mut self,
         panic: Box<dyn std::any::Any + Send + 'static>,
+        future: Option<crate::v02::resource::recovery::RecoveryFuture>,
     ) {
-        self.core.mark_unconfirmed(self.generation, panic);
+        self.core.mark_unconfirmed(self.generation, panic, future);
         self.completed = true;
         self.payload.take();
     }

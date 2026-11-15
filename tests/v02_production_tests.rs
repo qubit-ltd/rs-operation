@@ -38,6 +38,14 @@ impl AsyncCleanup<String> for MarkerCleanup {
     }
 }
 
+struct CountedDrop(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for CountedDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[test]
 fn test_real_sync_and_async_managers_run_typed_operations_and_shutdown() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
@@ -77,10 +85,18 @@ fn test_real_sync_and_async_managers_run_typed_operations_and_shutdown() {
 #[test]
 fn test_async_body_construction_panic_is_reported_and_releases_capacity() {
     let manager = AsyncOperationManager::new(ManagerOptions::default()).unwrap();
+    let resource_drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let resource_drops_for_body = Arc::clone(&resource_drops);
     let mut operation = manager
-        .try_submit(OperationOptions::default(), |_| -> std::future::Ready<Result<(), ()>> {
-            panic!("future construction failed")
-        })
+        .try_submit(
+            OperationOptions::default(),
+            move |scope| -> std::future::Ready<Result<(), ()>> {
+                let _resource = scope
+                    .manage(CountedDrop(resource_drops_for_body))
+                    .expect("resource should be accepted before body construction panics");
+                panic!("future construction failed")
+            },
+        )
         .unwrap()
         .into_sync();
 
@@ -95,6 +111,7 @@ fn test_async_body_construction_panic_is_reported_and_releases_capacity() {
         .expect("accepted operation should finish after a construction panic");
     assert!(matches!(outcome.unwrap(), OperationOutcome::Panicked(_)));
     assert!(settlement.unwrap().all_released());
+    assert_eq!(resource_drops.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     let mut next = manager
         .try_submit(OperationOptions::default(), |_| async { Ok::<_, ()>(()) })

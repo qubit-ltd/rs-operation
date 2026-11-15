@@ -45,10 +45,13 @@ impl<T: Send + Sync + 'static> RecoveryAction for AsyncRecoveryAction<T> {
     /// A future that resolves to success after release or transfer, or to the
     /// cleanup failure after restoring the resource for another attempt.
     ///
-    /// # Panics
+    /// # Panic Handling
     ///
-    /// The returned future panics if construction of the empty cleanup context
-    /// violates its invariant or if the cleanup policy panics while polled.
+    /// A cleanup policy panic is caught by the recovery attempt and reported as
+    /// `Unconfirmed`. If cleanup construction panics after consuming the
+    /// resource, that value cannot be recovered, but the recovery owner and its
+    /// capacity registration remain retained. A poll panic retains the
+    /// unfinished future without dropping it.
     fn retry(&self, _payload: RecoveryPayload) -> RecoveryFuture {
         let owner = Arc::clone(&self.0);
         Box::pin(async move {
