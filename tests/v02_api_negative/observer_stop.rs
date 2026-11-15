@@ -11,3 +11,4 @@ use qubit_operation::StopReason;
 fn check(observer: OperationObserver) {
     let _ = observer.request_stop(StopReason::User);
 }
+fn main() {}

@@ -1,0 +1,11 @@
+error[E0599]: no method named `request_stop` found for struct `OperationObserver` in the current scope
+  --> tests/v02_api_negative/observer_stop.rs:12:22
+   |
+12 |     let _ = observer.request_stop(StopReason::User);
+   |                      ^^^^^^^^^^^^ method not found in `OperationObserver`
+
+error[E0599]: no variant or associated item named `User` found for enum `StopReason` in the current scope
+  --> tests/v02_api_negative/observer_stop.rs:12:47
+   |
+12 |     let _ = observer.request_stop(StopReason::User);
+   |                                               ^^^^ variant or associated item not found in `StopReason`

@@ -1,0 +1,5 @@
+error[E0599]: no method named `try_take_outcome` found for struct `OperationObserver` in the current scope
+  --> tests/v02_api_negative/observer_result.rs:11:22
+   |
+11 |     let _ = observer.try_take_outcome();
+   |                      ^^^^^^^^^^^^^^^^ method not found in `OperationObserver`

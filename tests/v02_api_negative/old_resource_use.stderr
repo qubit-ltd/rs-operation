@@ -1,0 +1,8 @@
+error[E0432]: unresolved import `qubit_operation::ResourceUse`
+ --> tests/v02_api_negative/old_resource_use.rs:9:5
+  |
+9 | use qubit_operation::ResourceUse;
+  |     ^^^^^^^^^^^^^^^^^-----------
+  |     |                |
+  |     |                help: a similar name exists in the module: `ResourceId`
+  |     no `ResourceUse` in the root

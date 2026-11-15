@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `qubit_operation::Supervisor`
+ --> tests/v02_api_negative/old_supervisor.rs:9:5
+  |
+9 | use qubit_operation::Supervisor;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `Supervisor` in the root

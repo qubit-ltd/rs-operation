@@ -1,0 +1,7 @@
+error[E0594]: cannot assign to data in dereference of `ResourceRef<std::sync::Mutex<usize>>`
+  --> tests/v02_api_negative/resource_mut.rs:11:5
+   |
+11 |     *resource = std::sync::Mutex::new(3);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ cannot assign
+   |
+   = help: trait `DerefMut` is required to modify through a dereference, but it is not implemented for `ResourceRef<std::sync::Mutex<usize>>`

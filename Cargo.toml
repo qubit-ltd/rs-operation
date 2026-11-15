@@ -90,3 +90,6 @@ qubit-budget = "^0.10"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
+
+[dev-dependencies]
+trybuild = "^1.0"

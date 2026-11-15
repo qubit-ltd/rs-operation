@@ -7,6 +7,7 @@
 // =============================================================================
 // EXPECT: DerefMut
 use qubit_operation::ResourceRef;
-fn check(mut resource: ResourceRef<std::sync::Mutex<usize>>) {
+fn check(resource: ResourceRef<std::sync::Mutex<usize>>) {
     *resource = std::sync::Mutex::new(3);
 }
+fn main() {}

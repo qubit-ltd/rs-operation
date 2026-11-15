@@ -1,0 +1,11 @@
+error[E0277]: the trait bound `OperationScope: Clone` is not satisfied
+  --> tests/v02_api_negative/scope_clone.rs:12:22
+   |
+12 |     requires_clone::<OperationScope>();
+   |                      ^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `OperationScope`
+   |
+note: required by a bound in `requires_clone`
+  --> tests/v02_api_negative/scope_clone.rs:10:22
+   |
+10 | fn requires_clone<T: Clone>() {}
+   |                      ^^^^^ required by this bound in `requires_clone`

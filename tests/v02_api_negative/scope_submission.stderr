@@ -1,0 +1,5 @@
+error[E0599]: no method named `try_submit` found for reference `&OperationScope` in the current scope
+  --> tests/v02_api_negative/scope_submission.rs:11:19
+   |
+11 |     let _ = scope.try_submit(|_| Ok::<_, ()>(()));
+   |                   ^^^^^^^^^^ method not found in `&OperationScope`
