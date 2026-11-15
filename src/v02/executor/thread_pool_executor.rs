@@ -150,6 +150,11 @@ impl ThreadPoolExecutor {
     }
 
     /// Installs a callback invoked after a reservation is returned.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Executor whose reservation releases are observed.
+    /// - `callback`: Notification invoked after capacity is released.
     pub(crate) fn set_capacity_callback(&self, callback: Arc<dyn Fn() + Send + Sync + 'static>) {
         *lock(&self.inner.capacity_callback) = Some(callback);
     }

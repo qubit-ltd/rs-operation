@@ -52,14 +52,8 @@ fn test_independent_new_managers_do_not_share_capacity_state() {
     let mut b = second
         .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(2))
         .unwrap();
-    assert!(matches!(
-        a.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(1)
-    ));
-    assert!(matches!(
-        b.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(2)
-    ));
+    assert!(matches!(a.wait_outcome().unwrap(), OperationOutcome::Succeeded(1)));
+    assert!(matches!(b.wait_outcome().unwrap(), OperationOutcome::Succeeded(2)));
     a.wait_settlement().unwrap();
     b.wait_settlement().unwrap();
     let first_report = first.request_shutdown(ShutdownMode::Drain).wait().unwrap();
@@ -90,22 +84,16 @@ fn test_async_executor_full_waits_for_executor_capacity() {
         .unwrap();
     started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-    let mut waiting =
-        Box::pin(async_manager.submit(OperationOptions::default(), |_| async { Ok::<_, ()>(()) }));
+    let mut waiting = Box::pin(async_manager.submit(OperationOptions::default(), |_| async { Ok::<_, ()>(()) }));
     let mut context = Context::from_waker(std::task::Waker::noop());
-    assert!(matches!(
-        waiting.as_mut().poll(&mut context),
-        std::task::Poll::Pending
-    ));
+    assert!(matches!(waiting.as_mut().poll(&mut context), std::task::Poll::Pending));
 
     release_tx.send(()).unwrap();
+    let submitted = block_on(waiting);
+    assert!(submitted.is_ok());
     assert!(matches!(
         block_on(held.wait_outcome()).unwrap(),
         OperationOutcome::Succeeded(())
-    ));
-    assert!(matches!(
-        waiting.as_mut().poll(&mut context),
-        std::task::Poll::Ready(Ok(_))
     ));
 }
 
@@ -162,9 +150,7 @@ fn test_a_parent_child_slot_stays_reserved_until_the_child_really_finishes() {
         rejection_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
         AdmissionError::Busy
     );
-    let mut child = child_handle_rx
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap();
+    let mut child = child_handle_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let child_observer = child.observer();
     let before_release = child_observer.snapshot();
     assert!(
@@ -172,10 +158,7 @@ fn test_a_parent_child_slot_stays_reserved_until_the_child_really_finishes() {
         "a Busy rejection must not stop the accepted child: {before_release:?}"
     );
     release_tx.send(()).unwrap();
-    assert!(matches!(
-        child.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(())
-    ));
+    assert!(matches!(child.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
     child.wait_settlement().unwrap();
     continue_tx.send(()).unwrap();
     assert!(followup_rx.recv_timeout(Duration::from_secs(5)).unwrap());
@@ -190,9 +173,6 @@ fn test_a_parent_child_slot_stays_reserved_until_the_child_really_finishes() {
         "the accepted child was stopped unexpectedly: {after_release:?}"
     );
     assert!(parent.wait_settlement().unwrap().all_released());
-    let shutdown_report = manager
-        .request_shutdown(ShutdownMode::Drain)
-        .wait()
-        .unwrap();
+    let shutdown_report = manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
     assert_eq!(shutdown_report.snapshot.active_operations, 0);
 }

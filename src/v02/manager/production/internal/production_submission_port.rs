@@ -90,14 +90,11 @@ impl ProductionSubmissionPort {
     ///
     /// Returns an error if options are invalid or any executor or worker fails
     /// to start.
-    pub(in crate::v02::manager::production) fn new(
-        options: &ManagerOptions,
-    ) -> Result<Self, ManagerCreateError> {
+    pub(in crate::v02::manager::production) fn new(options: &ManagerOptions) -> Result<Self, ManagerCreateError> {
         let capacities = ManagerCapacityPools::new(options.limits);
-        let cleanup_pump =
-            CleanupPump::new().map_err(|source| ManagerCreateError::ThreadSpawn {
-                source: Arc::new(source),
-            })?;
+        let cleanup_pump = CleanupPump::new().map_err(|source| ManagerCreateError::ThreadSpawn {
+            source: Arc::new(source),
+        })?;
         let sync = match ThreadPoolExecutor::new(options.sync_executor) {
             Ok(executor) => Arc::new(executor),
             Err(error) => {
@@ -113,17 +110,16 @@ impl ProductionSubmissionPort {
                 return Err(map_executor_create_error(error));
             }
         };
-        let async_workers = match asynchronous
-            .start_workers(options.async_executor.worker_count, "qubit-operation-async")
-        {
-            Ok(workers) => workers,
-            Err(error) => {
-                asynchronous.close_admission();
-                let _ = sync.shutdown().wait();
-                cleanup_pump.shutdown();
-                return Err(map_executor_create_error(error));
-            }
-        };
+        let async_workers =
+            match asynchronous.start_workers(options.async_executor.worker_count, "qubit-operation-async") {
+                Ok(workers) => workers,
+                Err(error) => {
+                    asynchronous.close_admission();
+                    let _ = sync.shutdown().wait();
+                    cleanup_pump.shutdown();
+                    return Err(map_executor_create_error(error));
+                }
+            };
         let cleanup = match CleanupExecutor::new(options.cleanup_executor, options.async_executor) {
             Ok(executor) => Arc::new(executor),
             Err(error) => {
@@ -142,22 +138,20 @@ impl ProductionSubmissionPort {
                 pump.kick();
             }
         }));
-        let cleanup_workers = match cleanup.start_async_workers(
-            options.async_executor.worker_count,
-            "qubit-operation-cleanup-async",
-        ) {
-            Ok(workers) => workers,
-            Err(error) => {
-                let _ = cleanup.shutdown().wait();
-                asynchronous.close_admission();
-                for worker in async_workers {
-                    let _ = worker.join();
+        let cleanup_workers =
+            match cleanup.start_async_workers(options.async_executor.worker_count, "qubit-operation-cleanup-async") {
+                Ok(workers) => workers,
+                Err(error) => {
+                    let _ = cleanup.shutdown().wait();
+                    asynchronous.close_admission();
+                    for worker in async_workers {
+                        let _ = worker.join();
+                    }
+                    let _ = sync.shutdown().wait();
+                    cleanup_pump.shutdown();
+                    return Err(map_executor_create_error(error));
                 }
-                let _ = sync.shutdown().wait();
-                cleanup_pump.shutdown();
-                return Err(map_executor_create_error(error));
-            }
-        };
+            };
         let executor_capacity_changed = Arc::new(crate::v02::internal::notify::Notify::new());
         let sync_changed = Arc::clone(&executor_capacity_changed);
         sync.set_capacity_callback(Arc::new(move || sync_changed.notify_waiters()));
@@ -196,30 +190,27 @@ impl ProductionSubmissionPort {
     ///
     /// Returns an admission error if the selected executor cannot reserve a
     /// job slot.
-    fn execution_permit(
-        &self,
-        kind: ExecutionKind,
-        queue: CapacityPermit,
-    ) -> Result<ProductionPermit, AdmissionError> {
+    fn execution_permit(&self, kind: ExecutionKind, queue: CapacityPermit) -> Result<ProductionPermit, AdmissionError> {
         match kind {
             ExecutionKind::Sync => self
                 .sync
                 .reserve()
-                .map(|permit| {
-                    ProductionPermit::Sync(permit, Arc::clone(&self.queued_operations), queue)
-                })
+                .map(|permit| ProductionPermit::Sync(permit, Arc::clone(&self.queued_operations), queue))
                 .map_err(map_executor_admission),
             ExecutionKind::Async => self
                 .asynchronous
                 .reserve()
-                .map(|permit| {
-                    ProductionPermit::Async(permit, Arc::clone(&self.queued_operations), queue)
-                })
+                .map(|permit| ProductionPermit::Async(permit, Arc::clone(&self.queued_operations), queue))
                 .map_err(map_executor_admission),
         }
     }
 
     /// Reports whether the executor selected for a submission has a free slot.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Port that owns both operation executors.
+    /// - `kind`: Executor selected for the pending submission.
     fn executor_has_capacity(&self, kind: ExecutionKind) -> bool {
         match kind {
             ExecutionKind::Sync => self.sync.has_capacity(),
@@ -390,9 +381,7 @@ impl SubmissionPort for ProductionSubmissionPort {
                 loop {
                     let generation = self.executor_capacity_changed.generation();
                     if !self.executor_has_capacity(execution) {
-                        self.executor_capacity_changed
-                            .notified_since(generation)
-                            .await;
+                        self.executor_capacity_changed.notified_since(generation).await;
                         continue;
                     }
                     return request.await.map(|_| ()).map_err(|_| AdmissionError::Busy);
@@ -465,10 +454,7 @@ impl SubmissionPort for ProductionSubmissionPort {
     ///
     /// Returns a resource-scope error if capacity is zero or its cleanup
     /// dispatcher cannot be created.
-    fn service_resource_scope(
-        &self,
-        capacity: usize,
-    ) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
+    fn service_resource_scope(&self, capacity: usize) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
         if capacity == 0 {
             return Err(crate::v02::report::ResourceScopeError::InvalidOptions);
         }
@@ -479,25 +465,12 @@ impl SubmissionPort for ProductionSubmissionPort {
             resource_scopes: 1,
             effect_records: 1,
         };
-        let resource_capacity = Arc::new(ScopeCapacity::root_with_identity(
-            &self.capacities,
-            id.raw(),
-            limits,
-        ));
+        let resource_capacity = Arc::new(ScopeCapacity::root_with_identity(&self.capacities, id.raw(), limits));
         let dispatcher = Arc::new(
-            CleanupDispatcher::new_with_pump(
-                capacity,
-                Arc::clone(&self.cleanup),
-                Arc::clone(&self.cleanup_pump),
-            )
-            .map_err(|_| crate::v02::report::ResourceScopeError::CapacityExceeded)?,
+            CleanupDispatcher::new_with_pump(capacity, Arc::clone(&self.cleanup), Arc::clone(&self.cleanup_pump))
+                .map_err(|_| crate::v02::report::ResourceScopeError::CapacityExceeded)?,
         );
-        Ok(ResourceScope::new(
-            self.manager_id,
-            id,
-            resource_capacity,
-            dispatcher,
-        ))
+        Ok(ResourceScope::new(self.manager_id, id, resource_capacity, dispatcher))
     }
 
     /// Creates an operation resource scope using its inherited resource
@@ -530,11 +503,6 @@ impl SubmissionPort for ProductionSubmissionPort {
             )
             .map_err(|_| crate::v02::report::ResourceScopeError::CapacityExceeded)?,
         );
-        Ok(ResourceScope::new(
-            self.manager_id,
-            id,
-            capacity,
-            dispatcher,
-        ))
+        Ok(ResourceScope::new(self.manager_id, id, capacity, dispatcher))
     }
 }

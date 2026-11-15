@@ -50,24 +50,14 @@ impl ManagerCapacityPools {
     pub(crate) fn new(limits: ManagerLimits) -> Self {
         let coordinator = AdmissionCoordinator::new(limits.admission_waiters);
         let pool = |capacity, label| {
-            CapacityPool::with_coordinator(
-                ResourceLabel::Manager(label),
-                capacity,
-                Arc::clone(&coordinator),
-            )
+            CapacityPool::with_coordinator(ResourceLabel::Manager(label), capacity, Arc::clone(&coordinator))
         };
         Self {
             active_roots: pool(limits.active_operations, ManagerCapacity::ActiveRoots),
             queued_roots: pool(limits.queued_operations, ManagerCapacity::QueuedRoots),
             admission_waiters: pool(limits.admission_waiters, ManagerCapacity::AdmissionWaiters),
-            unconsumed_outcomes: pool(
-                limits.unconsumed_outcomes,
-                ManagerCapacity::UnconsumedOutcomes,
-            ),
-            cleanup_concurrency: pool(
-                limits.cleanup_concurrency,
-                ManagerCapacity::CleanupConcurrency,
-            ),
+            unconsumed_outcomes: pool(limits.unconsumed_outcomes, ManagerCapacity::UnconsumedOutcomes),
+            cleanup_concurrency: pool(limits.cleanup_concurrency, ManagerCapacity::CleanupConcurrency),
             diagnostic_events: pool(limits.diagnostic_events, ManagerCapacity::DiagnosticEvents),
             coordinator,
         }
@@ -89,20 +79,11 @@ impl ManagerCapacityPools {
     /// # Errors
     ///
     /// Returns an error if either required pool has no available capacity.
-    pub(crate) fn root_lifecycle_permits(
-        &self,
-    ) -> Result<(CapacityPermit, CapacityPermit), CapacityError> {
-        let mut permits = PermitBundle::try_acquire(&[
-            self.active_roots.clone(),
-            self.unconsumed_outcomes.clone(),
-        ])?;
+    pub(crate) fn root_lifecycle_permits(&self) -> Result<(CapacityPermit, CapacityPermit), CapacityError> {
+        let mut permits = PermitBundle::try_acquire(&[self.active_roots.clone(), self.unconsumed_outcomes.clone()])?;
         Ok((
-            permits
-                .take(&self.active_roots)
-                .expect("active root permit"),
-            permits
-                .take(&self.unconsumed_outcomes)
-                .expect("outcome permit"),
+            permits.take(&self.active_roots).expect("active root permit"),
+            permits.take(&self.unconsumed_outcomes).expect("outcome permit"),
         ))
     }
 
@@ -122,9 +103,7 @@ impl ManagerCapacityPools {
     ///
     /// Returns an error if the active-root pool has no available capacity.
     #[cfg(test)]
-    pub(in crate::v02::manager::capacity) fn active_root_permit(
-        &self,
-    ) -> Result<CapacityPermit, CapacityError> {
+    pub(in crate::v02::manager::capacity) fn active_root_permit(&self) -> Result<CapacityPermit, CapacityError> {
         self.active_roots.try_acquire()
     }
 
@@ -157,10 +136,7 @@ impl ManagerCapacityPools {
     ///
     /// Returns an error if a requested pool or the admission-waiter pool has no
     /// available capacity.
-    pub(crate) fn admission_request(
-        &self,
-        pools: Vec<CapacityPool>,
-    ) -> Result<AdmissionRequest, CapacityError> {
+    pub(crate) fn admission_request(&self, pools: Vec<CapacityPool>) -> Result<AdmissionRequest, CapacityError> {
         AdmissionRequest::new(pools, Some(self.admission_waiters.clone()))
     }
 
@@ -174,10 +150,7 @@ impl ManagerCapacityPools {
     ///
     /// Returns an error if a required pool or the admission-waiter pool has no
     /// available capacity.
-    pub(crate) fn child_admission_request(
-        &self,
-        scope: &ScopeCapacity,
-    ) -> Result<AdmissionRequest, CapacityError> {
+    pub(crate) fn child_admission_request(&self, scope: &ScopeCapacity) -> Result<AdmissionRequest, CapacityError> {
         let mut pools = scope.child_operation_pools.clone();
         pools.push(self.queued_roots.clone());
         pools.push(self.unconsumed_outcomes.clone());
@@ -205,9 +178,7 @@ impl ManagerCapacityPools {
             ]
             .concat(),
         )?;
-        let outcome = permits
-            .take(&self.unconsumed_outcomes)
-            .expect("outcome permit");
+        let outcome = permits.take(&self.unconsumed_outcomes).expect("outcome permit");
         Ok((permits, outcome))
     }
 

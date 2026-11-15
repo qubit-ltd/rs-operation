@@ -227,9 +227,7 @@ impl PortableExecutor {
 
     /// Polls at most the configured number of tasks for one scheduling turn.
     pub(crate) fn poll_turn(&self) -> usize {
-        (0..self.inner.polls_per_turn)
-            .take_while(|_| self.poll_once())
-            .count()
+        (0..self.inner.polls_per_turn).take_while(|_| self.poll_once()).count()
     }
 
     /// Rejects future reservations and wakes workers to observe shutdown.
