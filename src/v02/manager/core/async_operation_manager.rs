@@ -7,6 +7,8 @@
 // =============================================================================
 
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -151,6 +153,9 @@ impl AsyncOperationManager {
     /// bounded by the manager's admission-waiter limit and does not guarantee
     /// FIFO ordering. Root submissions are rejected after manager Drain begins,
     /// while descendants of accepted scopes may continue.
+    /// Panics while constructing or polling the returned future are reported
+    /// as [`OperationOutcome::Panicked`] and still complete operation
+    /// settlement.
     ///
     /// # Type Parameters
     ///
@@ -261,17 +266,22 @@ impl AsyncOperationManager {
                 operation.set_execution(ExecutionPhase::Running);
                 let manager_core = scope_core.manager().upgrade().expect("active scope manager exists");
                 let group = scope_core.group().cloned();
-                let user_future = {
+                let construction = {
                     let _context = ExecutionContextGuard::enter(&manager_core, operation_id, group.as_ref());
-                    body(scope)
+                    catch_unwind(AssertUnwindSafe(|| body(scope)))
                 };
-                let result = ExecutionContextFuture::new(
-                    CatchUnwindFuture(Box::pin(user_future)),
-                    manager_core,
-                    operation_id,
-                    group,
-                )
-                .await;
+                let result = match construction {
+                    Ok(user_future) => {
+                        ExecutionContextFuture::new(
+                            CatchUnwindFuture(Box::pin(user_future)),
+                            manager_core,
+                            operation_id,
+                            group,
+                        )
+                        .await
+                    }
+                    Err(payload) => Err(payload),
+                };
                 operation.set_execution(ExecutionPhase::Finished);
                 lease.execution_finished();
                 control.confirm_input_release(ChildRelease {

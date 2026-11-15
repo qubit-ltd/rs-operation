@@ -75,6 +75,68 @@ fn test_real_sync_and_async_managers_run_typed_operations_and_shutdown() {
 }
 
 #[test]
+fn test_async_body_construction_panic_is_reported_and_releases_capacity() {
+    let manager = AsyncOperationManager::new(ManagerOptions::default()).unwrap();
+    let mut operation = manager
+        .try_submit(OperationOptions::default(), |_| -> std::future::Ready<Result<(), ()>> {
+            panic!("future construction failed")
+        })
+        .unwrap()
+        .into_sync();
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        sender
+            .send((operation.wait_outcome(), operation.wait_settlement()))
+            .unwrap();
+    });
+    let (outcome, settlement) = receiver
+        .recv_timeout(Duration::from_secs(3))
+        .expect("accepted operation should finish after a construction panic");
+    assert!(matches!(outcome.unwrap(), OperationOutcome::Panicked(_)));
+    assert!(settlement.unwrap().all_released());
+
+    let mut next = manager
+        .try_submit(OperationOptions::default(), |_| async { Ok::<_, ()>(()) })
+        .unwrap()
+        .into_sync();
+    assert!(matches!(next.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
+    assert!(next.wait_settlement().unwrap().all_released());
+}
+
+#[test]
+fn test_async_body_poll_panic_is_reported_and_releases_capacity() {
+    let manager = AsyncOperationManager::new(ManagerOptions::default()).unwrap();
+    let mut operation = manager
+        .try_submit(OperationOptions::default(), |_| async {
+            panic!("poll failed");
+            #[allow(unreachable_code)]
+            Ok::<(), ()>(())
+        })
+        .unwrap()
+        .into_sync();
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        sender
+            .send((operation.wait_outcome(), operation.wait_settlement()))
+            .unwrap();
+    });
+    let (outcome, settlement) = receiver
+        .recv_timeout(Duration::from_secs(3))
+        .expect("accepted operation should finish after a poll panic");
+    assert!(matches!(outcome.unwrap(), OperationOutcome::Panicked(_)));
+    assert!(settlement.unwrap().all_released());
+
+    let mut next = manager
+        .try_submit(OperationOptions::default(), |_| async { Ok::<_, ()>(()) })
+        .unwrap()
+        .into_sync();
+    assert!(matches!(next.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
+    assert!(next.wait_settlement().unwrap().all_released());
+}
+
+#[test]
 fn test_operation_scope_resource_scope_uses_requested_local_capacity() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let completion = manager
