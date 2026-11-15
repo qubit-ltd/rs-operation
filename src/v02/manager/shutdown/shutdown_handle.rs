@@ -12,13 +12,14 @@ use std::time::Duration;
 use super::AsyncShutdownHandle;
 use super::internal::ShutdownTarget;
 use crate::v02::manager::core::ManagerCore;
-use crate::v02::manager::core::ManagerPhase;
 use crate::v02::manager::group::GroupCore;
 use crate::v02::report::ObservationError;
 use crate::v02::report::ShutdownMode;
 use crate::v02::report::ShutdownReport;
 use crate::v02::report::ShutdownSnapshot;
 use crate::v02::report::ShutdownWait;
+use crate::v02::scope::is_waiting_on_group;
+use crate::v02::scope::is_waiting_on_manager;
 
 /// A durable observer for the manager-wide shutdown already in progress.
 ///
@@ -85,10 +86,7 @@ impl ShutdownHandle {
     #[inline]
     pub fn mode(&self) -> ShutdownMode {
         match &self.target {
-            ShutdownTarget::Manager(core) => match core.phase() {
-                ManagerPhase::Cancelling | ManagerPhase::Closed => ShutdownMode::Cancel,
-                ManagerPhase::Open | ManagerPhase::Draining => ShutdownMode::Drain,
-            },
+            ShutdownTarget::Manager(core) => core.shutdown_mode(),
             ShutdownTarget::Group(_, group) => group.mode(),
         }
     }
@@ -117,14 +115,22 @@ impl ShutdownHandle {
 
     /// Waits until the observed manager or group has fully shut down.
     ///
+    /// Call this from outside an operation managed by the observed target.
+    /// Waiting from one of that target's own operations returns
+    /// [`ObservationError::WouldDeadlock`].
+    ///
     /// # Returns
     ///
     /// A report containing the final shutdown snapshot.
     ///
     /// # Errors
     ///
-    /// Returns an observation error if the shutdown target cannot be observed.
+    /// Returns [`ObservationError::WouldDeadlock`] when the current operation
+    /// belongs to the target being observed.
     pub fn wait(&self) -> Result<ShutdownReport, ObservationError> {
+        if self.would_deadlock() {
+            return Err(ObservationError::WouldDeadlock);
+        }
         match &self.target {
             ShutdownTarget::Manager(core) => core.shutdown_wait_blocking(),
             ShutdownTarget::Group(_, group) => group.wait_blocking(),
@@ -135,6 +141,11 @@ impl ShutdownHandle {
     }
 
     /// Waits for shutdown completion for up to `timeout`.
+    ///
+    /// A zero duration performs a snapshot check and never blocks, including
+    /// when called from an operation belonging to the target.
+    /// If the platform cannot represent the timeout as an `Instant` deadline,
+    /// the method waits until shutdown completes.
     ///
     /// # Parameters
     ///
@@ -147,8 +158,12 @@ impl ShutdownHandle {
     ///
     /// # Errors
     ///
-    /// Returns an observation error if the shutdown target cannot be observed.
+    /// Returns [`ObservationError::WouldDeadlock`] if a positive wait would
+    /// wait for the current operation to finish.
     pub fn wait_for(&self, timeout: Duration) -> Result<ShutdownWait, ObservationError> {
+        if !timeout.is_zero() && self.would_deadlock() {
+            return Err(ObservationError::WouldDeadlock);
+        }
         let completed = match &self.target {
             ShutdownTarget::Manager(core) => core.shutdown_wait_for(timeout),
             ShutdownTarget::Group(_, group) => group.wait_for(timeout),
@@ -188,6 +203,14 @@ impl ShutdownHandle {
         match &self.target {
             ShutdownTarget::Manager(core) => core.is_shutdown_empty(),
             ShutdownTarget::Group(_, group) => group.is_empty(),
+        }
+    }
+
+    /// Reports whether the currently executing body is part of this target.
+    pub(super) fn would_deadlock(&self) -> bool {
+        match &self.target {
+            ShutdownTarget::Manager(core) => is_waiting_on_manager(core),
+            ShutdownTarget::Group(core, group) => is_waiting_on_group(core, group),
         }
     }
 }

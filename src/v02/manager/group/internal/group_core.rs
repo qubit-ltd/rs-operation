@@ -288,20 +288,29 @@ impl GroupCore {
     /// `true` if the group becomes empty before the timeout expires.
     #[must_use]
     pub(crate) fn wait_for(&self, timeout: std::time::Duration) -> bool {
-        let until = std::time::Instant::now() + timeout;
+        let until = std::time::Instant::now().checked_add(timeout);
         let mut state = lock(&self.state);
         while state.active != 0 || !state.services.is_empty() || !state.recoveries.is_empty() {
-            let now = std::time::Instant::now();
-            if now >= until {
-                return false;
-            }
-            let (next, result) = self
-                .changed
-                .wait_timeout(state, until.saturating_duration_since(now))
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next;
-            if result.timed_out() && (state.active != 0 || !state.services.is_empty() || !state.recoveries.is_empty()) {
-                return false;
+            if let Some(until) = until {
+                let now = std::time::Instant::now();
+                if now >= until {
+                    return false;
+                }
+                let (next, result) = self
+                    .changed
+                    .wait_timeout(state, until.saturating_duration_since(now))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next;
+                if result.timed_out()
+                    && (state.active != 0 || !state.services.is_empty() || !state.recoveries.is_empty())
+                {
+                    return false;
+                }
+            } else {
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         }
         true

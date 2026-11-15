@@ -336,6 +336,6 @@ mod tests {
 
         let shutdown = group.request_shutdown(ShutdownMode::Drain);
         let mut wait = Box::pin(shutdown.wait());
-        assert_eq!(block_on(wait.as_mut()).snapshot.active_operations, 0);
+        assert_eq!(block_on(wait.as_mut()).unwrap().snapshot.active_operations, 0);
     }
 }

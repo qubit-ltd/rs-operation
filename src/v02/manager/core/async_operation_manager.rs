@@ -38,6 +38,8 @@ use super::child_outcome_summary;
 use super::lock;
 use super::panic_message;
 use super::resolve_wait_parent;
+use crate::v02::scope::ExecutionContextFuture;
+use crate::v02::scope::ExecutionContextGuard;
 
 /// An async view over the shared coordinator and one fixed target.
 ///
@@ -253,7 +255,19 @@ impl AsyncOperationManager {
             async move {
                 let frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
                 operation.set_execution(ExecutionPhase::Running);
-                let result = CatchUnwindFuture(Box::pin(body(scope))).await;
+                let manager_core = scope_core.manager().upgrade().expect("active scope manager exists");
+                let group = scope_core.group().cloned();
+                let user_future = {
+                    let _context = ExecutionContextGuard::enter(&manager_core, operation_id, group.as_ref());
+                    body(scope)
+                };
+                let result = ExecutionContextFuture::new(
+                    CatchUnwindFuture(Box::pin(user_future)),
+                    manager_core,
+                    operation_id,
+                    group,
+                )
+                .await;
                 operation.set_execution(ExecutionPhase::Finished);
                 lease.execution_finished();
                 control.confirm_input_release(ChildRelease {

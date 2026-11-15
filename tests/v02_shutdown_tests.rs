@@ -19,7 +19,9 @@ use qubit_operation::CleanupFuture;
 use qubit_operation::CleanupOutcome;
 use qubit_operation::CleanupStage;
 use qubit_operation::DiagnosticSummary;
+use qubit_operation::GroupOptions;
 use qubit_operation::ManagerOptions;
+use qubit_operation::ObservationError;
 use qubit_operation::OperationManager;
 use qubit_operation::OperationOptions;
 use qubit_operation::OperationOutcome;
@@ -38,6 +40,145 @@ fn test_drain_closes_roots_and_completes_when_idle() {
     assert!(matches!(result, Err(error) if error.reason() == AdmissionError::Closed));
     let report = shutdown.wait().unwrap();
     assert_eq!(report.snapshot.active_operations, 0);
+    assert_eq!(shutdown.mode(), ShutdownMode::Drain);
+    let _ = manager.request_shutdown(ShutdownMode::Cancel);
+    assert_eq!(shutdown.mode(), ShutdownMode::Drain);
+}
+
+#[test]
+fn test_shutdown_wait_for_max_on_empty_manager_completes() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let shutdown = manager.request_shutdown(ShutdownMode::Drain);
+    assert!(matches!(
+        shutdown.wait_for(Duration::MAX).unwrap(),
+        ShutdownWait::Completed(_)
+    ));
+}
+
+#[test]
+fn test_shutdown_wait_for_max_waits_for_active_manager() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut operation = manager
+        .try_submit(OperationOptions::default(), move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let shutdown = manager.request_shutdown(ShutdownMode::Drain);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        release_tx.send(()).unwrap();
+    });
+    assert!(matches!(
+        shutdown.wait_for(Duration::MAX).unwrap(),
+        ShutdownWait::Completed(_)
+    ));
+    release.join().unwrap();
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+}
+
+#[test]
+fn test_sync_manager_self_wait_returns_would_deadlock() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let inside = manager.clone();
+    let (result_tx, result_rx) = mpsc::channel();
+    let mut operation = manager
+        .try_submit(OperationOptions::default(), move |_| {
+            let shutdown = inside.request_shutdown(ShutdownMode::Drain);
+            assert!(matches!(
+                shutdown.wait_for(Duration::ZERO).unwrap(),
+                ShutdownWait::Pending(_)
+            ));
+            result_tx.send(shutdown.wait()).unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Err(ObservationError::WouldDeadlock)
+    ));
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+}
+
+#[test]
+fn test_sync_group_self_wait_returns_would_deadlock() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
+    let inside = group.clone();
+    let (result_tx, result_rx) = mpsc::channel();
+    let mut operation = group
+        .try_submit(OperationOptions::default(), move |_| {
+            let shutdown = inside.request_shutdown(ShutdownMode::Drain);
+            result_tx.send(shutdown.wait()).unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Err(ObservationError::WouldDeadlock)
+    ));
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+}
+
+#[test]
+fn test_async_manager_self_wait_returns_would_deadlock() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let inside = manager.as_async();
+    let (result_tx, result_rx) = mpsc::channel();
+    let mut operation = manager
+        .as_async()
+        .try_submit(OperationOptions::default(), move |_| async move {
+            let shutdown = inside.request_shutdown(ShutdownMode::Drain);
+            result_tx.send(shutdown.wait().await).unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap()
+        .into_sync();
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Err(ObservationError::WouldDeadlock)
+    ));
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+}
+
+#[test]
+fn test_async_group_self_wait_returns_would_deadlock() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(GroupOptions { capacity: 1 }).unwrap().as_async();
+    let inside = group.clone();
+    let (result_tx, result_rx) = mpsc::channel();
+    let mut operation = group
+        .try_submit(OperationOptions::default(), move |_| async move {
+            let shutdown = inside.request_shutdown(ShutdownMode::Drain);
+            result_tx.send(shutdown.wait().await).unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap()
+        .into_sync();
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        Err(ObservationError::WouldDeadlock)
+    ));
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
 }
 
 #[test]
@@ -175,6 +316,9 @@ fn test_shutdown_can_upgrade_not_reopen() {
         cancel.wait_for(Duration::from_secs(2)).unwrap(),
         ShutdownWait::Completed(_)
     ));
+    assert_eq!(cancel.mode(), ShutdownMode::Cancel);
+    let _ = manager.request_shutdown(ShutdownMode::Drain);
+    assert_eq!(cancel.mode(), ShutdownMode::Cancel);
 }
 
 #[test]

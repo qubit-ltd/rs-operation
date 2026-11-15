@@ -64,6 +64,34 @@ fn test_sync_group_run_and_settle_uses_group_target() {
 }
 
 #[test]
+fn test_group_wait_for_max_waits_for_active_operation() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut operation = group
+        .try_submit(OperationOptions::default(), move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    started_rx.recv().unwrap();
+    let shutdown = group.request_shutdown(ShutdownMode::Drain);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        release_tx.send(()).unwrap();
+    });
+    let outcome = std::thread::spawn(move || operation.wait_outcome().unwrap());
+    assert!(matches!(
+        shutdown.wait_for(std::time::Duration::MAX).unwrap(),
+        ShutdownWait::Completed(_)
+    ));
+    release.join().unwrap();
+    assert!(matches!(outcome.join().unwrap(), OperationOutcome::Succeeded(())));
+}
+
+#[test]
 fn test_local_drain_rejects_group_roots_but_accepts_bound_descendants() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let group = manager.group(GroupOptions { capacity: 2 }).unwrap();

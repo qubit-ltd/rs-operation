@@ -175,7 +175,7 @@ impl ScopeCore {
     /// The weak reference used to access the owning manager while it is alive.
     #[must_use = "use the manager link to access the owning manager while it is alive"]
     #[inline]
-    pub(in crate::v02::scope) fn manager(&self) -> &Weak<ManagerCore> {
+    pub(crate) fn manager(&self) -> &Weak<ManagerCore> {
         &self.manager
     }
 

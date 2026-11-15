@@ -70,24 +70,38 @@ impl AsyncShutdownHandle {
 
     /// Asynchronously waits until shutdown completes.
     ///
+    /// Call this from outside an operation managed by the observed target.
+    /// An operation cannot wait for its own completion; doing so returns
+    /// [`ObservationError::WouldDeadlock`].
+    ///
     /// # Returns
     ///
     /// A report containing the final shutdown snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObservationError::WouldDeadlock`] when the current operation
+    /// belongs to the target whose shutdown is being observed.
     #[must_use = "await and inspect the shutdown report"]
-    pub async fn wait(&self) -> ShutdownReport {
+    pub async fn wait(&self) -> Result<ShutdownReport, ObservationError> {
+        if self.handle.would_deadlock() {
+            return Err(ObservationError::WouldDeadlock);
+        }
         match &self.handle.target {
             ShutdownTarget::Manager(core) => core.shutdown_wait().await,
             ShutdownTarget::Group(_, group) => group.wait().await,
         }
-        ShutdownReport {
+        Ok(ShutdownReport {
             snapshot: self.snapshot(),
-        }
+        })
     }
 
     /// Waits asynchronously until the target shuts down or `deadline` is
     /// reached.
     ///
     /// The deadline must use the same clock domain as the manager's clock.
+    /// An expired deadline returns `Pending` immediately, including when the
+    /// current operation belongs to the target.
     ///
     /// # Parameters
     ///
@@ -100,8 +114,10 @@ impl AsyncShutdownHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error if the clock is unavailable or the deadline uses
-    /// another clock domain.
+    /// Returns [`ObservationError::ClockUnavailable`] if no clock is
+    /// configured, [`ObservationError::ClockDomainMismatch`] if the deadline
+    /// uses another clock domain, or [`ObservationError::WouldDeadlock`] if
+    /// waiting would depend on the current operation.
     pub async fn wait_until(&self, deadline: Deadline) -> Result<ShutdownWait, ObservationError> {
         let core = self.handle.manager();
         let clock = core.clock().ok_or(ObservationError::ClockUnavailable)?;
@@ -116,19 +132,27 @@ impl AsyncShutdownHandle {
                 snapshot: self.snapshot(),
             }));
         }
+        if clock.now().ticks() >= deadline.time_point().ticks() {
+            return Ok(ShutdownWait::Pending(self.snapshot()));
+        }
+        if self.handle.would_deadlock() {
+            return Err(ObservationError::WouldDeadlock);
+        }
         let mut completion = Box::pin(self.wait());
         let mut timer = Box::pin(ShutdownDeadline::new(clock, deadline));
         let completed = std::future::poll_fn(|cx| {
-            if completion.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(true);
+            match completion.as_mut().poll(cx) {
+                Poll::Ready(Ok(_)) => return Poll::Ready(Ok(true)),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
             }
             if timer.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(false);
+                return Poll::Ready(Ok(false));
             }
             Poll::Pending
         })
         .await;
-        if completed {
+        if completed? {
             Ok(ShutdownWait::Completed(ShutdownReport {
                 snapshot: self.snapshot(),
             }))
@@ -275,6 +299,66 @@ mod tests {
         assert!(matches!(
             shutdown.as_sync().wait_for(std::time::Duration::from_secs(2)).unwrap(),
             ShutdownWait::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn test_wait_until_rejects_self_wait_but_expired_deadline_is_pending() {
+        let domain = ClockDomainId::new_unique();
+        let manager = manager_with_clock(Arc::new(FixedClock {
+            now: Mutex::new(MonotonicTime::new(domain, 1)),
+            advance_on_register: false,
+        }));
+        let inside = manager.as_async();
+        let (result_tx, result_rx) = mpsc::channel();
+        let mut operation = manager
+            .as_async()
+            .try_submit(OperationOptions::default(), move |_| async move {
+                let shutdown = inside.request_shutdown(crate::v02::report::ShutdownMode::Drain);
+                result_tx
+                    .send(block_on(
+                        shutdown.wait_until(Deadline::at(MonotonicTime::new(domain, 5))),
+                    ))
+                    .unwrap();
+                Ok::<_, ()>(())
+            })
+            .unwrap()
+            .into_sync();
+        assert!(matches!(
+            result_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            Err(ObservationError::WouldDeadlock)
+        ));
+        assert!(matches!(
+            operation.wait_outcome().unwrap(),
+            OperationOutcome::Succeeded(())
+        ));
+
+        let manager = manager_with_clock(Arc::new(FixedClock {
+            now: Mutex::new(MonotonicTime::new(domain, 5)),
+            advance_on_register: false,
+        }));
+        let inside = manager.as_async();
+        let (result_tx, result_rx) = mpsc::channel();
+        let mut operation = manager
+            .as_async()
+            .try_submit(OperationOptions::default(), move |_| async move {
+                let shutdown = inside.request_shutdown(crate::v02::report::ShutdownMode::Drain);
+                result_tx
+                    .send(block_on(
+                        shutdown.wait_until(Deadline::at(MonotonicTime::new(domain, 5))),
+                    ))
+                    .unwrap();
+                Ok::<_, ()>(())
+            })
+            .unwrap()
+            .into_sync();
+        assert!(matches!(
+            result_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            Ok(ShutdownWait::Pending(_))
+        ));
+        assert!(matches!(
+            operation.wait_outcome().unwrap(),
+            OperationOutcome::Succeeded(())
         ));
     }
 }

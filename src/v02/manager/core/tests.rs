@@ -1155,7 +1155,8 @@ fn test_async_shutdown_wait_completes_after_admission_is_closed() {
     let shutdown = root.as_async().request_shutdown(ShutdownMode::Drain);
     let mut wait = Box::pin(shutdown.wait());
     match poll_once(wait.as_mut()) {
-        std::task::Poll::Ready(report) => assert_eq!(report.snapshot.active_operations, 0),
+        std::task::Poll::Ready(Ok(report)) => assert_eq!(report.snapshot.active_operations, 0),
+        std::task::Poll::Ready(Err(error)) => panic!("idle shutdown observation failed: {error}"),
         std::task::Poll::Pending => panic!("an idle manager shutdown should complete immediately"),
     }
 }

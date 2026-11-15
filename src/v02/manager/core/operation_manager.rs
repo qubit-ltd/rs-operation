@@ -40,6 +40,7 @@ use super::child_outcome_summary;
 use super::lock;
 use super::panic_message;
 use super::resolve_wait_parent;
+use crate::v02::scope::ExecutionContextGuard;
 
 /// A synchronous submission view over a shared manager coordinator.
 ///
@@ -357,7 +358,12 @@ impl OperationManager {
             let operation_id = scope.id();
             let frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
             operation.set_execution(ExecutionPhase::Running);
-            let result = panic::catch_unwind(AssertUnwindSafe(|| body(scope)));
+            let manager_core = scope_core.manager().upgrade().expect("active scope manager exists");
+            let group = scope_core.group().cloned();
+            let result = {
+                let _context = ExecutionContextGuard::enter(&manager_core, operation_id, group.as_ref());
+                panic::catch_unwind(AssertUnwindSafe(|| body(scope)))
+            };
             operation.set_execution(ExecutionPhase::Finished);
             lease.execution_finished();
             control.confirm_input_release(ChildRelease {

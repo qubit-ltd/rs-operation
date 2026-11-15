@@ -47,6 +47,10 @@ use crate::v02::report::StopReport;
 use crate::v02::report::SubmitError;
 use crate::v02::resource::ResourceScope;
 #[cfg(test)]
+use crate::v02::scope::ExecutionContextFuture;
+#[cfg(test)]
+use crate::v02::scope::ExecutionContextGuard;
+#[cfg(test)]
 use crate::v02::scope::ExecutionFrameGuard;
 #[cfg(test)]
 use crate::v02::scope::OperationScope;
@@ -115,6 +119,7 @@ impl ManagerCore {
         Arc::new(Self {
             state: Mutex::new(ManagerState {
                 phase: ManagerPhase::Open,
+                shutdown_mode: crate::v02::report::ShutdownMode::Drain,
                 active_scopes: std::collections::HashMap::new(),
                 service_scopes: std::collections::HashMap::new(),
                 recoveries: std::collections::HashMap::new(),
@@ -362,6 +367,9 @@ impl ManagerCore {
         permit.execution.dispatch(OperationJob::Sync(Box::new(move || {
             let scope = OperationScope::new(Arc::clone(&scope_core), core);
             let _frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
+            let manager = scope_core.manager().upgrade().expect("active scope manager exists");
+            let group = scope_core.group().cloned();
+            let _context = ExecutionContextGuard::enter(&manager, id, group.as_ref());
             body(scope);
         })));
         Ok(id)
@@ -383,7 +391,13 @@ impl ManagerCore {
         let scope = OperationScope::new(Arc::clone(&scope_core), core);
         let future = async move {
             let _frame = ExecutionFrameGuard::new(scope_core);
-            body(scope).await;
+            let manager = scope.core.manager().upgrade().expect("active scope manager exists");
+            let group = scope.core.group().cloned();
+            let user_future = {
+                let _context = ExecutionContextGuard::enter(&manager, id, group.as_ref());
+                body(scope)
+            };
+            ExecutionContextFuture::new(user_future, manager, id, group).await;
         };
         permit.execution.dispatch(OperationJob::Async(Box::pin(future)));
         Ok(id)
@@ -639,6 +653,9 @@ impl ManagerCore {
                 }
                 _ => {}
             }
+            if state.phase != ManagerPhase::Closed && mode == crate::v02::report::ShutdownMode::Cancel {
+                state.shutdown_mode = crate::v02::report::ShutdownMode::Cancel;
+            }
             let scopes = if state.phase == ManagerPhase::Cancelling {
                 state.active_scopes.values().filter_map(Weak::upgrade).collect()
             } else {
@@ -663,18 +680,22 @@ impl ManagerCore {
         phase
     }
 
-    /// Returns the current shared admission phase.
-    ///
-    /// # Returns
-    ///
-    /// The phase shared by sync and async manager views.
+    /// Returns the strongest shutdown policy requested for this manager.
+    pub(crate) fn shutdown_mode(&self) -> crate::v02::report::ShutdownMode {
+        lock(&self.state).shutdown_mode
+    }
+
+    /// Reports whether an operation still contributes to the manager shutdown.
     ///
     /// # Parameters
     ///
-    /// - `self`: coordinator whose phase is returned.
-    #[inline]
-    pub(crate) fn phase(&self) -> ManagerPhase {
-        lock(&self.state).phase
+    /// - `id`: Operation whose active registration is checked.
+    ///
+    /// # Returns
+    ///
+    /// `true` while the operation remains registered.
+    pub(crate) fn has_active_scope(&self, id: OperationId) -> bool {
+        lock(&self.state).active_scopes.contains_key(&id)
     }
 
     /// Returns the clock source inherited by root operation contexts.
@@ -839,22 +860,31 @@ impl ManagerCore {
     /// `true` when shutdown can be finalized, or `false` when the timeout
     /// expires.
     pub(crate) fn shutdown_wait_for(&self, timeout: std::time::Duration) -> bool {
-        let until = std::time::Instant::now() + timeout;
+        let until = std::time::Instant::now().checked_add(timeout);
         let mut state = lock(&self.state);
         while !state.active_scopes.is_empty() || !state.service_scopes.is_empty() || !state.recoveries.is_empty() {
-            let now = std::time::Instant::now();
-            if now >= until {
-                return false;
-            }
-            let (next, result) = self
-                .shutdown_changed
-                .wait_timeout(state, until.saturating_duration_since(now))
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next;
-            if result.timed_out()
-                && (!state.active_scopes.is_empty() || !state.service_scopes.is_empty() || !state.recoveries.is_empty())
-            {
-                return false;
+            if let Some(until) = until {
+                let now = std::time::Instant::now();
+                if now >= until {
+                    return false;
+                }
+                let (next, result) = self
+                    .shutdown_changed
+                    .wait_timeout(state, until.saturating_duration_since(now))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next;
+                if result.timed_out()
+                    && (!state.active_scopes.is_empty()
+                        || !state.service_scopes.is_empty()
+                        || !state.recoveries.is_empty())
+                {
+                    return false;
+                }
+            } else {
+                state = self
+                    .shutdown_changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
         }
         drop(state);
