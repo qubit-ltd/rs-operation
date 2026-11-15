@@ -31,6 +31,12 @@ impl Notify {
         lock(&self.inner.state).generation
     }
 
+    /// Returns the active waiter count for internal regression tests.
+    #[cfg(test)]
+    pub(crate) fn waiter_count(&self) -> usize {
+        lock(&self.inner.state).waiters.len()
+    }
+
     /// Creates a future observing changes after the current generation.
     pub(crate) fn notified(&self) -> Notified {
         self.notified_since(self.generation())

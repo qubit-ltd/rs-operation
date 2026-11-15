@@ -140,6 +140,8 @@ Inspect a `SettlementReport` after the business result. `Released` means the fra
 
 Use recovery handles to inspect or retry a recovery group explicitly. Do not retry while an unknown user may still access the resource. An unresolved recovery group can keep manager shutdown pending. Preserve the resource and the execution environment until release is confirmed or responsibility is deliberately transferred.
 
+`RecoveryStore::request_shutdown` closes store admission and returns a cloneable `RecoveryStoreShutdownHandle`. Clones and repeated calls to `wait`, `wait_async`, or `wait_for` observe the same final result. `is_complete()` means finalization finished, including when it finished with `RecoveryStoreShutdownError`; inspect the wait result to distinguish success from failure. Dropping a pending `wait_async` only cancels that observer. It does not reopen the store, cancel shutdown, or discard retained recovery groups. After groups drain, `wait_async` still performs executor shutdown and worker joins synchronously.
+
 ## 8. Capacity, context, and service shutdown
 
 ### 8.1 Backpressure

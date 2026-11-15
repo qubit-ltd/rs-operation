@@ -6,10 +6,8 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
-use std::future::poll_fn;
 use std::mem::take;
 use std::sync::PoisonError;
-use std::task::Poll;
 use std::thread::sleep;
 use std::time::Duration;
 use std::time::Instant;
@@ -59,10 +57,10 @@ impl RecoveryStoreShutdownHandle {
         self.store.snapshot()
     }
 
-    /// Reports whether a waiter has finished executor and worker shutdown.
+    /// Reports whether executor and worker shutdown finalization has finished.
     ///
-    /// This does not report whether shutdown completed successfully; call
-    /// [`Self::wait`] or another wait method to receive any worker panic error.
+    /// This can be `true` after a failed finalization. Call [`Self::wait`] or
+    /// another wait method to receive the shared result.
     ///
     /// # Parameters
     ///
@@ -70,7 +68,7 @@ impl RecoveryStoreShutdownHandle {
     ///
     /// # Returns
     ///
-    /// `true` after shutdown finalization, whether successful or panicked.
+    /// `true` after shutdown finalization, whether successful or failed.
     #[must_use = "use the result to determine whether shutdown has finalized"]
     pub fn is_complete(&self) -> bool {
         self.store
@@ -78,13 +76,15 @@ impl RecoveryStoreShutdownHandle {
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .finished
+            .result
+            .is_some()
     }
 
     /// Blocks until all recovery groups are resolved, then joins store workers.
     ///
-    /// Concurrent waiters share one shutdown operation. This method does not
-    /// return until the store contains no recovery groups.
+    /// Concurrent waiters and clones share one shutdown operation and its
+    /// final result. This method does not return until the store contains no
+    /// recovery groups and executor/worker finalization has completed.
     ///
     /// # Parameters
     ///
@@ -104,14 +104,16 @@ impl RecoveryStoreShutdownHandle {
         }
         let (state_lock, changed) = &*self.store.shutdown;
         let mut state = lock(state_lock);
-        if state.finished {
-            return Ok(());
+        if let Some(result) = state.result {
+            return result;
         }
         if state.started {
-            while !state.finished {
+            while state.result.is_none() {
                 state = changed.wait(state).unwrap_or_else(PoisonError::into_inner);
             }
-            return Ok(());
+            return state
+                .result
+                .expect("shutdown result was set before notification");
         }
         state.started = true;
         drop(state);
@@ -126,20 +128,24 @@ impl RecoveryStoreShutdownHandle {
         for worker in workers {
             panicked |= worker.join().is_err();
         }
-        let mut state = lock(state_lock);
-        state.finished = true;
-        changed.notify_all();
-        if panicked {
+        let final_result = if panicked {
             Err(RecoveryStoreShutdownError::WorkerPanicked)
         } else {
             result
-        }
+        };
+        let mut state = lock(state_lock);
+        state.result = Some(final_result);
+        drop(state);
+        changed.notify_all();
+        final_result
     }
 
     /// Waits asynchronously for groups to drain, then finalizes shutdown.
     ///
-    /// Waiting for groups does not block the polling task. Once the store is
-    /// empty, this method performs executor shutdown and worker joins.
+    /// Waiting for groups does not block the polling task. Dropping this future
+    /// cancels only this observer; it does not cancel store shutdown. Once the
+    /// store is empty, this method performs executor shutdown and worker joins
+    /// synchronously. Repeated polls reuse one notification registration.
     ///
     /// # Parameters
     ///
@@ -147,27 +153,27 @@ impl RecoveryStoreShutdownHandle {
     ///
     /// # Returns
     ///
-    /// `Ok(())` when shutdown completes cleanly.
+    /// The shared finalization result, including a previously recorded error.
     ///
     /// # Errors
     ///
     /// Returns [`RecoveryStoreShutdownError::WorkerPanicked`] if a shutdown
     /// worker panics while joining.
     pub async fn wait_async(&self) -> Result<(), RecoveryStoreShutdownError> {
-        poll_fn(|cx| {
+        loop {
+            let generation = self.store.shutdown_notify.generation();
             if self.store.snapshot().groups == 0 {
-                return Poll::Ready(self.wait());
+                return self.wait();
             }
-            lock(&self.store.shutdown_wakers).push(cx.waker().clone());
-            Poll::Pending
-        })
-        .await
+            self.store.shutdown_notify.notified_since(generation).await;
+        }
     }
 
     /// Waits up to `timeout` for groups to drain and then finalizes shutdown.
     ///
     /// A timeout leaves the store closed to new groups; a later call may
-    /// continue waiting on the same shutdown handle.
+    /// continue waiting on the same shutdown handle. The final result is
+    /// shared with all other wait methods and handle clones.
     ///
     /// # Parameters
     ///

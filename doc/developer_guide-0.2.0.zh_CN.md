@@ -810,6 +810,8 @@ fn retry_report(report: &SettlementReport) -> Result<(), ObservationError> {
 
 未确认还有实际使用者的资源不能通过“重试清理”强行删除。先确认使用已结束，再处理清理失败。manager 内的未解决恢复组会阻止整体关闭，这是责任尚未完成的信号。
 
+`RecoveryStore::request_shutdown` 会关闭新组准入并返回可克隆的 `RecoveryStoreShutdownHandle`。各克隆以及重复调用 `wait`、`wait_async` 或 `wait_for` 都观察同一个最终结果。`is_complete()` 表示关闭收尾已结束，即使收尾结果是 `RecoveryStoreShutdownError` 也为真；应检查等待结果来区分成功与失败。丢弃仍在等待的 `wait_async` 只取消该观察者，不会重新开放 store、取消关闭或丢弃保留的恢复组。恢复组排空后，`wait_async` 仍会同步执行 executor 关闭和 worker join。
+
 ## 8. 容量、上下文与服务关闭
 
 ### 8.1 根据繁忙原因处理背压

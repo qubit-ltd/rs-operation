@@ -55,6 +55,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::task::Context;
     use std::task::Poll;
+    use std::task::Wake;
     use std::task::Waker;
     use std::time::Duration;
 
@@ -164,7 +165,8 @@ mod tests {
         let registration = ScopeCapacity::root(&pools, 81, ScopeLimits::default())
             .resource_registration()
             .unwrap();
-        let (payload, action) = super::async_owner(resource_id, Probe(Arc::clone(&drops)), policy, registration);
+        let (payload, action) =
+            super::async_owner(resource_id, Probe(Arc::clone(&drops)), policy, registration);
         let group = Arc::new(RecoveryCore::new(vec![resource_id], payload, action));
         let handle = super::RecoveryHandle::new(Arc::clone(&group));
         let store = super::RecoveryStore::new(super::RecoveryStoreOptions::default()).unwrap();
@@ -188,12 +190,20 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while group.snapshot().phase != RecoveryPhase::Resolved {
-            assert!(std::time::Instant::now() < deadline, "store retry did not finish");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "store retry did not finish"
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(policy_owner.calls.load(Ordering::SeqCst), 2);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert!(store.request_shutdown().wait_for(Duration::from_secs(2)).unwrap());
+        assert!(
+            store
+                .request_shutdown()
+                .wait_for(Duration::from_secs(2))
+                .unwrap()
+        );
     }
 
     struct ErrCleanup;
@@ -233,13 +243,19 @@ mod tests {
         assert_eq!(transfer.recovery, id);
         assert_eq!(transfer.receipt.recovery(), id);
         assert!(store.contains(id));
-        assert_eq!(handle.snapshot().phase, crate::v02::report::RecoveryPhase::Transferred);
+        assert_eq!(
+            handle.snapshot().phase,
+            crate::v02::report::RecoveryPhase::Transferred
+        );
         assert_eq!(store.snapshot().groups, 1);
         let shutdown = store.request_shutdown();
         assert!(!shutdown.wait_for(Duration::ZERO).unwrap());
         let attempt = store.try_retry(id).unwrap();
         let report = attempt.wait().unwrap();
-        assert_eq!(report.recovery.phase, crate::v02::report::RecoveryPhase::Resolved);
+        assert_eq!(
+            report.recovery.phase,
+            crate::v02::report::RecoveryPhase::Resolved
+        );
         assert!(shutdown.wait_for(Duration::from_secs(2)).unwrap());
         assert!(shutdown.is_complete());
     }
@@ -268,6 +284,108 @@ mod tests {
         assert!(handle.is_complete());
         assert!(clone.wait().is_ok());
         assert!(clone.is_complete());
+    }
+
+    #[test]
+    fn test_shutdown_failure_is_shared_with_clones_and_repeated_waits() {
+        let store = super::RecoveryStore::new(super::RecoveryStoreOptions::default()).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        store
+            .async_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                panic!("injected worker panic");
+            }));
+        let handle = store.request_shutdown();
+        let clone = handle.clone();
+        let first = {
+            let handle = handle.clone();
+            std::thread::spawn(move || handle.wait())
+        };
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (observer_tx, observer_rx) = std::sync::mpsc::channel();
+        let second = {
+            let handle = clone.clone();
+            std::thread::spawn(move || {
+                observer_tx.send(()).unwrap();
+                handle.wait()
+            })
+        };
+        observer_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        release_tx.send(()).unwrap();
+        let expected =
+            Err(crate::v02::resource::recovery::RecoveryStoreShutdownError::WorkerPanicked);
+        assert_eq!(first.join().unwrap(), expected);
+        assert_eq!(second.join().unwrap(), expected);
+        assert_eq!(clone.wait(), expected);
+        assert_eq!(
+            clone.wait_for(Duration::ZERO),
+            Err(crate::v02::resource::recovery::RecoveryStoreShutdownError::WorkerPanicked)
+        );
+        assert!(handle.is_complete());
+    }
+
+    #[test]
+    fn test_shutdown_async_wait_reuses_and_unregisters_its_waker() {
+        let store = super::RecoveryStore::with_capacity(2, 2).unwrap();
+        let group = group();
+        let id = group.id();
+        assert!(store.accept(group).is_ok());
+        let handle = store.request_shutdown();
+        let mut wait = Box::pin(handle.wait_async());
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        assert_eq!(store.shutdown_notify.waiter_count(), 1);
+        drop(wait);
+        assert_eq!(store.shutdown_notify.waiter_count(), 0);
+        let attempt = store.try_retry(id).unwrap();
+        attempt.finish(Ok(()));
+        assert!(handle.wait().is_ok());
+    }
+
+    #[test]
+    fn test_shutdown_notifies_when_group_resolves_before_callback_installation() {
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let store = super::RecoveryStore::with_capacity(2, 2).unwrap();
+        let gate = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        *lock(&store.callback_install_gate) = Some(Arc::clone(&gate));
+        let group = group();
+        let id = group.id();
+        let accepting = {
+            let store = store.clone();
+            std::thread::spawn(move || store.accept(group))
+        };
+
+        gate.0.wait();
+        let handle = store.request_shutdown();
+        let mut wait = Box::pin(handle.wait_async());
+        let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut context = Context::from_waker(&waker);
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+
+        let attempt = store.try_retry(id).unwrap();
+        attempt.finish(Ok(()));
+        gate.1.wait();
+        assert!(accepting.join().unwrap().is_ok());
+        assert!(wake_count.0.load(Ordering::SeqCst) > 0);
+        assert!(wait.as_mut().poll(&mut context).is_ready());
     }
 
     #[test]
@@ -300,14 +418,20 @@ mod tests {
         let group = group();
         let attempt = group.try_retry().unwrap();
         drop(attempt);
-        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Unconfirmed);
+        assert_eq!(
+            group.snapshot().phase,
+            crate::v02::report::RecoveryPhase::Unconfirmed
+        );
     }
 
     #[test]
     fn test_recovery_store_handoff_is_bounded_and_signed() {
         let manager = ManagerId::new_unique();
         let group = Arc::new(RecoveryCore::new(
-            vec![ResourceId::new(manager, 1, 1), ResourceId::new(manager, 2, 1)],
+            vec![
+                ResourceId::new(manager, 1, 1),
+                ResourceId::new(manager, 2, 1),
+            ],
             Arc::new(()),
             Arc::new(Noop),
         ));
@@ -318,7 +442,10 @@ mod tests {
             handle.transfer_to(&too_small),
             Err(crate::v02::report::RecoveryTransferError::CapacityExceeded)
         );
-        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Pending);
+        assert_eq!(
+            group.snapshot().phase,
+            crate::v02::report::RecoveryPhase::Pending
+        );
 
         let store = super::RecoveryStore::with_capacity(1, 2).unwrap();
         let transfer = match store.accept(Arc::clone(&group)) {
@@ -328,11 +455,20 @@ mod tests {
         assert_eq!(transfer.recovery, group.id());
         assert_eq!(transfer.receiver, transfer.receipt.receiver());
         assert!(store.contains(group.id()));
-        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Transferred);
+        assert_eq!(
+            group.snapshot().phase,
+            crate::v02::report::RecoveryPhase::Transferred
+        );
 
         let attempt = store.try_retry(group.id()).unwrap();
-        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Running);
+        assert_eq!(
+            group.snapshot().phase,
+            crate::v02::report::RecoveryPhase::Running
+        );
         attempt.finish(Ok(()));
-        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Resolved);
+        assert_eq!(
+            group.snapshot().phase,
+            crate::v02::report::RecoveryPhase::Resolved
+        );
     }
 }
