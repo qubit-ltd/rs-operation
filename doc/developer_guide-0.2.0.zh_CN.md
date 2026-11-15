@@ -252,6 +252,8 @@ let key;
 
 resource_scope 返回 ResourceScope，表示一个显式的资源所属范围。key 是 `ResourceKey<Vec<u8>>`，只保存身份和类型，不延长资源存活；get_resource 则通过仍开放的范围建立新的使用引用。
 
+`ResourceId` 是不透明的进程内身份。同一资源经 clone 或通过 key 再次获取时 ID 保持不变；即使资源属于不同 scope，登记后也有不同 ID。不要依赖 slot 数值，也不要把它持久化为应用主键。
+
 ResourceScope 的 owner Drop 或 end 都会结束持有，但不会阻塞等待清理。需要提前等待该局部范围收尾时，先保存 observer，结束范围，并保证当前函数没有继续持有其中的资源引用，再等待 observer 的报告。
 
 ### 3.3 并发获取不表示独占
@@ -810,7 +812,7 @@ fn retry_report(report: &SettlementReport) -> Result<(), ObservationError> {
 
 未确认还有实际使用者的资源不能通过“重试清理”强行删除。先确认使用已结束，再处理清理失败。manager 内的未解决恢复组会阻止整体关闭，这是责任尚未完成的信号。
 
-操作主体在构造 Future 或轮询时发生的 panic，会在完成生命周期和容量记账后报告为 `Panicked`。恢复清理期间发生 panic 时报告为 `Unconfirmed`：框架保留恢复责任，不把资源当作已经释放。多个恢复观察者共享同一份最终报告；丢弃一个观察者只取消该等待，不会取消共享重试或释放资源。这些保证适用于 unwind panic，不涵盖 `panic = "abort"`。
+操作主体在构造 Future 或轮询时发生的 panic，会在完成生命周期和容量记账后报告为 `Panicked`。恢复清理期间发生 panic 时报告为 `Unconfirmed`：框架保留恢复责任，不把资源当作已经释放。直接执行重试时，第一个被 poll 的等待者驱动清理；若丢弃这个仍在等待的 Future，执行会停止，未完成的清理 Future 会被保留，并发布 `Unconfirmed` 唤醒其他观察者。丢弃非驱动观察者只取消该等待。由 store worker 执行时，丢弃观察者只取消观察，worker 继续执行。两类取消都不代表资源已释放。这些 panic 保证适用于 unwind，不涵盖 `panic = "abort"`。
 
 `RecoveryStore::request_shutdown` 会关闭新组准入并返回可克隆的 `RecoveryStoreShutdownHandle`。各克隆以及重复调用 `wait`、`wait_async` 或 `wait_for` 都观察同一个最终结果。`is_complete()` 表示关闭收尾已结束，即使收尾结果是 `RecoveryStoreShutdownError` 也为真；应检查等待结果来区分成功与失败。丢弃仍在等待的 `wait_async` 只取消该观察者，不会重新开放 store、取消关闭或丢弃保留的恢复组。恢复组排空后，`wait_async` 仍会同步执行 executor 关闭和 worker join。
 

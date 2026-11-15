@@ -22,11 +22,13 @@ use crate::v02::resource::recovery::wait_attempt_async;
 
 /// One admitted retry and its shared observation state.
 ///
-/// A synchronous or asynchronous observer can wait on the same attempt. If
-/// every observer is dropped before completion, the retained owner remains in
-/// recovery and its phase becomes `Unconfirmed`; it is never marked released.
-/// Panics from retry action construction or polling are also reported as
-/// `Unconfirmed`, with the resource responsibility retained.
+/// A synchronous or asynchronous observer can wait on the same attempt. In
+/// direct execution, the first observer polled drives the retry; dropping that
+/// pending wait preserves its cleanup future, records `Unconfirmed`, and wakes
+/// all other observers. Dropping a non-driving observer only cancels that wait.
+/// When execution was handed to a store worker, dropping an observer does not
+/// stop the worker. Panics from retry action construction or polling are also
+/// reported as `Unconfirmed`, with the resource responsibility retained.
 /// Attempts are created by [`crate::RecoveryHandle::try_retry`] or
 /// [`crate::RecoveryStore::try_retry`].
 ///
@@ -95,8 +97,11 @@ impl RecoveryAttempt {
     /// Starts or observes this retry without blocking the current thread.
     ///
     /// The retry action starts when this future is first polled. If an executor
-    /// permit was reserved, the action is spawned there; otherwise the action
-    /// is awaited directly. All observers receive the same completion report.
+    /// permit was reserved, the action is spawned there and dropping this wait
+    /// only cancels observation. Otherwise, the first polled observer drives
+    /// the action directly; dropping its pending wait retains the unfinished
+    /// action future, records `Unconfirmed`, and wakes the other observers.
+    /// All observers receive the same completion report.
     ///
     /// # Parameters
     ///
@@ -121,12 +126,7 @@ impl RecoveryAttempt {
                     publish_attempt(&observation, run.core.snapshot());
                 });
             } else {
-                let payload = run.payload.as_ref().expect("attempt owns payload").clone();
-                match retry_catching_panic(Arc::clone(&run.action), payload).await {
-                    Ok(result) => run.complete(result),
-                    Err((panic, future)) => run.complete_unconfirmed(panic, future),
-                }
-                publish_attempt(&self.observation, self.core.snapshot());
+                super::direct_recovery_driver::drive_direct(run, Arc::clone(&self.observation)).await;
             }
         }
         wait_attempt_async(&self.observation).await

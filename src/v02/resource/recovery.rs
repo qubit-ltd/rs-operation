@@ -9,6 +9,7 @@
 //! Strongly retained recovery payloads and single-flight retry state.
 
 mod async_recovery_attempt;
+pub(super) mod direct_recovery_driver;
 mod internal;
 mod recovery_attempt;
 mod recovery_handle;
@@ -250,6 +251,80 @@ mod tests {
         assert!(store.request_shutdown().wait_for(Duration::from_secs(2)).unwrap());
     }
 
+    #[test]
+    fn test_cancelled_direct_retry_keeps_real_resource_and_capacity_registration() {
+        use crate::v02::manager::capacity::ManagerCapacityPools;
+        use crate::v02::manager::capacity::ScopeCapacity;
+        use crate::v02::report::ManagerLimits;
+        use crate::v02::report::ScopeLimits;
+
+        let resource_id = ResourceId::new(ManagerId::new_unique(), 13, 1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new(Gate {
+            state: Mutex::new((false, None)),
+            started: started_tx,
+        });
+        let policy = Arc::new(FlakyCleanup {
+            calls: AtomicUsize::new(0),
+            gate: Arc::clone(&gate),
+        });
+        let policy_owner = Arc::clone(&policy);
+        let policy: Arc<dyn super::super::cleanup::AsyncCleanup<Probe>> = policy;
+        let pools = ManagerCapacityPools::new(ManagerLimits::default());
+        let scope_capacity = ScopeCapacity::root(
+            &pools,
+            84,
+            ScopeLimits {
+                resources: 1,
+                ..ScopeLimits::default()
+            },
+        );
+        let registration = scope_capacity.resource_registration().unwrap();
+        let (payload, action) = super::async_owner(resource_id, Probe(Arc::clone(&drops)), policy, registration);
+        let group = Arc::new(RecoveryCore::new(vec![resource_id], payload, action));
+        let handle = super::RecoveryHandle::new(Arc::clone(&group));
+
+        assert_eq!(
+            handle.try_retry().unwrap().wait().unwrap().recovery.phase,
+            RecoveryPhase::Pending
+        );
+        let attempt = handle.try_retry().unwrap();
+        let driver_attempt = attempt.as_async();
+        let observer_attempt = attempt.as_async();
+        let mut driver = Box::pin(driver_attempt.wait());
+        let mut observer = Box::pin(observer_attempt.wait());
+        let driver_waker = Waker::noop();
+        let observer_waker = Waker::noop();
+        let mut driver_context = Context::from_waker(driver_waker);
+        let mut observer_context = Context::from_waker(observer_waker);
+
+        assert!(driver.as_mut().poll(&mut driver_context).is_pending());
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("direct retry starts cleanup");
+        assert!(observer.as_mut().poll(&mut observer_context).is_pending());
+        assert!(scope_capacity.resource_registration().is_err());
+        drop(driver);
+
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let report = match observer.as_mut().poll(&mut observer_context) {
+            Poll::Ready(report) => report,
+            Poll::Pending => panic!("observer did not receive direct cancellation report"),
+        };
+        assert_eq!(report.recovery.phase, RecoveryPhase::Unconfirmed);
+        assert_eq!(report.recovery.resources.as_ref(), [resource_id]);
+        assert!(report.failures.iter().any(|failure| {
+            failure.resource_id == resource_id
+                && failure.summary.as_str() == "recovery attempt execution cancelled; cleanup unconfirmed"
+        }));
+        assert!(scope_capacity.resource_registration().is_err());
+        assert_eq!(policy_owner.calls.load(Ordering::SeqCst), 2);
+        assert!(handle.try_retry().is_err());
+        drop(group);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
     struct ErrCleanup;
     impl ErrCleanup {
         fn failed(resource: Probe) -> super::super::cleanup::CleanupOutcome<Probe> {
@@ -345,23 +420,33 @@ mod tests {
         assert!(first_observer.as_mut().poll(&mut context).is_pending());
         assert!(second_observer.as_mut().poll(&mut context).is_pending());
         assert_eq!(group.snapshot().phase, RecoveryPhase::Running);
+        drop(second_observer);
+        assert_eq!(group.snapshot().phase, RecoveryPhase::Running);
 
         attempt.finish(Ok(()));
         assert!(first_observer.as_mut().poll(&mut context).is_pending());
-        assert!(second_observer.as_mut().poll(&mut context).is_pending());
 
         gate.open();
         let first_report = match first_observer.as_mut().poll(&mut context) {
             Poll::Ready(report) => report,
             Poll::Pending => panic!("first observer did not receive the completed retry"),
         };
-        let second_report = match second_observer.as_mut().poll(&mut context) {
-            Poll::Ready(report) => report,
-            Poll::Pending => panic!("second observer did not receive the completed retry"),
-        };
-        assert_eq!(first_report.recovery.id, second_report.recovery.id);
-        assert_eq!(first_report.recovery.phase, second_report.recovery.phase);
+        assert_eq!(first_report.recovery.phase, RecoveryPhase::Resolved);
         assert_eq!(group.snapshot().phase, RecoveryPhase::Resolved);
+    }
+
+    #[test]
+    fn test_dropping_unpolled_retry_wait_does_not_take_the_run() {
+        let group = group();
+        let attempt = group.try_retry().unwrap();
+        let observer = attempt.as_async();
+        let wait = observer.wait();
+        drop(wait);
+
+        assert_eq!(group.snapshot().phase, RecoveryPhase::Running);
+        assert!(lock(&attempt.run).is_some());
+        let report = super::block_on(observer.wait());
+        assert_eq!(report.recovery.phase, RecoveryPhase::Resolved);
     }
 
     #[test]
@@ -508,6 +593,82 @@ mod tests {
         let attempt = group.try_retry().unwrap();
         drop(attempt);
         assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Unconfirmed);
+    }
+
+    #[test]
+    fn test_cancelled_direct_retry_publishes_unconfirmed_and_retains_future() {
+        struct PendingProbe(Arc<AtomicUsize>);
+
+        impl Future for PendingProbe {
+            type Output = Result<(), CleanupFailure>;
+
+            fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+
+        impl Drop for PendingProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct PendingRetry(Arc<AtomicUsize>);
+
+        impl RecoveryAction for PendingRetry {
+            fn retry(&self, _payload: Arc<dyn std::any::Any + Send + Sync>) -> super::RecoveryFuture {
+                Box::pin(PendingProbe(Arc::clone(&self.0)))
+            }
+        }
+
+        struct CountWake(AtomicUsize);
+
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let resource_id = ResourceId::new(ManagerId::new_unique(), 12, 1);
+        let group = Arc::new(RecoveryCore::new(
+            vec![resource_id],
+            Arc::new(()),
+            Arc::new(PendingRetry(Arc::clone(&drops))),
+        ));
+        let attempt = group.try_retry().unwrap();
+        let driver_attempt = attempt.as_async();
+        let observer_attempt = attempt.as_async();
+        let mut driver = Box::pin(driver_attempt.wait());
+        let mut observer = Box::pin(observer_attempt.wait());
+        let driver_wake = Arc::new(CountWake(AtomicUsize::new(0)));
+        let observer_wake = Arc::new(CountWake(AtomicUsize::new(0)));
+        let driver_waker = Waker::from(Arc::clone(&driver_wake));
+        let observer_waker = Waker::from(Arc::clone(&observer_wake));
+        let mut driver_context = Context::from_waker(&driver_waker);
+        let mut observer_context = Context::from_waker(&observer_waker);
+
+        assert!(driver.as_mut().poll(&mut driver_context).is_pending());
+        assert!(observer.as_mut().poll(&mut observer_context).is_pending());
+        assert_eq!(group.snapshot().phase, RecoveryPhase::Running);
+
+        drop(driver);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(observer_wake.0.load(Ordering::SeqCst) > 0);
+        let report = match observer.as_mut().poll(&mut observer_context) {
+            Poll::Ready(report) => report,
+            Poll::Pending => panic!("observer did not receive cancellation report"),
+        };
+        assert_eq!(report.recovery.phase, RecoveryPhase::Unconfirmed);
+        assert_eq!(report.recovery.resources.as_ref(), [resource_id]);
+        assert_eq!(group.snapshot().phase, RecoveryPhase::Unconfirmed);
+        assert!(group.try_retry().is_err());
+        drop(group);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
     }
 
     struct PanicRetry;

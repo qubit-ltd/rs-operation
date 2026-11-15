@@ -54,6 +54,21 @@ impl RecoveryRun {
         self.payload.take();
     }
 
+    /// Records a cancelled retry while preserving its pending cleanup future.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — run whose direct execution was cancelled.
+    /// * `future` — unfinished cleanup future that must remain retained.
+    pub(in crate::v02::resource::recovery) fn complete_cancelled(
+        &mut self,
+        future: Option<crate::v02::resource::recovery::RecoveryFuture>,
+    ) {
+        self.core.mark_cancelled(self.generation, future);
+        self.completed = true;
+        self.payload.take();
+    }
+
     /// Applies the cleanup result if this run still owns the active generation.
     ///
     /// Success resolves the group and releases retained owner state outside

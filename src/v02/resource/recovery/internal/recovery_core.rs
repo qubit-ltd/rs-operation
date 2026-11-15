@@ -266,9 +266,48 @@ impl RecoveryCore {
     ) {
         let summary = panic
             .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("recovery action panicked; cleanup outcome is unconfirmed");
+            .map(|summary| (*summary).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "recovery action panicked; cleanup outcome is unconfirmed".to_owned());
+        self.mark_unconfirmed_with(generation, Some(panic), future, &summary);
+    }
+
+    /// Marks a cancelled attempt unconfirmed without inventing a panic cause.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — recovery core whose direct retry was cancelled.
+    /// * `generation` — active retry token used to reject stale completion.
+    /// * `future` — unfinished cleanup future retained by the core.
+    pub(in crate::v02::resource::recovery) fn mark_cancelled(
+        &self,
+        generation: u64,
+        future: Option<crate::v02::resource::recovery::RecoveryFuture>,
+    ) {
+        self.mark_unconfirmed_with(
+            generation,
+            None,
+            future,
+            "recovery attempt execution cancelled; cleanup unconfirmed",
+        );
+    }
+
+    /// Shared state transition for panic and cancellation outcomes.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — recovery core whose retry outcome is being recorded.
+    /// * `generation` — attempt token used to reject stale outcomes.
+    /// * `panic` — optional panic payload retained when the action panicked.
+    /// * `future` — unfinished action future retained when cleanup is unknown.
+    /// * `summary` — bounded diagnostic applied to the affected resources.
+    fn mark_unconfirmed_with(
+        &self,
+        generation: u64,
+        panic: Option<Box<dyn std::any::Any + Send + 'static>>,
+        future: Option<crate::v02::resource::recovery::RecoveryFuture>,
+        summary: &str,
+    ) {
         let failures = self
             .resources
             .iter()
@@ -280,13 +319,22 @@ impl RecoveryCore {
                 source: None,
             })
             .collect::<Vec<_>>();
+        let mut retained_future = future;
         let mut state = lock(&self.state);
         if state.phase == RecoveryPhase::Running && state.generation == generation {
             state.phase = RecoveryPhase::Unconfirmed;
             state.retry_disabled = true;
-            state.panic = Some(panic);
-            state.unconfirmed_future = future;
+            state.panic = panic;
+            state.unconfirmed_future = retained_future.take();
             state.failures.extend(failures);
+        } else {
+            // A stale future can still own a resource whose cleanup result is
+            // unknown. Preserve it even when this generation no longer owns
+            // the visible recovery state.
+            drop(state);
+            if let Some(future) = retained_future {
+                std::mem::forget(future);
+            }
         }
     }
 
