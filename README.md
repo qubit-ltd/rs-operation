@@ -17,7 +17,7 @@ Until `qubit-operation` 0.2 is published, point your application at the local `r
 
 ```toml
 [dependencies]
-qubit-operation = { path = "<path-to-rs-operation>" }
+qubit-operation = { path = "<path-to-rs-operation>", version = "^0.2" }
 ```
 
 After the crate is published, you can use `qubit-operation = "^0.2"` from crates.io. Its own dependencies are declared in the local crate manifest.

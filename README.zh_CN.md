@@ -17,7 +17,7 @@
 
 ```toml
 [dependencies]
-qubit-operation = { path = "<path-to-rs-operation>" }
+qubit-operation = { path = "<path-to-rs-operation>", version = "^0.2" }
 ```
 
 crate 发布后，可改用 crates.io 依赖 `qubit-operation = "^0.2"`。本地 crate 的其他依赖由其自身的 manifest 声明。
