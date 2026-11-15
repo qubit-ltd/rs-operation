@@ -6,7 +6,22 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
-/// Capacity limits inherited by an operation's resource scope.
+/// Capacity limits requested for an operation's scope and inherited by its
+/// descendants.
+///
+/// The default limits are 64 child operations, 128 resources, 64 attached
+/// resource scopes, and 64 effect records. For an operation, a complete value
+/// equal to [`ScopeLimits::default()`] is the sentinel that selects the
+/// manager's `scope_limits` value as the operation's limits. A value that
+/// differs in any field is used as a whole; unchanged fields are not merged
+/// from the manager configuration. This means an explicit request for the
+/// complete default values cannot be distinguished from inheritance.
+///
+/// A root operation can therefore override the manager defaults by supplying
+/// any non-default value. A child operation's requested capacities are
+/// clamped along the parent chain, so no descendant can exceed an ancestor's
+/// effective limit. These limits bound simultaneous retained capacity; a
+/// released reservation can be used again.
 ///
 /// # Examples
 ///
@@ -19,13 +34,13 @@
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ScopeLimits {
-    /// Maximum child operations admitted into the scope.
+    /// Maximum simultaneously admitted child operations; defaults to `64`.
     pub child_operations: usize,
-    /// Maximum resources registered with the scope.
+    /// Maximum simultaneously registered resources; defaults to `128`.
     pub resources: usize,
-    /// Maximum child resource scopes attached to this operation scope.
+    /// Maximum attached child resource scopes; defaults to `64`.
     pub resource_scopes: usize,
-    /// Maximum effect records retained for the scope.
+    /// Maximum retained effect records; defaults to `64`.
     pub effect_records: usize,
 }
 

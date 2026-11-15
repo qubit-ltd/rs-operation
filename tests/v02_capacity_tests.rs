@@ -19,6 +19,7 @@ use qubit_operation::OperationManager;
 use qubit_operation::OperationOptions;
 use qubit_operation::OperationOutcome;
 use qubit_operation::PortableExecutorOptions;
+use qubit_operation::ResourceScopeOptions;
 use qubit_operation::ScopeLimits;
 use qubit_operation::ShutdownMode;
 
@@ -175,4 +176,267 @@ fn test_a_parent_child_slot_stays_reserved_until_the_child_really_finishes() {
     assert!(parent.wait_settlement().unwrap().all_released());
     let shutdown_report = manager.request_shutdown(ShutdownMode::Drain).wait().unwrap();
     assert_eq!(shutdown_report.snapshot.active_operations, 0);
+}
+
+#[test]
+fn test_manager_resource_limit_is_inherited_by_default_root_and_can_be_overridden() {
+    let manager = OperationManager::new(ManagerOptions {
+        scope_limits: ScopeLimits {
+            resources: 2,
+            ..ScopeLimits::default()
+        },
+        ..ManagerOptions::default()
+    })
+    .unwrap();
+
+    let mut inherited = manager
+        .try_submit(OperationOptions::default(), |scope| {
+            let _first = scope.manage(1usize).unwrap();
+            let _second = scope.manage(2usize).unwrap();
+            assert!(scope.manage(3usize).is_err());
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(matches!(
+        inherited.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    inherited.wait_settlement().unwrap();
+
+    let mut three = manager
+        .try_submit(
+            OperationOptions {
+                limits: ScopeLimits {
+                    resources: 3,
+                    ..ScopeLimits::default()
+                },
+                ..OperationOptions::default()
+            },
+            |scope| {
+                let _first = scope.manage(1usize).unwrap();
+                let _second = scope.manage(2usize).unwrap();
+                let _third = scope.manage(3usize).unwrap();
+                assert!(scope.manage(4usize).is_err());
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        three.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    three.wait_settlement().unwrap();
+
+    let mut one = manager
+        .try_submit(
+            OperationOptions {
+                limits: ScopeLimits {
+                    resources: 1,
+                    ..ScopeLimits::default()
+                },
+                ..OperationOptions::default()
+            },
+            |scope| {
+                let _first = scope.manage(1usize).unwrap();
+                assert!(scope.manage(2usize).is_err());
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        one.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    one.wait_settlement().unwrap();
+}
+
+#[test]
+fn test_child_resource_request_is_clamped_by_parent_and_capacity_is_reused_after_settlement() {
+    let manager = OperationManager::new(ManagerOptions {
+        scope_limits: ScopeLimits {
+            resources: 2,
+            ..ScopeLimits::default()
+        },
+        ..ManagerOptions::default()
+    })
+    .unwrap();
+    let mut parent = manager
+        .try_submit(
+            OperationOptions {
+                limits: ScopeLimits {
+                    resources: 2,
+                    ..ScopeLimits::default()
+                },
+                ..OperationOptions::default()
+            },
+            |scope| {
+                let _parent_resource = scope.manage(1usize).unwrap();
+                let mut child = scope
+                    .manager()
+                    .try_submit(
+                        OperationOptions {
+                            limits: ScopeLimits {
+                                resources: 3,
+                                ..ScopeLimits::default()
+                            },
+                            ..OperationOptions::default()
+                        },
+                        |child_scope| {
+                            let _child_resource = child_scope.manage(2usize).unwrap();
+                            assert!(child_scope.manage(3usize).is_err());
+                            Ok::<_, ()>(())
+                        },
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    child.wait_outcome().unwrap(),
+                    OperationOutcome::Succeeded(())
+                ));
+                child.wait_settlement().unwrap();
+                let mut reused = scope
+                    .manager()
+                    .try_submit(
+                        OperationOptions {
+                            limits: ScopeLimits {
+                                resources: 3,
+                                ..ScopeLimits::default()
+                            },
+                            ..OperationOptions::default()
+                        },
+                        |child_scope| {
+                            let _resource = child_scope.manage(7usize).unwrap();
+                            Ok::<_, ()>(())
+                        },
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    reused.wait_outcome().unwrap(),
+                    OperationOutcome::Succeeded(())
+                ));
+                reused.wait_settlement().unwrap();
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        parent.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    parent.wait_settlement().unwrap();
+
+    let mut after_settlement = manager
+        .try_submit(OperationOptions::default(), |scope| {
+            let _first = scope.manage(4usize).unwrap();
+            let _second = scope.manage(5usize).unwrap();
+            assert!(scope.manage(6usize).is_err());
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(matches!(
+        after_settlement.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    after_settlement.wait_settlement().unwrap();
+}
+
+#[test]
+fn test_default_limits_are_replaced_as_a_whole_and_changed_limits_are_not_field_merged() {
+    let manager = OperationManager::new(ManagerOptions {
+        scope_limits: ScopeLimits {
+            resources: 2,
+            resource_scopes: 1,
+            ..ScopeLimits::default()
+        },
+        ..ManagerOptions::default()
+    })
+    .unwrap();
+
+    let mut default_limits = manager
+        .try_submit(OperationOptions::default(), |scope| {
+            let _first = scope
+                .resource_scope(ResourceScopeOptions { capacity: 1 })
+                .unwrap();
+            assert!(
+                scope
+                    .resource_scope(ResourceScopeOptions { capacity: 1 })
+                    .is_err()
+            );
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(matches!(
+        default_limits.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    default_limits.wait_settlement().unwrap();
+
+    let mut one_field_changed = manager
+        .try_submit(
+            OperationOptions {
+                limits: ScopeLimits {
+                    resources: 3,
+                    ..ScopeLimits::default()
+                },
+                ..OperationOptions::default()
+            },
+            |scope| {
+                let _first = scope
+                    .resource_scope(ResourceScopeOptions { capacity: 1 })
+                    .unwrap();
+                let _second = scope
+                    .resource_scope(ResourceScopeOptions { capacity: 1 })
+                    .unwrap();
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        one_field_changed.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    one_field_changed.wait_settlement().unwrap();
+}
+
+#[test]
+fn test_default_child_limits_are_replaced_then_clamped_by_parent_limits() {
+    let manager = OperationManager::new(ManagerOptions {
+        scope_limits: ScopeLimits {
+            resources: 2,
+            ..ScopeLimits::default()
+        },
+        ..ManagerOptions::default()
+    })
+    .unwrap();
+    let mut parent = manager
+        .try_submit(
+            OperationOptions {
+                limits: ScopeLimits {
+                    resources: 1,
+                    ..ScopeLimits::default()
+                },
+                ..OperationOptions::default()
+            },
+            |scope| {
+                let _parent_resource = scope.manage(1usize).unwrap();
+                let mut child = scope
+                    .manager()
+                    .try_submit(OperationOptions::default(), |child_scope| {
+                        assert!(child_scope.manage(2usize).is_err());
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    child.wait_outcome().unwrap(),
+                    OperationOutcome::Succeeded(())
+                ));
+                child.wait_settlement().unwrap();
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        parent.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    parent.wait_settlement().unwrap();
 }

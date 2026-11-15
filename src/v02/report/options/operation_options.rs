@@ -13,6 +13,15 @@ use crate::v02::report::ScopeLimits;
 
 /// Per-child policy and context inherited when an operation starts a child.
 ///
+/// `limits` is compared as a complete [`ScopeLimits`] value. When it equals
+/// [`ScopeLimits::default()`], submission substitutes the manager's
+/// `scope_limits` value for the whole structure, including for root
+/// operations. Any other value is used as the operation's requested limits;
+/// fields are not merged with manager defaults. For child operations, each
+/// requested capacity is then clamped by the effective limits of every
+/// ancestor. Because the complete default value is the inheritance sentinel,
+/// callers cannot express an explicit request for exactly that value.
+///
 /// # Examples
 ///
 /// ```
@@ -25,7 +34,10 @@ use crate::v02::report::ScopeLimits;
 pub struct OperationOptions {
     /// Whether failure of this child affects its parent outcome.
     pub requirement: ChildRequirement,
-    /// Limits applied to the child operation's scope.
+    /// Requested capacity limits for this operation's scope. The complete
+    /// [`ScopeLimits::default()`] value means inherit the manager's
+    /// `scope_limits`; any other value replaces that default as a whole.
+    /// Effective child limits are clamped by every ancestor.
     pub limits: ScopeLimits,
     /// Sibling behavior after a required child fails.
     pub child_failure_policy: ChildFailurePolicy,
