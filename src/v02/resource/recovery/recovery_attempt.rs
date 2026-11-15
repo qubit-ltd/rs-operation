@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::Poll;
 
 use crate::v02::report::CleanupFailure;
 use crate::v02::resource::recovery::AsyncRecoveryAttempt;
@@ -110,14 +111,18 @@ impl RecoveryAttempt {
                 let observation = Arc::clone(&self.observation);
                 permit.spawn(async move {
                     let payload = run.payload.as_ref().expect("attempt owns payload").clone();
-                    let result = run.action.retry(payload).await;
-                    run.complete(result);
+                    match retry_catching_panic(Arc::clone(&run.action), payload).await {
+                        Ok(result) => run.complete(result),
+                        Err(panic) => run.complete_unconfirmed(panic),
+                    }
                     publish_attempt(&observation, run.core.snapshot());
                 });
             } else {
                 let payload = run.payload.as_ref().expect("attempt owns payload").clone();
-                let result = run.action.retry(payload).await;
-                run.complete(result);
+                match retry_catching_panic(Arc::clone(&run.action), payload).await {
+                    Ok(result) => run.complete(result),
+                    Err(panic) => run.complete_unconfirmed(panic),
+                }
                 publish_attempt(&self.observation, self.core.snapshot());
             }
         }
@@ -158,4 +163,38 @@ impl RecoveryAttempt {
             observation: Arc::clone(&self.observation),
         }
     }
+}
+
+/// Runs both action construction and future polling behind unwind boundaries.
+async fn retry_catching_panic(
+    action: Arc<dyn crate::v02::resource::recovery::RecoveryAction>,
+    payload: crate::v02::resource::recovery::RecoveryPayload,
+) -> Result<Result<(), CleanupFailure>, Box<dyn std::any::Any + Send>> {
+    let future =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action.retry(payload))) {
+            Ok(future) => future,
+            Err(panic) => return Err(panic),
+        };
+    let mut future = Some(future);
+    std::future::poll_fn(|cx| {
+        let future_ref = future
+            .as_mut()
+            .expect("future remains present until completion");
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            future_ref.as_mut().poll(cx)
+        })) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(result)) => {
+                future.take();
+                Poll::Ready(Ok(result))
+            }
+            Err(panic) => {
+                if let Some(future) = future.take() {
+                    std::mem::forget(future);
+                }
+                Poll::Ready(Err(panic))
+            }
+        }
+    })
+    .await
 }

@@ -94,6 +94,8 @@ impl RecoveryCore {
                 payload: Some(payload),
                 action: Some(action),
                 failures: Vec::new(),
+                retry_disabled: false,
+                panic: None,
             }),
             terminal: Mutex::new(None),
             executor: Mutex::new(None),
@@ -125,6 +127,8 @@ impl RecoveryCore {
                 payload: Some(payload),
                 action: None,
                 failures: Vec::new(),
+                retry_disabled: true,
+                panic: None,
             }),
             terminal: Mutex::new(None),
             executor: Mutex::new(None),
@@ -200,7 +204,11 @@ impl RecoveryCore {
                 RecoveryPhase::Resolved | RecoveryPhase::Transferred => {
                     return Err(crate::v02::report::RetryError::AlreadyResolved);
                 }
-                RecoveryPhase::Pending | RecoveryPhase::Unconfirmed => {}
+                RecoveryPhase::Pending | RecoveryPhase::Unconfirmed => {
+                    if state.retry_disabled {
+                        return Err(crate::v02::report::RetryError::ExecutorUnavailable);
+                    }
+                }
             }
             let payload = state
                 .payload
@@ -229,6 +237,20 @@ impl RecoveryCore {
             }))),
             observation: Arc::new(AttemptObservation::default()),
         })
+    }
+
+    /// Marks a panicked attempt unconfirmed while retaining owner and action.
+    pub(in crate::v02::resource::recovery) fn mark_unconfirmed(
+        &self,
+        generation: u64,
+        panic: Box<dyn std::any::Any + Send + 'static>,
+    ) {
+        let mut state = lock(&self.state);
+        if state.phase == RecoveryPhase::Running && state.generation == generation {
+            state.phase = RecoveryPhase::Unconfirmed;
+            state.retry_disabled = true;
+            state.panic = Some(panic);
+        }
     }
 
     /// Marks a pending or unconfirmed recovery group as transferred.

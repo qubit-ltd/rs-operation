@@ -119,6 +119,67 @@ mod tests {
         calls: AtomicUsize,
         gate: Arc<Gate>,
     }
+
+    struct PanicCleanup {
+        calls: AtomicUsize,
+        poll: bool,
+    }
+    impl super::super::cleanup::AsyncCleanup<Probe> for PanicCleanup {
+        fn cleanup(
+            self: Arc<Self>,
+            resource: Probe,
+            _context: crate::v02::context::CleanupContext,
+        ) -> super::super::cleanup::CleanupFuture<Probe> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Box::pin(async move { ErrCleanup::failed(resource) });
+            }
+            if self.poll {
+                Box::pin(async move {
+                    let _resource = resource;
+                    panic!("cleanup poll panic");
+                })
+            } else {
+                panic!("cleanup construction panic");
+            }
+        }
+    }
+
+    fn panic_cleanup_group(
+        poll: bool,
+        store: bool,
+    ) -> (Arc<RecoveryCore>, Option<super::RecoveryStore>) {
+        use crate::v02::manager::capacity::ManagerCapacityPools;
+        use crate::v02::manager::capacity::ScopeCapacity;
+        use crate::v02::report::ManagerLimits;
+        use crate::v02::report::ScopeLimits;
+
+        let manager = ManagerId::new_unique();
+        let resource_id = ResourceId::new(manager, 10, 1);
+        let pools = ManagerCapacityPools::new(ManagerLimits::default());
+        let registration = ScopeCapacity::root(&pools, 83, ScopeLimits::default())
+            .resource_registration()
+            .unwrap();
+        let policy: Arc<dyn super::super::cleanup::AsyncCleanup<Probe>> = Arc::new(PanicCleanup {
+            calls: AtomicUsize::new(0),
+            poll,
+        });
+        let (payload, action) = super::async_owner(
+            resource_id,
+            Probe(Arc::new(AtomicUsize::new(0))),
+            policy,
+            registration,
+        );
+        let group = Arc::new(RecoveryCore::new(vec![resource_id], payload, action));
+        let recovery_store = store.then(|| {
+            super::RecoveryStore::new(crate::v02::report::RecoveryStoreOptions::default()).unwrap()
+        });
+        if let Some(recovery_store) = &recovery_store {
+            if let Err((_error, _group)) = recovery_store.accept(Arc::clone(&group)) {
+                panic!("store rejected recovery group");
+            }
+        }
+        (group, recovery_store)
+    }
     impl super::super::cleanup::AsyncCleanup<Probe> for FlakyCleanup {
         fn cleanup(
             self: Arc<Self>,
@@ -458,6 +519,125 @@ mod tests {
         let attempt = group.try_retry().unwrap();
         drop(attempt);
         assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Unconfirmed);
+    }
+
+    struct PanicRetry;
+    impl RecoveryAction for PanicRetry {
+        fn retry(&self, _payload: Arc<dyn std::any::Any + Send + Sync>) -> super::RecoveryFuture {
+            panic!("retry construction panic")
+        }
+    }
+
+    struct PanicPoll;
+    impl RecoveryAction for PanicPoll {
+        fn retry(&self, _payload: Arc<dyn std::any::Any + Send + Sync>) -> super::RecoveryFuture {
+            Box::pin(std::future::poll_fn(
+                |_| -> Poll<Result<(), CleanupFailure>> { panic!("retry poll panic") },
+            ))
+        }
+    }
+
+    #[test]
+    fn test_retry_construction_panic_publishes_unconfirmed_report() {
+        let manager = ManagerId::new_unique();
+        let group = Arc::new(RecoveryCore::new(
+            vec![ResourceId::new(manager, 7, 1)],
+            Arc::new(()),
+            Arc::new(PanicRetry),
+        ));
+        let attempt = group.try_retry().unwrap();
+        let report = super::block_on(attempt.wait_async());
+        assert_eq!(
+            report.recovery.phase,
+            crate::v02::report::RecoveryPhase::Unconfirmed
+        );
+        assert_eq!(
+            group.snapshot().phase,
+            crate::v02::report::RecoveryPhase::Unconfirmed
+        );
+        assert!(group.try_retry().is_err());
+    }
+
+    #[test]
+    fn test_retry_poll_panic_publishes_unconfirmed_report() {
+        let manager = ManagerId::new_unique();
+        let group = Arc::new(RecoveryCore::new(
+            vec![ResourceId::new(manager, 8, 1)],
+            Arc::new(()),
+            Arc::new(PanicPoll),
+        ));
+        let attempt = group.try_retry().unwrap();
+        let report = super::block_on(attempt.wait_async());
+        assert_eq!(
+            report.recovery.phase,
+            crate::v02::report::RecoveryPhase::Unconfirmed
+        );
+        assert_eq!(
+            group.snapshot().phase,
+            crate::v02::report::RecoveryPhase::Unconfirmed
+        );
+        assert!(group.try_retry().is_err());
+    }
+
+    #[test]
+    fn test_store_retry_panic_publishes_unconfirmed_and_keeps_record() {
+        let manager = ManagerId::new_unique();
+        let group = Arc::new(RecoveryCore::new(
+            vec![ResourceId::new(manager, 9, 1)],
+            Arc::new(()),
+            Arc::new(PanicPoll),
+        ));
+        let store =
+            super::RecoveryStore::new(crate::v02::report::RecoveryStoreOptions::default()).unwrap();
+        let id = group.id();
+        if let Err((_error, _group)) = store.accept(Arc::clone(&group)) {
+            panic!("store rejected recovery group");
+        }
+        let report = store.try_retry(id).unwrap().wait().unwrap();
+        assert_eq!(
+            report.recovery.phase,
+            crate::v02::report::RecoveryPhase::Unconfirmed
+        );
+        assert_eq!(
+            group.snapshot().phase,
+            crate::v02::report::RecoveryPhase::Unconfirmed
+        );
+        assert!(store.contains(id));
+        assert!(store.try_retry(id).is_err());
+        store
+            .request_shutdown()
+            .wait_for(Duration::from_secs(2))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_async_cleanup_panics_are_unconfirmed_direct_and_in_store() {
+        for (poll, in_store) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (group, store) = panic_cleanup_group(poll, in_store);
+            let attempt = if let Some(store) = &store {
+                store.try_retry(group.id()).unwrap()
+            } else {
+                group.try_retry().unwrap()
+            };
+            let first = attempt.wait().unwrap();
+            assert_eq!(first.recovery.phase, RecoveryPhase::Pending);
+            let attempt = if let Some(store) = &store {
+                store.try_retry(group.id()).unwrap()
+            } else {
+                group.try_retry().unwrap()
+            };
+            let report = attempt.wait().unwrap();
+            assert_eq!(report.recovery.phase, RecoveryPhase::Unconfirmed);
+            assert_eq!(group.snapshot().phase, RecoveryPhase::Unconfirmed);
+            assert!(group.try_retry().is_err());
+            if let Some(store) = store {
+                assert!(store.contains(group.id()));
+                store
+                    .request_shutdown()
+                    .wait_for(Duration::from_secs(2))
+                    .unwrap();
+            }
+        }
     }
 
     #[test]

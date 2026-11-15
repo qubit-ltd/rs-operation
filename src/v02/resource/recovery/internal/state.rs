@@ -28,4 +28,8 @@ pub(in crate::v02::resource::recovery) struct State {
     pub(super) action: Option<Arc<dyn RecoveryAction>>,
     /// Cleanup failures accumulated across retry attempts.
     pub(super) failures: Vec<CleanupFailure>,
+    /// A panic made automatic retry unsafe while ownership remains unresolved.
+    pub(super) retry_disabled: bool,
+    /// Panic payload retained after a retry becomes unconfirmed.
+    pub(super) panic: Option<Box<dyn std::any::Any + Send + 'static>>,
 }
