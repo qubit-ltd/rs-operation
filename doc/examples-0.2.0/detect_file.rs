@@ -1,7 +1,15 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
 use std::error::Error;
 use std::fs::File;
+use std::io;
 use std::io::Read;
-use std::io::{self};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -13,17 +21,46 @@ use qubit_operation::OperationOutcome;
 use qubit_operation::ShutdownMode;
 use qubit_operation::ShutdownWait;
 
+/// File resource managed by the operation while its header is inspected.
 struct InputFile {
+    /// Serializes mutable reads when the managed file is shared with workers.
     file: Mutex<File>,
 }
 
 impl InputFile {
+    /// Opens a file for the operation's managed-resource example.
+    ///
+    /// # Parameters
+    ///
+    /// - `path`: filesystem path passed to the example executable.
+    ///
+    /// # Returns
+    ///
+    /// A mutex-protected file handle ready for header inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error from opening `path`.
     fn open(path: PathBuf) -> io::Result<Self> {
         Ok(Self {
             file: Mutex::new(File::open(path)?),
         })
     }
 
+    /// Reads the first five bytes and checks for the PDF signature.
+    ///
+    /// The file cursor advances by five bytes. A mutex-poison error is mapped
+    /// to `io::Error` so the example can propagate it through its operation.
+    ///
+    /// # Returns
+    ///
+    /// `Some("application/pdf")` for a `%PDF-` prefix, or `None` for any other
+    /// five-byte header.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the lock is poisoned or the header cannot be
+    /// read completely.
     fn detect(&self) -> io::Result<Option<&'static str>> {
         let mut file = self.file.lock().map_err(|_| io::Error::other("input lock poisoned"))?;
         let mut header = [0_u8; 5];

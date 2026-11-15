@@ -1,6 +1,14 @@
-include!("../doc/examples-0.2.0/submission_context.rs");
-
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+use qubit_operation::OperationOutcome as SubmissionOutcome;
 use qubit_operation::ShutdownMode;
+
+include!("../doc/examples-0.2.0/submission_context.rs");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manager = OperationManager::new(Default::default())?;
@@ -10,10 +18,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut request = submit_scan_request(&manager, b"nested scan".to_vec())?;
     match request.wait_outcome()? {
-        qubit_operation::OperationOutcome::Succeeded(id) => println!("request: {id}"),
+        SubmissionOutcome::Succeeded(id) => println!("request: {id}"),
         other => eprintln!("request failed: {other:?}"),
     }
     println!("request released: {}", request.wait_settlement()?.all_released());
-    manager.request_shutdown(ShutdownMode::Drain).wait()?;
+    let shutdown_report = manager.request_shutdown(ShutdownMode::Drain).wait()?;
+    assert_eq!(shutdown_report.snapshot.active_operations, 0);
     Ok(())
 }

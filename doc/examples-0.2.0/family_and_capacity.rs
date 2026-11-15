@@ -1,3 +1,10 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
 use qubit_operation::AdmissionError;
 use qubit_operation::AsyncOperationHandle;
 use qubit_operation::AsyncOperationManager;
@@ -11,6 +18,10 @@ struct FileSummary {
     mime: Option<&'static str>,
 }
 
+/// Submits a parent operation that summarizes file bytes in a managed child.
+///
+/// The child uses the manager derived from the parent scope, keeping both
+/// operations in the same operation family.
 fn submit_file_summary(
     manager: &AsyncOperationManager,
     bytes: Vec<u8>,
@@ -42,6 +53,10 @@ fn submit_file_summary(
         .map_err(|error| error.into_parts().0)
 }
 
+/// Creates a manager with explicit child-operation and resource limits.
+///
+/// The resource limit is supplied by the caller so the example can show how
+/// manager-level scope limits are configured.
 fn create_capacity_demo_manager(resource_limit: usize) -> Result<AsyncOperationManager, String> {
     let mut options = ManagerOptions::default();
     options.scope_limits.child_operations = 2;
@@ -49,6 +64,10 @@ fn create_capacity_demo_manager(resource_limit: usize) -> Result<AsyncOperationM
     AsyncOperationManager::new(options).map_err(|e| e.to_string())
 }
 
+/// Submits a parent and child operation with explicit per-operation limits.
+///
+/// The parent manages input and request metadata; the child manages a copied
+/// portion of that input to demonstrate resource accounting across a family.
 fn submit_capacity_demo(
     manager: &AsyncOperationManager,
     resource_limit: usize,

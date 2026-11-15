@@ -39,7 +39,8 @@ pub struct ManagerLimits {
     pub cleanup_concurrency: usize, pub diagnostic_events: usize,
 }
 pub struct ScopeLimits {
-    pub child_operations: usize, pub resources: usize, pub effect_records: usize,
+    pub child_operations: usize, pub resources: usize,
+    pub resource_scopes: usize, pub effect_records: usize,
 }
 pub enum ChildFailurePolicy { StopSiblings, ContinueSiblings }
 pub enum ChildRequirement { Required, Optional }
@@ -54,7 +55,7 @@ impl<F> SubmitError<F> {
 }
 ```
 
-容量默认值为 manager：active 4、queued 64、admission waiters 64、未取 outcomes 64、清理并行 4、diagnostic events 256；scope：后代 child 数 64（含其后代、不含自身）、资源登记 128、副作用记录 64（含其后代）。`OperationOptions.requirement` 默认 Required，仅有父级时参与父成功判定。
+容量默认值为 manager：active 4、queued 64、admission waiters 64、未取 outcomes 64、清理并行 4、diagnostic events 256；scope：后代 child 数 64（含其后代、不含自身）、资源登记 128、附属 ResourceScope 数 64、副作用记录 64（含其后代）。附属 ResourceScope 数和资源登记数沿父链分别计量；scope 名额持有到该 ResourceScope settlement 稳定后归还。`OperationOptions.requirement` 默认 Required，仅有父级时参与父成功判定。
 
 **冻结的标准库 `Default` 实现：** `ManagerLimits`、`ScopeLimits`、`PortableExecutorOptions`、`ThreadPoolExecutorOptions`、`ContextOptions`、`ManagerOptions`、`OperationOptions` 均实现 `Default`。四个设计 §8 配置 struct 的默认值如下：
 
@@ -68,6 +69,7 @@ impl<F> SubmitError<F> {
 | `ManagerLimits.diagnostic_events` | 256 |
 | `ScopeLimits.child_operations` | 64 |
 | `ScopeLimits.resources` | 128 |
+| `ScopeLimits.resource_scopes` | 64 |
 | `ScopeLimits.effect_records` | 64 |
 | `OperationOptions.requirement` | `ChildRequirement::Required` |
 | `OperationOptions.limits` | `ScopeLimits::default()` |

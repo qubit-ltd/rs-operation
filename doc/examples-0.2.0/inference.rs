@@ -1,3 +1,10 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
 use std::sync::Arc;
 
 use qubit_operation::AdmissionError;
@@ -7,10 +14,30 @@ use qubit_operation::OperationOptions;
 use qubit_operation::OperationOutcome;
 use qubit_operation::ResourceScopeOptions;
 
+/// Supplies the model implementation used by the inference example.
+///
+/// A backend receives a borrowed feature vector and returns a prediction vector
+/// or an error describing why inference could not be completed.
 pub trait ModelBackend: Send + Sync + 'static {
+    /// Runs inference for one borrowed feature vector.
     fn infer(&self, features: &[f32]) -> Result<Vec<f32>, String>;
 }
 
+/// Submits inference as a child operation of an asynchronous parent operation.
+///
+/// The parent keeps the managed feature vector alive while the child invokes
+/// the backend, then returns the child's prediction or outcome as its result.
+///
+/// # Parameters
+///
+/// - `manager`: Manager that accepts the parent operation.
+/// - `model`: Thread-safe backend retained by the child operation.
+/// - `features`: Feature values moved into the parent's managed resource scope.
+///
+/// # Returns
+///
+/// Returns a handle for observing the parent operation, or an admission error
+/// when the manager cannot accept it.
 pub fn submit_inference(
     manager: &AsyncOperationManager,
     model: Arc<dyn ModelBackend>,

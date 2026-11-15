@@ -843,13 +843,16 @@ submit 会等待准入；同步方法阻塞当前调用线程，异步方法 awa
 | 清理并发 | manager 下所有正在运行的清理步骤 | 一次清理实际结束时；清理失败保留资源，但不一直占 worker |
 | 子操作名额 | 当前操作的所有后代，不包括它自己 | 子收尾报告稳定，且其 typed 结果已取出或放弃后 |
 | 资源登记名额 | 当前操作及其所有后代的资源 | 该登记不再承担清理或恢复责任时 |
+| ResourceScope 实例名额 | 当前操作及其所有后代创建并附着的局部 ResourceScope | ResourceScope settlement 稳定后；仅结束父操作或调用 end 不提前归还 |
 | 局部 ResourceScope 容量 | 该局部范围的资源 | 同上；还必须满足根和沿途祖先的额度 |
 
 不同限制需要同时满足。例如结果槽总额为 64，根 handle 已保留一个结果槽时，最多还能同时预留 63 个其他结果槽；把子名额设置为 64，并不保证 64 次子提交全部可以成功。消费结果或 into_observer 可以归还结果槽，但子操作仍须满足自己的收尾条件，才归还子名额。
 
 例如根允许两个子名额：根创建 B 占一个，B 创建 C 再占一个，根池就满了。无论根还是 B 再创建任务，都不能绕过这两个名额的总限制。B 还可以有更低的局部上限，但把 B 的配置写得更大不会放宽根的限制；创建 B 时也不预留 B 配置中声明的全部名额。
 
-资源也按整棵子树合并计数。根登记输入，B 登记临时缓冲区，各占一个资源名额；B 对输入 clone 一份 ResourceRef 不增加资源名额。新建 ResourceScope 也不新增总额度，只是在总额内增加一个局部限制。
+资源登记也按整棵子树合并计数。根登记输入，B 登记临时缓冲区，各占一个资源名额；B 对输入 clone 一份 ResourceRef 不增加资源名额。`ScopeLimits.resources` 限制资源登记数，`ResourceScopeOptions.capacity` 再限制单个 ResourceScope 内的资源数。
+
+创建一个附着到操作的 ResourceScope 还会单独消耗一个 `ScopeLimits.resource_scopes` 名额；它与资源登记额度分开计数。默认每个操作 scope 可同时拥有 64 个附属 ResourceScope，子操作创建的 scope 同时计入沿途祖先的额度。额度在该 ResourceScope 的 settlement 稳定后归还，因此只创建空 scope 也会受限，不能通过反复创建空 scope 绕过资源登记上限。服务级 `ServiceResourceScope` 使用独立配额，不计入操作 scope 的该额度。
 
 OperationOptions.limits 沿父链收紧，实际按各字段与继承上限取较小值。因此默认值 64、128 不会覆盖父级更小的配置。额度限制尚未退还的占用，归还后可以再次使用；若要限制请求一生累计执行的任务数，应使用另一个 ResourceBudget，不要把并发容量当作累计消耗。
 
