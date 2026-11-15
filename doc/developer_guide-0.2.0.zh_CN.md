@@ -132,7 +132,7 @@ Result<OperationHandle<T, E>, SubmitError<F>>
 
 F 是传入的闭包类型；本例的 T 是 `Option<&'static str>`，E 是 String。因此 operation 是 `OperationHandle<Option<&'static str>, String>`。
 
-提交成功只表示任务已经交给管理器，不表示业务已执行完成。闭包由同步执行器调用，try_submit 本身不等待空闲容量；无容量或管理器已关闭时，SubmitError 保留尚未执行的闭包。需要等待准入时使用同名参数形式的 submit。
+提交成功只表示任务已经交给管理器，不表示业务已执行完成。闭包由同步执行器调用，try_submit 本身不等待容量；无容量或管理器已关闭时，SubmitError 保留尚未执行的闭包。需要等待准入时使用同名参数形式的 submit。submit 有界等待相关 manager、父 scope 与 group 容量，不会因 group 已满而忙循环；丢弃仍在等待的提交会取消本次等待并归还有界等待者名额。等待不保证 FIFO，也不预留下一名额。
 
 闭包自己的返回值是 `Result<T, E>`。它与提交结果处在不同阶段：文件读取失败属于业务 E，不会变成 SubmitError。不要只检查提交成功就响应“检测成功”。
 
@@ -908,7 +908,7 @@ OperationOptions.context 接受 ContextOptions，其中可以配置 ClockSource�
 
 一个应用通常长期持有 manager，每次请求提交独立操作。OperationGroup/AsyncOperationGroup 划分某个领域服务的准入和关闭范围；跨请求资源由 ServiceResourceScope 管理，请求只持有资源引用。
 
-关闭顺序是停止准入，再等待操作和资源。Drain 允许已接纳操作完成必要子工作；Cancel 进一步请求停止并禁止新子提交。Drain 可以升级到 Cancel，不可重新开放准入。
+关闭顺序是停止准入，再等待操作和资源。准入关闭后，等待中的根 submit 会及时返回拒绝；Drain 时仍符合条件的已接纳父操作可以继续提交后代。关闭 group 也会唤醒相关等待者。Drain 允许已接纳操作完成必要子工作；Cancel 进一步请求停止、禁止新子提交并中断准入等待。Drain 可以升级到 Cancel，不可重新开放准入。
 
 `request_shutdown` 立即返回 `ShutdownHandle` 或 `AsyncShutdownHandle`。同步和异步 `wait()` 都返回 `Result<ShutdownReport, ObservationError>`；在目标自身操作中等待会得到 `WouldDeadlock`。同步 `wait_for(Duration::ZERO)` 只做快照检查，即使从目标操作内调用也不会阻塞；正时长等待若依赖当前操作结束则返回 `WouldDeadlock`。异步 `wait_until` 先验证时钟和时间域，再检查完成状态；已过期的 deadline 返回 `Pending`，不等待也不报自等待错误。
 

@@ -144,7 +144,7 @@ Use recovery handles to inspect or retry a recovery group explicitly. Do not ret
 
 ### 8.1 Backpressure
 
-`Busy` means an admission limit or result capacity prevented acceptance. Inspect the manager or group snapshot, consume old results, resolve recovery, or reject/defer the request. Waiting for capacity from a worker that must finish before capacity is freed creates a dependency; the framework may return `WouldDeadlock`.
+`Busy` means an admission limit or result capacity prevented acceptance. Inspect the manager or group snapshot, consume old results, resolve recovery, or reject/defer the request. `try_submit` returns this result immediately; `submit` waits for the relevant manager, parent-scope, and group capacity without polling in a busy loop. Dropping a pending submission cancels that wait and releases its bounded waiter registration. The wait is not FIFO and does not reserve the next slot. Waiting for capacity from a worker that must finish before capacity is freed creates a dependency; the framework may return `WouldDeadlock`.
 
 ### 8.2 Deadlines and stopping
 
@@ -154,7 +154,7 @@ Deadlines constrain waits; stop requests ask work to stop. They are separate con
 
 An application usually owns a long-lived manager and submits one operation per request. `OperationGroup` and `AsyncOperationGroup` define local admission and shutdown boundaries for a service. `ServiceResourceScope` owns resources shared across requests; each request holds a `ResourceRef`.
 
-Stop admission, then wait for accepted operations and resources. `ShutdownMode::Drain` lets accepted work finish required child work. `Cancel` additionally requests stopping and prevents new child submissions. A shutdown policy can upgrade from Drain to Cancel; it cannot downgrade or reopen admission. After shutdown, `mode()` continues to report the applied policy, even when a Drain has completed.
+Stop admission, then wait for accepted operations and resources. A pending root `submit` is rejected promptly when manager admission closes; an accepted parent may still submit descendants during Drain while its scope remains eligible. Closing a group also wakes its waiting submissions. `ShutdownMode::Drain` lets accepted work finish required child work. `Cancel` additionally requests stopping and prevents new child submissions, and interrupts pending admission waits. A shutdown policy can upgrade from Drain to Cancel; it cannot downgrade or reopen admission. After shutdown, `mode()` continues to report the applied policy, even when a Drain has completed.
 
 `request_shutdown` returns a `ShutdownHandle` or `AsyncShutdownHandle`. Both `wait()` methods have the signature `Result<ShutdownReport, ObservationError>`; waiting from an operation included in the target returns `ObservationError::WouldDeadlock`. Handle the error explicitly, for example:
 
