@@ -165,8 +165,7 @@ mod tests {
         let registration = ScopeCapacity::root(&pools, 81, ScopeLimits::default())
             .resource_registration()
             .unwrap();
-        let (payload, action) =
-            super::async_owner(resource_id, Probe(Arc::clone(&drops)), policy, registration);
+        let (payload, action) = super::async_owner(resource_id, Probe(Arc::clone(&drops)), policy, registration);
         let group = Arc::new(RecoveryCore::new(vec![resource_id], payload, action));
         let handle = super::RecoveryHandle::new(Arc::clone(&group));
         let store = super::RecoveryStore::new(super::RecoveryStoreOptions::default()).unwrap();
@@ -190,20 +189,12 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while group.snapshot().phase != RecoveryPhase::Resolved {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "store retry did not finish"
-            );
+            assert!(std::time::Instant::now() < deadline, "store retry did not finish");
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(policy_owner.calls.load(Ordering::SeqCst), 2);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert!(
-            store
-                .request_shutdown()
-                .wait_for(Duration::from_secs(2))
-                .unwrap()
-        );
+        assert!(store.request_shutdown().wait_for(Duration::from_secs(2)).unwrap());
     }
 
     struct ErrCleanup;
@@ -243,19 +234,13 @@ mod tests {
         assert_eq!(transfer.recovery, id);
         assert_eq!(transfer.receipt.recovery(), id);
         assert!(store.contains(id));
-        assert_eq!(
-            handle.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Transferred
-        );
+        assert_eq!(handle.snapshot().phase, crate::v02::report::RecoveryPhase::Transferred);
         assert_eq!(store.snapshot().groups, 1);
         let shutdown = store.request_shutdown();
         assert!(!shutdown.wait_for(Duration::ZERO).unwrap());
         let attempt = store.try_retry(id).unwrap();
         let report = attempt.wait().unwrap();
-        assert_eq!(
-            report.recovery.phase,
-            crate::v02::report::RecoveryPhase::Resolved
-        );
+        assert_eq!(report.recovery.phase, crate::v02::report::RecoveryPhase::Resolved);
         assert!(shutdown.wait_for(Duration::from_secs(2)).unwrap());
         assert!(shutdown.is_complete());
     }
@@ -317,8 +302,7 @@ mod tests {
         };
         observer_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         release_tx.send(()).unwrap();
-        let expected =
-            Err(crate::v02::resource::recovery::RecoveryStoreShutdownError::WorkerPanicked);
+        let expected = Err(crate::v02::resource::recovery::RecoveryStoreShutdownError::WorkerPanicked);
         assert_eq!(first.join().unwrap(), expected);
         assert_eq!(second.join().unwrap(), expected);
         assert_eq!(clone.wait(), expected);
@@ -418,20 +402,14 @@ mod tests {
         let group = group();
         let attempt = group.try_retry().unwrap();
         drop(attempt);
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Unconfirmed
-        );
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Unconfirmed);
     }
 
     #[test]
     fn test_recovery_store_handoff_is_bounded_and_signed() {
         let manager = ManagerId::new_unique();
         let group = Arc::new(RecoveryCore::new(
-            vec![
-                ResourceId::new(manager, 1, 1),
-                ResourceId::new(manager, 2, 1),
-            ],
+            vec![ResourceId::new(manager, 1, 1), ResourceId::new(manager, 2, 1)],
             Arc::new(()),
             Arc::new(Noop),
         ));
@@ -442,10 +420,7 @@ mod tests {
             handle.transfer_to(&too_small),
             Err(crate::v02::report::RecoveryTransferError::CapacityExceeded)
         );
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Pending
-        );
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Pending);
 
         let store = super::RecoveryStore::with_capacity(1, 2).unwrap();
         let transfer = match store.accept(Arc::clone(&group)) {
@@ -455,20 +430,11 @@ mod tests {
         assert_eq!(transfer.recovery, group.id());
         assert_eq!(transfer.receiver, transfer.receipt.receiver());
         assert!(store.contains(group.id()));
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Transferred
-        );
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Transferred);
 
         let attempt = store.try_retry(group.id()).unwrap();
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Running
-        );
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Running);
         attempt.finish(Ok(()));
-        assert_eq!(
-            group.snapshot().phase,
-            crate::v02::report::RecoveryPhase::Resolved
-        );
+        assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Resolved);
     }
 }

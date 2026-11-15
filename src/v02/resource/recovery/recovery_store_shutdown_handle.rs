@@ -111,9 +111,7 @@ impl RecoveryStoreShutdownHandle {
             while state.result.is_none() {
                 state = changed.wait(state).unwrap_or_else(PoisonError::into_inner);
             }
-            return state
-                .result
-                .expect("shutdown result was set before notification");
+            return state.result.expect("shutdown result was set before notification");
         }
         state.started = true;
         drop(state);

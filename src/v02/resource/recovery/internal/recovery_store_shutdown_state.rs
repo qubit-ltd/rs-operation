@@ -11,6 +11,5 @@ pub(in crate::v02::resource::recovery) struct RecoveryStoreShutdownState {
     /// Whether a caller has claimed the one-shot shutdown operation.
     pub(in crate::v02::resource::recovery) started: bool,
     /// Final result after executor and worker shutdown has finished.
-    pub(in crate::v02::resource::recovery) result:
-        Option<Result<(), super::super::RecoveryStoreShutdownError>>,
+    pub(in crate::v02::resource::recovery) result: Option<Result<(), super::super::RecoveryStoreShutdownError>>,
 }

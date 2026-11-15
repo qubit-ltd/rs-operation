@@ -30,6 +30,9 @@ use crate::v02::resource::recovery::lock;
 use crate::v02::resource::recovery::next_transfer_nonce;
 use crate::v02::resource::recovery::store_usage;
 
+#[cfg(test)]
+pub(super) type CallbackInstallGate = Arc<Mutex<Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>>>;
+
 /// Bounded receiver that owns recovery groups after they leave a resource
 /// scope.
 ///
@@ -69,14 +72,13 @@ pub struct RecoveryStore {
     /// Worker threads serving asynchronous cleanup retries.
     pub(in crate::v02::resource::recovery) async_workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
     /// Shared shutdown state and notification for blocking waiters.
-    pub(in crate::v02::resource::recovery) shutdown:
-        Arc<(Mutex<RecoveryStoreShutdownState>, std::sync::Condvar)>,
+    pub(in crate::v02::resource::recovery) shutdown: Arc<(Mutex<RecoveryStoreShutdownState>, std::sync::Condvar)>,
     /// Notification source for asynchronous shutdown observers.
     pub(in crate::v02::resource::recovery) shutdown_notify: Arc<Notify>,
-    /// Test-only gate for exercising publication before terminal callback installation.
+    /// Test-only gate for exercising publication before terminal callback
+    /// installation.
     #[cfg(test)]
-    pub(super) callback_install_gate:
-        Arc<Mutex<Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>>>,
+    pub(super) callback_install_gate: CallbackInstallGate,
 }
 
 impl RecoveryStore {
@@ -110,9 +112,7 @@ impl RecoveryStore {
                 field: "cleanup_concurrency",
             });
         }
-        if options.cleanup_executor.worker_count == 0
-            || options.cleanup_executor.queue_capacity == 0
-        {
+        if options.cleanup_executor.worker_count == 0 || options.cleanup_executor.queue_capacity == 0 {
             return Err(RecoveryStoreCreateError::InvalidOptions {
                 field: "cleanup_executor",
             });
@@ -161,15 +161,8 @@ impl RecoveryStore {
             )
             .ok()?,
         );
-        let workers = executor
-            .start_async_workers(1, "qubit-operation-recovery-test")
-            .ok()?;
-        Some(Self::from_parts(
-            group_capacity,
-            resource_capacity,
-            executor,
-            workers,
-        ))
+        let workers = executor.start_async_workers(1, "qubit-operation-recovery-test").ok()?;
+        Some(Self::from_parts(group_capacity, resource_capacity, executor, workers))
     }
 
     /// Initializes shared store state after its executor workers are ready.
@@ -246,10 +239,7 @@ impl RecoveryStore {
     ///
     /// Returns an error if the group is absent or resolved, another attempt is
     /// running, executor capacity is unavailable, or no retry action exists.
-    pub fn try_retry(
-        &self,
-        id: RecoveryId,
-    ) -> Result<RecoveryAttempt, crate::v02::report::RetryError> {
+    pub fn try_retry(&self, id: RecoveryId) -> Result<RecoveryAttempt, crate::v02::report::RetryError> {
         let group = lock(&self.state)
             .groups
             .get(&id)
@@ -288,9 +278,7 @@ impl RecoveryStore {
     /// shutdown.
     pub fn request_shutdown(&self) -> RecoveryStoreShutdownHandle {
         self.close_admission();
-        RecoveryStoreShutdownHandle {
-            store: self.clone(),
-        }
+        RecoveryStoreShutdownHandle { store: self.clone() }
     }
 
     /// Returns counts and admission state for the retained recovery groups.
@@ -437,9 +425,7 @@ impl RecoveryStore {
             let resolved = state
                 .groups
                 .iter()
-                .filter_map(|(id, group)| {
-                    (group.snapshot().phase == RecoveryPhase::Resolved).then_some(*id)
-                })
+                .filter_map(|(id, group)| (group.snapshot().phase == RecoveryPhase::Resolved).then_some(*id))
                 .collect::<Vec<_>>();
             resolved
                 .into_iter()
