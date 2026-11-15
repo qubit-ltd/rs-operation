@@ -812,7 +812,7 @@ fn retry_report(report: &SettlementReport) -> Result<(), ObservationError> {
 
 未确认还有实际使用者的资源不能通过“重试清理”强行删除。先确认使用已结束，再处理清理失败。manager 内的未解决恢复组会阻止整体关闭，这是责任尚未完成的信号。
 
-操作主体在构造 Future 或轮询时发生的 panic，会在完成生命周期和容量记账后报告为 `Panicked`。恢复清理期间发生 panic 时报告为 `Unconfirmed`：框架保留恢复责任，不把资源当作已经释放。直接执行重试时，第一个被 poll 的等待者驱动清理；若丢弃这个仍在等待的 Future，执行会停止，未完成的清理 Future 会被保留，并发布 `Unconfirmed` 唤醒其他观察者。丢弃非驱动观察者只取消该等待。由 store worker 执行时，丢弃观察者只取消观察，worker 继续执行。两类取消都不代表资源已释放。这些 panic 保证适用于 unwind，不涵盖 `panic = "abort"`。
+操作主体在构造、轮询或可捕获的最终 Future 析构时发生的 panic，会在完成生命周期和容量记账后报告为 `Panicked`。这不保证恢复 `panic = "abort"`，也不涵盖析构在另一次 unwind 中再次 panic 导致的进程终止。恢复清理期间发生 panic 时报告为 `Unconfirmed`：框架保留恢复责任，不把资源当作已经释放。直接执行重试时，第一个被 poll 的等待者驱动清理；若丢弃这个仍在等待的 Future，执行会停止，未完成的清理 Future 会被保留，并发布 `Unconfirmed` 唤醒其他观察者。丢弃非驱动观察者只取消该等待。由 store worker 执行时，丢弃观察者只取消观察，worker 继续执行。两类取消都不代表资源已释放。
 
 `RecoveryStore::request_shutdown` 会关闭新组准入并返回可克隆的 `RecoveryStoreShutdownHandle`。各克隆以及重复调用 `wait`、`wait_async` 或 `wait_for` 都观察同一个最终结果。`is_complete()` 表示关闭收尾已结束，即使收尾结果是 `RecoveryStoreShutdownError` 也为真；应检查等待结果来区分成功与失败。丢弃仍在等待的 `wait_async` 只取消该观察者，不会重新开放 store、取消关闭或丢弃保留的恢复组。恢复组排空后，`wait_async` 仍会同步执行 executor 关闭和 worker join。
 
@@ -824,7 +824,11 @@ fn retry_report(report: &SettlementReport) -> Result<(), ObservationError> {
 
 try_submit 返回 Busy 时，先检查 manager.snapshot() 中的活动、排队、等待准入和未取结果计数。结果未取会继续占结果槽，恢复对象也会占资源额度；提高队列长度不能代替消费结果和处理恢复。
 
-默认活动 root 为 4，排队 root 为 64，结果槽为 64，每 root 子操作和资源分别为 64、128。这些都是可配置的初始值，64 不是固定上限。ManagerLimits 配置 manager 的容量，ManagerOptions.scope_limits 配置每个根操作的额度上限；OperationOptions.limits 可以进一步收紧单次请求的额度。父操作及其后代共享根操作的额度，创建子操作不会得到新的一套名额。
+默认活动 root 为 4，排队 root 为 64，结果槽为 64，每 root 子操作和资源分别为 64、128。这些都是可配置的默认值，64 不是固定上限。`ManagerLimits` 约束 manager 范围的活动操作、队列和结果等资源；`ManagerOptions.scope_limits` 是操作 scope 使用的默认配额，不是根操作不可覆盖的硬上限。`OperationOptions.limits` 整个结构等于 `ScopeLimits::default()` 时，manager 会用 `scope_limits` 整体替换它；这是整结构比较，不会逐字段合并。
+
+根操作显式提供非默认 `limits` 时，这组值直接成为根 scope 的配额，可以高于或低于 manager 的 scope 默认值。例如 manager 默认 `resources = 2` 时，完整默认的根请求采用 2，而显式设置 `resources = 3` 的根可接纳 3 个资源，设置为 1 的根最多接纳 1 个。根及其后代仍共享容量池；若父级有效配额为 2，子级请求 3 也不能突破父链的 2。子 scope 会先执行同样的默认替换，再逐字段与父级有效配置取较小值。
+
+例如 manager 将 `scope_limits.resources` 设为 2，仅把 `OperationOptions::default().limits.child_operations` 改为 3 时，整个 `limits` 已不等于默认结构，因此其余字段仍取 `OperationOptions` 默认值，而不会自动采用 manager 的 `resources = 2`。如果调用方想显式指定一组恰好等于 `ScopeLimits::default()` 的数值，当前接口无法区分“显式使用默认数值”和“继承 manager 默认值”。
 
 修改配置时可从默认值开始，例如：
 
