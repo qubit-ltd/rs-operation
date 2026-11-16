@@ -87,10 +87,7 @@ impl GroupCore {
     /// Returns the admission reason when shutdown or capacity prevents
     /// reservation.
     #[cfg(test)]
-    pub(crate) fn reserve(
-        self: &Arc<Self>,
-        descendant: bool,
-    ) -> Result<GroupPermit, AdmissionError> {
+    pub(crate) fn reserve(self: &Arc<Self>, descendant: bool) -> Result<GroupPermit, AdmissionError> {
         Self::reserve_many(std::slice::from_ref(self), descendant)
             .map(|mut permits| permits.pop().expect("one group produces one permit"))
     }
@@ -116,10 +113,7 @@ impl GroupCore {
     ///
     /// Returns the first admission reason if any group rejects the request;
     /// no group is reserved in that case.
-    pub(crate) fn reserve_many(
-        groups: &[Arc<Self>],
-        descendant: bool,
-    ) -> Result<Vec<GroupPermit>, AdmissionError> {
+    pub(crate) fn reserve_many(groups: &[Arc<Self>], descendant: bool) -> Result<Vec<GroupPermit>, AdmissionError> {
         let mut ordered = groups.to_vec();
         ordered.sort_unstable_by_key(|group| group.id);
         ordered.dedup_by_key(|group| group.id);
@@ -146,10 +140,7 @@ impl GroupCore {
 
         Ok(ordered
             .into_iter()
-            .map(|group| GroupPermit {
-                group,
-                released: false,
-            })
+            .map(|group| GroupPermit { group, released: false })
             .collect())
     }
 
@@ -186,10 +177,7 @@ impl GroupCore {
     ///
     /// - `self`: Group whose notifications are observed.
     /// - `generation`: Previously sampled notification generation.
-    pub(crate) fn admission_notified_since(
-        &self,
-        generation: u64,
-    ) -> crate::v02::internal::notify::Notified {
+    pub(crate) fn admission_notified_since(&self, generation: u64) -> crate::v02::internal::notify::Notified {
         self.notify.notified_since(generation)
     }
 
@@ -282,11 +270,7 @@ impl GroupCore {
     /// `true` if registration succeeded; cancellation mode rejects it.
     #[must_use]
     #[cfg(test)]
-    pub(crate) fn register_scope(
-        &self,
-        id: OperationId,
-        scope: Weak<crate::v02::scope::ScopeCore>,
-    ) -> bool {
+    pub(crate) fn register_scope(&self, id: OperationId, scope: Weak<crate::v02::scope::ScopeCore>) -> bool {
         let mut state = lock(&self.state);
         if state.mode == ShutdownMode::Cancel {
             return false;
@@ -343,11 +327,7 @@ impl GroupCore {
             if mode == ShutdownMode::Cancel {
                 state.mode = mode;
                 (
-                    state
-                        .scopes
-                        .values()
-                        .filter_map(Weak::upgrade)
-                        .collect::<Vec<_>>(),
+                    state.scopes.values().filter_map(Weak::upgrade).collect::<Vec<_>>(),
                     state
                         .services
                         .values()
@@ -468,9 +448,7 @@ impl GroupCore {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state = next;
                 if result.timed_out()
-                    && (state.active != 0
-                        || !state.services.is_empty()
-                        || !state.recoveries.is_empty())
+                    && (state.active != 0 || !state.services.is_empty() || !state.recoveries.is_empty())
                 {
                     return false;
                 }
@@ -570,11 +548,7 @@ impl GroupCore {
         let (operations, services) = {
             let state = lock(&self.state);
             (
-                state
-                    .scopes
-                    .values()
-                    .filter_map(Weak::upgrade)
-                    .collect::<Vec<_>>(),
+                state.scopes.values().filter_map(Weak::upgrade).collect::<Vec<_>>(),
                 state
                     .services
                     .values()
@@ -582,10 +556,7 @@ impl GroupCore {
                     .collect::<Vec<_>>(),
             )
         };
-        operations
-            .iter()
-            .map(|scope| scope.cleanup_in_flight())
-            .sum::<usize>()
+        operations.iter().map(|scope| scope.cleanup_in_flight()).sum::<usize>()
             + services
                 .iter()
                 .map(crate::v02::resource::ResourceScope::cleanup_in_flight)
@@ -632,11 +603,7 @@ impl GroupCore {
     /// - `handle`: Recovery handle whose active state changed.
     /// - `active`: Whether the handle should remain counted as active recovery.
     /// - `self`: Group core whose recovery accounting is updated.
-    pub(crate) fn recovery_changed(
-        &self,
-        handle: crate::v02::resource::RecoveryHandle,
-        active: bool,
-    ) {
+    pub(crate) fn recovery_changed(&self, handle: crate::v02::resource::RecoveryHandle, active: bool) {
         let removed = {
             let mut state = lock(&self.state);
             if active {
@@ -687,11 +654,7 @@ mod tests {
 
         let one = GroupCore::new(1);
         let two = GroupCore::new(1);
-        let (first, later) = if one.id < two.id {
-            (one, two)
-        } else {
-            (two, one)
-        };
+        let (first, later) = if one.id < two.id { (one, two) } else { (two, one) };
         let _later_full = GroupCore::reserve_many(std::slice::from_ref(&later), false).unwrap();
         let later_state = later.state.lock().unwrap();
         let (started_tx, started_rx) = mpsc::channel();
@@ -740,8 +703,7 @@ mod tests {
         } else {
             (later, first)
         };
-        let permits =
-            GroupCore::reserve_many(&[Arc::clone(&first), Arc::clone(&later)], false).unwrap();
+        let permits = GroupCore::reserve_many(&[Arc::clone(&first), Arc::clone(&later)], false).unwrap();
         later.begin_shutdown(ShutdownMode::Cancel);
         let operation = OperationId::new_unique();
 

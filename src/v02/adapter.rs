@@ -17,7 +17,6 @@ mod tests;
 
 pub use external_operation::ExternalBindError;
 pub use external_operation::PreparedExternalOperation;
-
 pub(crate) use internal::AdapterErrorKind;
 pub(crate) use internal::AdapterReservation;
 #[cfg(test)]

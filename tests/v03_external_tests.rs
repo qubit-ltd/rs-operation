@@ -6,6 +6,13 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
+use std::future::Future;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
+
 use qubit_operation::ChildOutcomeSummary;
 use qubit_operation::ChildRelease;
 use qubit_operation::ChildSnapshot;
@@ -18,10 +25,6 @@ use qubit_operation::PreparedExternalOperation;
 use qubit_operation::SettlementReport;
 use qubit_operation::StopReason;
 use qubit_operation::StopReport;
-use std::future::Future;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::task::{Wake, Waker};
 
 struct Prepared {
     activated: std::sync::atomic::AtomicUsize,
@@ -61,14 +64,11 @@ impl OperationControl for Prepared {
             0,
             "request_stop panic requested"
         );
-        self.stop_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.stop_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     fn snapshot(&self) -> ChildSnapshot {
         assert!(
-            !self
-                .panic_snapshot
-                .load(std::sync::atomic::Ordering::SeqCst),
+            !self.panic_snapshot.load(std::sync::atomic::Ordering::SeqCst),
             "snapshot panic requested"
         );
         ChildSnapshot {
@@ -86,8 +86,7 @@ impl OperationControl for Prepared {
             0,
             "poll_outcome panic requested"
         );
-        self.summary_polls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.summary_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if !self.summary_ready.load(std::sync::atomic::Ordering::SeqCst) {
             *self.summary_waker.lock().unwrap() = Some(cx.waker().clone());
             return Poll::Pending;
@@ -104,8 +103,7 @@ impl OperationControl for Prepared {
             0,
             "poll_release panic requested"
         );
-        self.release_polls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.release_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if !self.release_ready.load(std::sync::atomic::Ordering::SeqCst) {
             *self.release_waker.lock().unwrap() = Some(cx.waker().clone());
             return Poll::Pending;
@@ -121,12 +119,8 @@ impl OperationControl for Prepared {
             0,
             "poll_settlement panic requested"
         );
-        self.settlement_polls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if !self
-            .settlement_ready
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        self.settlement_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !self.settlement_ready.load(std::sync::atomic::Ordering::SeqCst) {
             *self.settlement_waker.lock().unwrap() = Some(cx.waker().clone());
             return Poll::Pending;
         }
@@ -161,16 +155,14 @@ impl OperationControl for Prepared {
 
 impl Prepared {
     fn release_settlement(&self) {
-        self.settlement_ready
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.settlement_ready.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(waker) = self.settlement_waker.lock().unwrap().take() {
             waker.wake();
         }
     }
 
     fn release_summary(&self) {
-        self.summary_ready
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.summary_ready.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(waker) = self.summary_waker.lock().unwrap().take() {
             waker.wake();
         }
@@ -205,16 +197,14 @@ impl Prepared {
     }
 
     fn release_outcome(&self) {
-        self.outcome_ready
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.outcome_ready.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(waker) = self.outcome_waker.lock().unwrap().take() {
             waker.wake();
         }
     }
 
     fn release_inputs(&self) {
-        self.release_ready
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release_ready.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(waker) = self.release_waker.lock().unwrap().take() {
             waker.wake();
         }
@@ -246,12 +236,9 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
         Ok(())
     }
     fn activate(self: Arc<Self>, scope: OperationScope) -> Result<(), ExecutionFailure> {
-        self.activated
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.activated.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         assert!(
-            !self
-                .panic_activate
-                .load(std::sync::atomic::Ordering::SeqCst),
+            !self.panic_activate.load(std::sync::atomic::Ordering::SeqCst),
             "activate panic requested"
         );
         if self.panic_flags.load(std::sync::atomic::Ordering::SeqCst) & 32 != 0 {
@@ -266,8 +253,7 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
         Ok(())
     }
     fn abandon(self: Arc<Self>) {
-        self.abandon_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.abandon_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     fn poll_take_outcome(&self, cx: &mut Context<'_>) -> Poll<OperationOutcome<usize, ()>> {
         assert_eq!(
@@ -275,8 +261,7 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
             0,
             "poll_take_outcome panic requested"
         );
-        self.outcome_polls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.outcome_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if !self.outcome_ready.load(std::sync::atomic::Ordering::SeqCst) {
             *self.outcome_waker.lock().unwrap() = Some(cx.waker().clone());
             return Poll::Pending;
@@ -316,11 +301,7 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .expect("external task should be admitted");
-    while prepared
-        .outcome_polls
-        .load(std::sync::atomic::Ordering::SeqCst)
-        == 0
-    {
+    while prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         std::thread::yield_now();
     }
     assert_eq!(
@@ -328,57 +309,33 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
         StopRequestStatus::Accepted
     );
     prepared.release_outcome();
-    assert!(matches!(
-        handle.wait_outcome().unwrap(),
-        OperationOutcome::Stopped(_)
-    ));
-    assert_eq!(
-        prepared.activated.load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
-    assert!(
-        prepared
-            .release_polls
-            .load(std::sync::atomic::Ordering::SeqCst)
-            >= 1
-    );
+    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
+    assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     for _ in 0..1000 {
         std::thread::yield_now();
     }
-    let polls_without_release = prepared
-        .release_polls
-        .load(std::sync::atomic::Ordering::SeqCst);
+    let polls_without_release = prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst);
     for _ in 0..1000 {
         std::thread::yield_now();
     }
     assert_eq!(
-        prepared
-            .release_polls
-            .load(std::sync::atomic::Ordering::SeqCst),
+        prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst),
         polls_without_release,
         "the retained driver must wait for a wake instead of busy polling"
     );
     prepared.release_inputs();
     handle.wait_settlement().unwrap();
-    let outcome_polls_after_ready = prepared
-        .outcome_polls
-        .load(std::sync::atomic::Ordering::SeqCst);
+    let outcome_polls_after_ready = prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst);
     for _ in 0..1000 {
         std::thread::yield_now();
     }
     assert_eq!(
-        prepared
-            .outcome_polls
-            .load(std::sync::atomic::Ordering::SeqCst),
+        prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst),
         outcome_polls_after_ready,
         "the driver must never poll the unique typed outcome after Ready"
     );
-    assert!(
-        prepared
-            .stop_calls
-            .load(std::sync::atomic::Ordering::SeqCst)
-            >= 1
-    );
+    assert!(prepared.stop_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     let second = manager
         .try_submit_external::<usize, (), _>(OperationOptions::default(), Arc::clone(&prepared))
         .err()
@@ -386,12 +343,7 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
     let (reason, returned) = second.into_parts();
     assert_eq!(reason, AdmissionError::AlreadyBound);
     assert!(Arc::ptr_eq(&returned, &prepared));
-    assert_eq!(
-        prepared
-            .abandon_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
+    assert_eq!(prepared.abandon_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -429,16 +381,8 @@ fn test_post_claim_bind_failure_is_accepted_and_abandoned_once() {
         handle.wait_outcome().unwrap(),
         OperationOutcome::ExecutionFailed(_)
     ));
-    assert_eq!(
-        prepared.activated.load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
-    assert_eq!(
-        prepared
-            .abandon_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
+    assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(prepared.abandon_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     handle.wait_settlement().unwrap();
 }
 
@@ -478,8 +422,7 @@ fn test_stop_during_bind_wins_before_commit_and_abandons_without_activation() {
     let submit_manager = manager.clone();
     let submit_prepared = Arc::clone(&prepared);
     let submit = std::thread::spawn(move || {
-        submit_manager
-            .try_submit_external::<usize, (), _>(OperationOptions::default(), submit_prepared)
+        submit_manager.try_submit_external::<usize, (), _>(OperationOptions::default(), submit_prepared)
     });
     entered_rx.recv().expect("bind reached after admission");
     let _shutdown = manager.request_shutdown(ShutdownMode::Cancel);
@@ -490,20 +433,9 @@ fn test_stop_during_bind_wins_before_commit_and_abandons_without_activation() {
         .join()
         .expect("submission thread did not panic")
         .expect("claimed submission remains accepted after stop");
-    assert!(matches!(
-        handle.wait_outcome().unwrap(),
-        OperationOutcome::Stopped(_)
-    ));
-    assert_eq!(
-        prepared.activated.load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
-    assert_eq!(
-        prepared
-            .abandon_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
+    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
+    assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(prepared.abandon_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     handle.wait_settlement().unwrap();
 }
 
@@ -553,13 +485,9 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
     });
     let submit = std::thread::spawn({
         let prepared = Arc::clone(&prepared);
-        move || {
-            child_manager.try_submit_external::<usize, (), _>(OperationOptions::default(), prepared)
-        }
+        move || child_manager.try_submit_external::<usize, (), _>(OperationOptions::default(), prepared)
     });
-    entered_rx
-        .recv()
-        .expect("child bind reached final preflight");
+    entered_rx.recv().expect("child bind reached final preflight");
     close_parent_tx.send(()).unwrap();
     let (ready, changed) = &*proceed;
     *ready.lock().unwrap() = true;
@@ -568,20 +496,9 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
         .join()
         .expect("child submission thread did not panic")
         .expect("a claimed child remains accepted while parent closes");
-    assert!(matches!(
-        child.wait_outcome().unwrap(),
-        OperationOutcome::Stopped(_)
-    ));
-    assert_eq!(
-        prepared.activated.load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
-    assert_eq!(
-        prepared
-            .abandon_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
+    assert!(matches!(child.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
+    assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(prepared.abandon_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     child.wait_settlement().unwrap();
     parent.wait_settlement().unwrap();
 }
@@ -618,10 +535,7 @@ fn test_already_bound_claim_rolls_back_provisional_parent_child_link() {
     let mut first = first_manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .unwrap();
-    assert!(matches!(
-        first.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(7)
-    ));
+    assert!(matches!(first.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
     first.wait_settlement().unwrap();
 
     let (child_manager_tx, child_manager_rx) = std::sync::mpsc::channel();
@@ -676,18 +590,12 @@ fn test_dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .unwrap();
-    assert!(matches!(
-        handle.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(7)
-    ));
+    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
     drop(handle);
     let shutdown = manager.request_shutdown(ShutdownMode::Cancel);
     prepared.release_inputs();
     assert_eq!(shutdown.wait().unwrap().snapshot.active_operations, 0);
-    assert_eq!(
-        prepared.activated.load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
+    assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -704,16 +612,9 @@ fn test_callback_panics_are_captured_and_activation_panic_is_not_abandoned() {
         snapshot_handle.wait_outcome().unwrap(),
         OperationOutcome::ExecutionFailed(_)
     ));
+    assert_eq!(snapshot_panics.activated.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(
-        snapshot_panics
-            .activated
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
-    assert_eq!(
-        snapshot_panics
-            .abandon_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
+        snapshot_panics.abandon_calls.load(std::sync::atomic::Ordering::SeqCst),
         1
     );
     snapshot_handle.wait_settlement().unwrap();
@@ -729,12 +630,7 @@ fn test_callback_panics_are_captured_and_activation_panic_is_not_abandoned() {
         activation_handle.wait_outcome().unwrap(),
         OperationOutcome::ExecutionFailed(_)
     ));
-    assert_eq!(
-        activation_panics
-            .activated
-            .load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
+    assert_eq!(activation_panics.activated.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(
         activation_panics
             .abandon_calls
@@ -754,16 +650,9 @@ fn test_callback_panics_are_captured_and_activation_panic_is_not_abandoned() {
         error_handle.wait_outcome().unwrap(),
         OperationOutcome::ExecutionFailed(_)
     ));
+    assert_eq!(activation_error.activated.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(
-        activation_error
-            .activated
-            .load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
-    assert_eq!(
-        activation_error
-            .abandon_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
+        activation_error.abandon_calls.load(std::sync::atomic::Ordering::SeqCst),
         0
     );
     error_handle.wait_settlement().unwrap();
@@ -773,9 +662,7 @@ fn test_callback_panics_are_captured_and_activation_panic_is_not_abandoned() {
 fn test_request_stop_and_outcome_poll_panics_are_captured() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let stop_panics = Prepared::ready_fixture();
-    stop_panics
-        .panic_flags
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    stop_panics.panic_flags.store(1, std::sync::atomic::Ordering::SeqCst);
     let mut stop_handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&stop_panics))
         .unwrap();
@@ -823,10 +710,7 @@ fn test_release_and_settlement_poll_panics_keep_scope_pending_without_fabricatin
         let mut handle = manager
             .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
             .unwrap();
-        assert!(matches!(
-            handle.wait_outcome().unwrap(),
-            OperationOutcome::Succeeded(7)
-        ));
+        assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
         assert!(matches!(
             handle
                 .wait_settlement_for(std::time::Duration::from_millis(10))
@@ -835,12 +719,7 @@ fn test_release_and_settlement_poll_panics_keep_scope_pending_without_fabricatin
         ));
         let shutdown = manager.request_shutdown(ShutdownMode::Drain);
         assert_eq!(shutdown.snapshot().active_operations, 1);
-        assert_eq!(
-            prepared
-                .abandon_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
+        assert_eq!(prepared.abandon_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         drop(handle);
 
         // Each case intentionally leaves one driver pending because the
@@ -856,17 +735,11 @@ fn test_release_and_settlement_poll_panics_keep_scope_pending_without_fabricatin
 fn test_typed_result_waits_for_matching_summary_when_facts_arrive_out_of_order() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Prepared::ready_fixture();
-    prepared
-        .summary_ready
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+    prepared.summary_ready.store(false, std::sync::atomic::Ordering::SeqCst);
     let handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .unwrap();
-    while prepared
-        .summary_polls
-        .load(std::sync::atomic::Ordering::SeqCst)
-        == 0
-    {
+    while prepared.summary_polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         std::thread::yield_now();
     }
     let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
@@ -876,11 +749,7 @@ fn test_typed_result_waits_for_matching_summary_when_facts_arrive_out_of_order()
         let _ = outcome_tx.send(result);
         handle.wait_settlement().unwrap();
     });
-    assert!(
-        outcome_rx
-            .recv_timeout(std::time::Duration::from_millis(10))
-            .is_err()
-    );
+    assert!(outcome_rx.recv_timeout(std::time::Duration::from_millis(10)).is_err());
     prepared.release_summary();
     assert!(matches!(
         outcome_rx.recv().unwrap().unwrap(),
@@ -893,16 +762,11 @@ fn test_typed_result_waits_for_matching_summary_when_facts_arrive_out_of_order()
 fn test_external_frame_ends_at_typed_outcome_while_release_is_still_pending() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Prepared::ready_fixture();
-    prepared
-        .release_ready
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+    prepared.release_ready.store(false, std::sync::atomic::Ordering::SeqCst);
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .unwrap();
-    assert!(matches!(
-        handle.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(7)
-    ));
+    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
     let scoped_manager = prepared
         .captured_manager
         .lock()
@@ -916,23 +780,17 @@ fn test_external_frame_ends_at_typed_outcome_while_release_is_still_pending() {
         .expect("typed outcome ends the execution frame before release");
     assert_eq!(error.reason(), AdmissionError::ScopeEnded);
     assert!(matches!(
-        handle
-            .wait_settlement_for(std::time::Duration::from_millis(1))
-            .unwrap(),
+        handle.wait_settlement_for(std::time::Duration::from_millis(1)).unwrap(),
         SettlementWait::Pending(_)
     ));
     prepared.release_inputs();
     handle.wait_settlement().unwrap();
-    let release_polls_after_ready = prepared
-        .release_polls
-        .load(std::sync::atomic::Ordering::SeqCst);
+    let release_polls_after_ready = prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst);
     for _ in 0..1000 {
         std::thread::yield_now();
     }
     assert_eq!(
-        prepared
-            .release_polls
-            .load(std::sync::atomic::Ordering::SeqCst),
+        prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst),
         release_polls_after_ready,
         "the driver must not poll release again after Ready"
     );
@@ -948,35 +806,22 @@ fn test_typed_outcome_precedes_settlement_and_ready_settlement_is_not_repolled()
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .unwrap();
-    assert!(matches!(
-        handle.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(7)
-    ));
-    while prepared
-        .settlement_polls
-        .load(std::sync::atomic::Ordering::SeqCst)
-        == 0
-    {
+    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
+    while prepared.settlement_polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         std::thread::yield_now();
     }
     assert!(matches!(
-        handle
-            .wait_settlement_for(std::time::Duration::from_millis(5))
-            .unwrap(),
+        handle.wait_settlement_for(std::time::Duration::from_millis(5)).unwrap(),
         SettlementWait::Pending(_)
     ));
     prepared.release_settlement();
     handle.wait_settlement().unwrap();
-    let ready_polls = prepared
-        .settlement_polls
-        .load(std::sync::atomic::Ordering::SeqCst);
+    let ready_polls = prepared.settlement_polls.load(std::sync::atomic::Ordering::SeqCst);
     for _ in 0..1000 {
         std::thread::yield_now();
     }
     assert_eq!(
-        prepared
-            .settlement_polls
-            .load(std::sync::atomic::Ordering::SeqCst),
+        prepared.settlement_polls.load(std::sync::atomic::Ordering::SeqCst),
         ready_polls,
         "the driver must not poll settlement again after Ready"
     );
@@ -1027,21 +872,10 @@ fn test_concurrent_managers_claim_one_shared_arc_once() {
         }
         _ => panic!("exactly one cross-manager submission must claim the Arc"),
     };
-    assert!(matches!(
-        winner.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(7)
-    ));
+    assert!(matches!(winner.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
     winner.wait_settlement().unwrap();
-    assert_eq!(
-        prepared.activated.load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
-    assert_eq!(
-        prepared
-            .abandon_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0
-    );
+    assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(prepared.abandon_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1075,10 +909,7 @@ fn test_full_manager_rejects_before_calling_bind() {
         "bind must not run before capacity admission"
     );
     release_tx.send(()).unwrap();
-    assert!(matches!(
-        held.wait_outcome().unwrap(),
-        OperationOutcome::Succeeded(())
-    ));
+    assert!(matches!(held.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
     held.wait_settlement().unwrap();
 }
 

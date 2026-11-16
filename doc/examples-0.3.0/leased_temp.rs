@@ -6,11 +6,17 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
-//! A worker retains its lease until it has actually stopped using the temp file.
-use qubit_operation::{OperationControl, OperationHandle, SettlementReport, StopReason};
+//! A worker retains its lease until it has actually stopped using the temp
+//! file.
 use std::sync::Arc;
 
-/// Ask the worker to stop. Its release poll must remain pending until the temp is unused.
+use qubit_operation::OperationControl;
+use qubit_operation::OperationHandle;
+use qubit_operation::SettlementReport;
+use qubit_operation::StopReason;
+
+/// Ask the worker to stop. Its release poll must remain pending until the temp
+/// is unused.
 pub fn request_worker_stop(control: &impl OperationControl) {
     control.request_stop(StopReason::UserCancelled);
 }

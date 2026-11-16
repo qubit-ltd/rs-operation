@@ -246,7 +246,8 @@ impl ScopeCore {
         (records, total, overflow)
     }
 
-    /// Requests scope cancellation and reports whether the request was accepted.
+    /// Requests scope cancellation and reports whether the request was
+    /// accepted.
     ///
     /// # Parameters
     ///

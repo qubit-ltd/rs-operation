@@ -7,6 +7,15 @@
 // =============================================================================
 
 //! Cross-protocol lifecycle tests using public crate-root APIs only.
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Waker;
+
 use qubit_operation::ChildOutcomeSummary;
 use qubit_operation::ChildRelease;
 use qubit_operation::ChildSnapshot;
@@ -19,9 +28,6 @@ use qubit_operation::PreparedExternalOperation;
 use qubit_operation::SettlementReport;
 use qubit_operation::StopReason;
 use qubit_operation::StopReport;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
 
 struct External {
     id: Mutex<Option<OperationId>>,
@@ -237,10 +243,7 @@ fn test_stopped_early_outcome_waits_for_input_release_and_domain_settlement() {
     );
     assert_eq!(stopped_rx.recv().unwrap(), StopReason::UserCancelled);
     external.release_typed_outcome();
-    assert!(matches!(
-        handle.wait_outcome().unwrap(),
-        OperationOutcome::Stopped(_)
-    ));
+    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
     let domain_summary = match external.poll_outcome(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(summary) => summary,
         Poll::Pending => panic!("domain completion summary is ready"),
@@ -261,9 +264,7 @@ fn test_stopped_early_outcome_waits_for_input_release_and_domain_settlement() {
     );
     polled_rx.recv().unwrap();
     assert!(matches!(
-        handle
-            .wait_settlement_for(std::time::Duration::ZERO)
-            .unwrap(),
+        handle.wait_settlement_for(std::time::Duration::ZERO).unwrap(),
         SettlementWait::Pending(_)
     ));
     assert_eq!(external.stops.load(Ordering::SeqCst), 1);
@@ -331,10 +332,7 @@ fn test_queue_capacity_does_not_block_stop_for_an_accepted_external_operation() 
     );
     release_tx.send(()).unwrap();
     assert_eq!(stopped_rx.recv().unwrap(), StopReason::UserCancelled);
-    assert!(matches!(
-        queued.wait_outcome().unwrap(),
-        OperationOutcome::Stopped(_)
-    ));
+    assert!(matches!(queued.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
     external.release_input();
     external.release_settlement();
     queued.wait_settlement().unwrap();
@@ -382,10 +380,7 @@ impl PreparedExternalOperation<ResourceRef<DropProbe>, ()> for ResourceExternal 
         Ok(())
     }
     fn abandon(self: Arc<Self>) {}
-    fn poll_take_outcome(
-        &self,
-        _: &mut Context<'_>,
-    ) -> Poll<OperationOutcome<ResourceRef<DropProbe>, ()>> {
+    fn poll_take_outcome(&self, _: &mut Context<'_>) -> Poll<OperationOutcome<ResourceRef<DropProbe>, ()>> {
         Poll::Ready(OperationOutcome::Succeeded(
             self.result.lock().unwrap().take().expect("activated"),
         ))
@@ -408,18 +403,14 @@ fn test_resource_valued_typed_outcome_must_be_dropped_before_settlement() {
     let outcome = handle.wait_outcome().unwrap();
     polled_rx.recv().unwrap();
     assert!(matches!(
-        handle
-            .wait_settlement_for(std::time::Duration::ZERO)
-            .unwrap(),
+        handle.wait_settlement_for(std::time::Duration::ZERO).unwrap(),
         SettlementWait::Pending(_)
     ));
     external.control.release_input();
     external.control.release_settlement();
     assert!(
         matches!(
-            handle
-                .wait_settlement_for(std::time::Duration::ZERO)
-                .unwrap(),
+            handle.wait_settlement_for(std::time::Duration::ZERO).unwrap(),
             SettlementWait::Pending(_)
         ),
         "the returned ResourceRef keeps framework settlement pending"
@@ -430,11 +421,7 @@ fn test_resource_valued_typed_outcome_must_be_dropped_before_settlement() {
 
 struct FailingTempCleanup(Arc<Mutex<Option<ResourceId>>>);
 impl AsyncCleanup<DropProbe> for FailingTempCleanup {
-    fn cleanup(
-        self: Arc<Self>,
-        resource: DropProbe,
-        _: CleanupContext,
-    ) -> CleanupFuture<DropProbe> {
+    fn cleanup(self: Arc<Self>, resource: DropProbe, _: CleanupContext) -> CleanupFuture<DropProbe> {
         Box::pin(std::future::ready(CleanupOutcome::Failed {
             failure: CleanupFailure {
                 resource_id: self.0.lock().unwrap().expect("resource id set"),
@@ -456,9 +443,7 @@ fn test_failed_temp_cleanup_leaves_an_owner_in_the_recovery_store() {
     let drops_for_body = Arc::clone(&drops);
     let completion = manager
         .run_and_settle(OperationOptions::default(), move |scope| {
-            let resources = scope
-                .resource_scope(ResourceScopeOptions { capacity: 1 })
-                .unwrap();
+            let resources = scope.resource_scope(ResourceScopeOptions { capacity: 1 }).unwrap();
             let owner = resources
                 .manage_with(
                     DropProbe(drops_for_body),
@@ -494,9 +479,7 @@ fn test_shutdown_timeout_keeps_external_owner_observable_until_release() {
         ShutdownWait::Pending(_)
     ));
     assert!(matches!(
-        handle
-            .wait_settlement_for(std::time::Duration::ZERO)
-            .unwrap(),
+        handle.wait_settlement_for(std::time::Duration::ZERO).unwrap(),
         SettlementWait::Pending(_)
     ));
     external.release_input();
