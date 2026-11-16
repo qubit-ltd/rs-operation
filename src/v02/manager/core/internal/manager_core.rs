@@ -265,13 +265,10 @@ impl ManagerCore {
                 (Some((*id, scope)), groups)
             }
         };
-        let mut group_permits = Vec::new();
-        for group in groups {
-            match group.reserve(parent.is_some()) {
-                Ok(permit) => group_permits.push(permit),
-                Err(reason) => return Err(SubmitError::new(reason, body)),
-            }
-        }
+        let group_permits = match crate::v02::manager::group::GroupCore::reserve_many(groups, parent.is_some()) {
+            Ok(permits) => permits,
+            Err(reason) => return Err(SubmitError::new(reason, body)),
+        };
         if options.limits == ScopeLimits::default() {
             options.limits = self.scope_limits;
         }

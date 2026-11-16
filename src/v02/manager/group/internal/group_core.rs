@@ -86,22 +86,55 @@ impl GroupCore {
     ///
     /// Returns the admission reason when shutdown or capacity prevents
     /// reservation.
+    #[cfg(test)]
     pub(crate) fn reserve(self: &Arc<Self>, descendant: bool) -> Result<GroupPermit, AdmissionError> {
-        let mut state = lock(&self.state);
-        if state.mode == ShutdownMode::Cancel {
-            return Err(AdmissionError::Stopped);
-        }
-        if !state.accepting && !descendant {
-            return Err(AdmissionError::Closed);
-        }
-        if state.active >= self.capacity {
-            return Err(AdmissionError::Busy);
-        }
-        state.active += 1;
-        Ok(GroupPermit {
-            group: Arc::clone(self),
-            released: false,
+        Self::reserve_many(std::slice::from_ref(self), descendant).map(|mut permits| {
+            permits.pop().expect("one group produces one permit")
         })
+    }
+
+    /// Atomically reserves membership in every distinct group.
+    ///
+    /// Group state locks are acquired in stable `GroupId` order. Every mode,
+    /// closure, and capacity check completes before any active count changes;
+    /// all locks remain held until every count has been incremented. Single
+    /// group reservations use this same path, so they cannot observe a partial
+    /// multi-group reservation.
+    pub(crate) fn reserve_many(
+        groups: &[Arc<Self>],
+        descendant: bool,
+    ) -> Result<Vec<GroupPermit>, AdmissionError> {
+        let mut ordered = groups.to_vec();
+        ordered.sort_unstable_by_key(|group| group.id);
+        ordered.dedup_by_key(|group| group.id);
+
+        let mut states = Vec::with_capacity(ordered.len());
+        for group in &ordered {
+            states.push(lock(&group.state));
+        }
+        for (group, state) in ordered.iter().zip(states.iter()) {
+            if state.mode == ShutdownMode::Cancel {
+                return Err(AdmissionError::Stopped);
+            }
+            if !state.accepting && !descendant {
+                return Err(AdmissionError::Closed);
+            }
+            if state.active >= group.capacity {
+                return Err(AdmissionError::Busy);
+            }
+        }
+        for state in &mut states {
+            state.active += 1;
+        }
+        drop(states);
+
+        Ok(ordered
+            .into_iter()
+            .map(|group| GroupPermit {
+                group,
+                released: false,
+            })
+            .collect())
     }
 
     /// Checks whether a submission can retry group admission without reserving
@@ -513,6 +546,7 @@ impl GroupCore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::Weak;
     use std::time::Duration;
 
@@ -537,6 +571,48 @@ mod tests {
         group.begin_shutdown(ShutdownMode::Cancel);
         assert_eq!(group.mode(), ShutdownMode::Cancel);
         assert!(matches!(group.reserve(true), Err(AdmissionError::Stopped)));
+    }
+
+    #[test]
+    fn failed_later_group_reservation_never_exposes_earlier_capacity() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let one = GroupCore::new(1);
+        let two = GroupCore::new(1);
+        let (first, later) = if one.id < two.id { (one, two) } else { (two, one) };
+        let _later_full = GroupCore::reserve_many(std::slice::from_ref(&later), false).unwrap();
+        let later_state = later.state.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let first_for_worker = Arc::clone(&first);
+        let later_for_worker = Arc::clone(&later);
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            GroupCore::reserve_many(&[first_for_worker, later_for_worker], false)
+        });
+        started_rx.recv().unwrap();
+
+        // The batch holds the earlier mutex while blocked on the later one.
+        // This directly verifies that no observer can read a partial count.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match first.state.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Err(std::sync::TryLockError::Poisoned(error)) => panic!("group mutex poisoned: {error}"),
+                Ok(state) => {
+                    drop(state);
+                    assert!(Instant::now() < deadline, "batch did not acquire the earlier group lock");
+                    std::thread::yield_now();
+                }
+            }
+        }
+        drop(later_state);
+        assert!(matches!(worker.join().unwrap(), Err(AdmissionError::Busy)));
+        assert_eq!(first.public_snapshot().active_operations, 0);
+        assert_eq!(later.public_snapshot().active_operations, 1);
+        let permit = GroupCore::reserve_many(std::slice::from_ref(&first), false).unwrap();
+        assert_eq!(first.public_snapshot().active_operations, 1);
+        drop(permit);
     }
 
     #[test]
