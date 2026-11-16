@@ -185,6 +185,53 @@ impl GroupCore {
         self.notify.notify_waiters();
     }
 
+    /// Atomically registers an operation in every distinct group.
+    ///
+    /// Group state locks use the same canonical `GroupId` order as admission.
+    /// All groups are validated before scope and queue entries are inserted.
+    /// The parent link is committed under the same group locks. If
+    /// `commit_parent` rejects the child, every insertion is rolled back before
+    /// any group can observe it or request cancellation. Cancellation racing
+    /// this transaction therefore observes either every membership or none.
+    pub(crate) fn register_scope_many_with<F>(
+        groups: &[Arc<Self>],
+        id: OperationId,
+        scope: Weak<crate::v02::scope::ScopeCore>,
+        descendant: bool,
+        commit_parent: F,
+    ) -> Result<(), AdmissionError>
+    where
+        F: FnOnce() -> Result<(), AdmissionError>,
+    {
+        let mut ordered = groups.to_vec();
+        ordered.sort_unstable_by_key(|group| group.id);
+        ordered.dedup_by_key(|group| group.id);
+        let mut states = Vec::with_capacity(ordered.len());
+        for group in &ordered {
+            states.push(lock(&group.state));
+        }
+        for state in &states {
+            if state.mode == ShutdownMode::Cancel {
+                return Err(AdmissionError::Stopped);
+            }
+            if !state.accepting && !descendant {
+                return Err(AdmissionError::Closed);
+            }
+        }
+        for state in &mut states {
+            state.scopes.insert(id, scope.clone());
+            state.queued.insert(id);
+        }
+        if let Err(reason) = commit_parent() {
+            for state in &mut states {
+                state.scopes.remove(&id);
+                state.queued.remove(&id);
+            }
+            return Err(reason);
+        }
+        Ok(())
+    }
+
     /// Registers an operation scope and marks its operation as queued.
     ///
     /// # Parameters
@@ -197,6 +244,7 @@ impl GroupCore {
     ///
     /// `true` if registration succeeded; cancellation mode rejects it.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn register_scope(&self, id: OperationId, scope: Weak<crate::v02::scope::ScopeCore>) -> bool {
         let mut state = lock(&self.state);
         if state.mode == ShutdownMode::Cancel {
@@ -233,6 +281,7 @@ impl GroupCore {
     ///
     /// - `id`: Identifier of the operation to unregister.
     /// - `self`: Group core whose operation registration is removed.
+    #[cfg(test)]
     pub(crate) fn unregister_scope(&self, id: OperationId) {
         let mut state = lock(&self.state);
         state.scopes.remove(&id);
@@ -613,6 +662,59 @@ mod tests {
         let permit = GroupCore::reserve_many(std::slice::from_ref(&first), false).unwrap();
         assert_eq!(first.public_snapshot().active_operations, 1);
         drop(permit);
+    }
+
+    #[test]
+    fn canceled_later_group_rejects_batch_without_partial_scope_registration() {
+        let first = GroupCore::new(1);
+        let later = GroupCore::new(1);
+        let (first, later) = if first.id < later.id { (first, later) } else { (later, first) };
+        let permits = GroupCore::reserve_many(&[Arc::clone(&first), Arc::clone(&later)], false).unwrap();
+        later.begin_shutdown(ShutdownMode::Cancel);
+        let operation = OperationId::new_unique();
+
+        assert!(matches!(
+            GroupCore::register_scope_many_with(&[Arc::clone(&first), Arc::clone(&later)], operation, Weak::new(), false, || Ok(())),
+            Err(AdmissionError::Stopped)
+        ));
+        assert_eq!(first.shutdown_snapshot().queued_operations, 0);
+        assert_eq!(later.shutdown_snapshot().queued_operations, 0);
+        assert_eq!(first.public_snapshot().active_operations, 1);
+        drop(permits);
+        assert_eq!(first.public_snapshot().active_operations, 0);
+        assert_eq!(later.public_snapshot().active_operations, 0);
+
+        let rejected_first = GroupCore::new(1);
+        let rejected_later = GroupCore::new(1);
+        let rejected_id = OperationId::new_unique();
+        let result = GroupCore::register_scope_many_with(
+            &[Arc::clone(&rejected_first), Arc::clone(&rejected_later)],
+            rejected_id,
+            Weak::new(),
+            false,
+            || {
+                assert!(matches!(rejected_first.state.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+                Err(AdmissionError::ScopeEnded)
+            },
+        );
+        assert!(matches!(result, Err(AdmissionError::ScopeEnded)));
+        assert_eq!(rejected_first.shutdown_snapshot().queued_operations, 0);
+        assert_eq!(rejected_later.shutdown_snapshot().queued_operations, 0);
+
+        let registered_first = GroupCore::new(1);
+        let registered_later = GroupCore::new(1);
+        let operation = OperationId::new_unique();
+        GroupCore::register_scope_many_with(
+            &[Arc::clone(&registered_first), Arc::clone(&registered_later)],
+            operation,
+            Weak::new(),
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        registered_later.begin_shutdown(ShutdownMode::Cancel);
+        assert_eq!(registered_first.shutdown_snapshot().queued_operations, 1);
+        assert_eq!(registered_later.shutdown_snapshot().queued_operations, 1);
     }
 
     #[test]

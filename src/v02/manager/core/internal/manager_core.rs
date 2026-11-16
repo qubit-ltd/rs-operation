@@ -325,23 +325,23 @@ impl ManagerCore {
                     body,
                 ));
             }
-            let mut registered_groups: Vec<&Arc<crate::v02::manager::group::GroupCore>> = Vec::new();
-            for group in groups {
-                if !group.register_scope(id, Arc::downgrade(&scope_core)) {
-                    for registered in registered_groups { registered.unregister_scope(id); }
-                    drop(state);
-                    return Err(SubmitError::new(AdmissionError::Stopped, body));
-                }
-                registered_groups.push(group);
-            }
-            if let Some((_, parent_scope)) = parent.as_ref()
-                && !parent_scope.mark_child(id, Arc::downgrade(&scope_core), scope_core.options().requirement)
-            {
-                for group in groups {
-                    group.unregister_scope(id);
-                }
+            let register_result = crate::v02::manager::group::GroupCore::register_scope_many_with(
+                groups,
+                id,
+                Arc::downgrade(&scope_core),
+                parent_id.is_some(),
+                || {
+                    if let Some((_, parent_scope)) = parent.as_ref()
+                        && !parent_scope.mark_child(id, Arc::downgrade(&scope_core), scope_core.options().requirement)
+                    {
+                        return Err(AdmissionError::ScopeEnded);
+                    }
+                    Ok(())
+                },
+            );
+            if let Err(reason) = register_result {
                 drop(state);
-                return Err(SubmitError::new(AdmissionError::ScopeEnded, body));
+                return Err(SubmitError::new(reason, body));
             }
             state.active_scopes.insert(id, Arc::downgrade(&scope_core));
             #[cfg(test)]
