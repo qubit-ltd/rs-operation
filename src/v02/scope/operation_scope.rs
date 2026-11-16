@@ -140,7 +140,8 @@ impl OperationScope {
     pub fn manage<T: Send + Sync + 'static>(
         &self,
         resource: T,
-    ) -> Result<crate::v02::resource::ResourceRef<T>, crate::v02::resource::ManageResourceError<T>> {
+    ) -> Result<crate::v02::resource::ResourceRef<T>, crate::v02::resource::ManageResourceError<T>>
+    {
         let reservation = match self.reserve_resource() {
             Ok(reservation) => reservation,
             Err(error) => {
@@ -155,7 +156,9 @@ impl OperationScope {
                         crate::v02::report::ResourceManageErrorKind::CapacityExceeded
                     }
                 };
-                return Err(crate::v02::resource::ManageResourceError::new(kind, resource));
+                return Err(crate::v02::resource::ManageResourceError::new(
+                    kind, resource,
+                ));
             }
         };
         reservation.commit(resource).map_err(|error| {
@@ -180,7 +183,10 @@ impl OperationScope {
     /// a resource.
     pub fn reserve_resource(
         &self,
-    ) -> Result<crate::v02::resource::ResourceReservation, crate::v02::resource::ResourceCapacityError> {
+    ) -> Result<
+        crate::v02::resource::ResourceReservation,
+        crate::v02::resource::ResourceCapacityError,
+    > {
         let result = self
             .core
             .with_resource_lifecycle(|| self.core.resource_scope().reserve());

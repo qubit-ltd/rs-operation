@@ -197,6 +197,15 @@ impl ScopeCore {
         self.id
     }
 
+    /// Records an effect while the scope still accepts effect updates.
+    ///
+    /// # Parameters
+    ///
+    /// - `record`: Effect record retained in this scope's bounded history.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lifecycle or capacity error that prevented recording.
     pub(crate) fn record_effect(&self, record: EffectRecord) -> Result<(), EffectRecordError> {
         self.with_lifecycle_gate(|| {
             let mut state = lock(&self.state);
@@ -219,6 +228,15 @@ impl ScopeCore {
         })
     }
 
+    /// Takes a snapshot of recorded effects and their overflow count.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Scope whose effect history is snapshotted.
+    ///
+    /// # Returns
+    ///
+    /// The retained records, total count, and number omitted for capacity.
     pub(crate) fn effect_records(&self) -> (Vec<EffectRecord>, usize, usize) {
         let mut state = lock(&self.state);
         let records = state.effects.clone();
@@ -228,6 +246,15 @@ impl ScopeCore {
         (records, total, overflow)
     }
 
+    /// Requests scope cancellation and reports whether the request was accepted.
+    ///
+    /// # Parameters
+    ///
+    /// - `reason`: Stop reason propagated to this scope and its descendants.
+    ///
+    /// # Returns
+    ///
+    /// The resulting stop-request status, including already-finished cases.
     pub(crate) fn request_stop_status(&self, reason: StopReason) -> StopRequestStatus {
         {
             let state = lock(&self.state);
@@ -316,6 +343,11 @@ impl ScopeCore {
         self.resource_scope.cleanup_in_flight()
     }
 
+    /// Borrows the groups that track this operation's admission and shutdown.
+    ///
+    /// # Returns
+    ///
+    /// The group cores registered for this operation scope.
     pub(crate) fn groups(&self) -> &[Arc<GroupCore>] {
         &self.groups
     }
