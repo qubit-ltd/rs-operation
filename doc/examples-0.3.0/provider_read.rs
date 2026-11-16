@@ -1,3 +1,11 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
 //! A provider adapter reports early stop independently from releasing input.
 use qubit_operation::OperationOutcome;
 use qubit_operation::StopReason;

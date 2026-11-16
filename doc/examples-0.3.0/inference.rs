@@ -1,3 +1,11 @@
+// =============================================================================
+//    Copyright (c) 2025 - 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
+
 //! Resource-valued results must be consumed and dropped before settlement.
 use qubit_operation::OperationHandle;
 use qubit_operation::OperationOutcome;
