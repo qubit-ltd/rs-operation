@@ -15,6 +15,10 @@ struct External {
     settlement_waker: Mutex<Option<Waker>>,
     settlement_polled: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     stop_forwarded: Mutex<Option<std::sync::mpsc::Sender<StopReason>>>,
+    activated: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    typed_outcome_ready: AtomicBool,
+    typed_outcome_waker: Mutex<Option<Waker>>,
+    typed_poll_pending: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     worker_owner: Mutex<Option<Arc<DropProbe>>>,
     stops: AtomicUsize,
     polls: AtomicUsize,
@@ -33,6 +37,10 @@ impl External {
             settlement_waker: Mutex::new(None),
             settlement_polled: Mutex::new(None),
             stop_forwarded: Mutex::new(None),
+            activated: Mutex::new(None),
+            typed_outcome_ready: AtomicBool::new(true),
+            typed_outcome_waker: Mutex::new(None),
+            typed_poll_pending: Mutex::new(None),
             worker_owner: Mutex::new(None),
             stops: AtomicUsize::new(0),
             polls: AtomicUsize::new(0),
@@ -51,6 +59,12 @@ impl External {
     }
     fn release_settlement(&self) {
         Self::open(&self.settlement, &self.settlement_waker);
+    }
+    fn release_typed_outcome(&self) {
+        self.typed_outcome_ready.store(true, Ordering::SeqCst);
+        if let Some(waker) = self.typed_outcome_waker.lock().unwrap().take() {
+            waker.wake();
+        }
     }
 }
 
@@ -156,11 +170,24 @@ impl PreparedExternalOperation<usize, ()> for External {
     }
     fn activate(self: Arc<Self>, _: OperationScope) -> Result<(), ExecutionFailure> {
         self.phase.store(1, Ordering::SeqCst);
+        if let Some(signal) = self.activated.lock().unwrap().take() {
+            let _ = signal.send(());
+        }
         Ok(())
     }
     fn abandon(self: Arc<Self>) {}
-    fn poll_take_outcome(&self, _: &mut Context<'_>) -> Poll<OperationOutcome<usize, ()>> {
+    fn poll_take_outcome(&self, cx: &mut Context<'_>) -> Poll<OperationOutcome<usize, ()>> {
+        let mut waker = self.typed_outcome_waker.lock().unwrap();
+        if !self.typed_outcome_ready.load(Ordering::SeqCst) {
+            *waker = Some(cx.waker().clone());
+            if let Some(signal) = self.typed_poll_pending.lock().unwrap().take() {
+                let _ = signal.send(());
+            }
+            return Poll::Pending;
+        }
+        drop(waker);
         self.outcome_published.store(true, Ordering::SeqCst);
+        self.phase.store(2, Ordering::SeqCst);
         Poll::Ready(OperationOutcome::Succeeded(42))
     }
 }
@@ -171,6 +198,11 @@ fn stopped_early_outcome_waits_for_input_release_and_domain_settlement() {
     let external = External::held();
     let owner_drops = Arc::new(AtomicUsize::new(0));
     *external.worker_owner.lock().unwrap() = Some(Arc::new(DropProbe(Arc::clone(&owner_drops))));
+    external.typed_outcome_ready.store(false, Ordering::SeqCst);
+    let (typed_pending_tx, typed_pending_rx) = std::sync::mpsc::channel();
+    *external.typed_poll_pending.lock().unwrap() = Some(typed_pending_tx);
+    let (activated_tx, activated_rx) = std::sync::mpsc::channel();
+    *external.activated.lock().unwrap() = Some(activated_tx);
     let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
     *external.stop_forwarded.lock().unwrap() = Some(stopped_tx);
     let (polled_tx, polled_rx) = std::sync::mpsc::channel();
@@ -178,14 +210,14 @@ fn stopped_early_outcome_waits_for_input_release_and_domain_settlement() {
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&external))
         .unwrap();
-    while external.phase.load(Ordering::SeqCst) != 1 {
-        std::thread::yield_now();
-    }
+    activated_rx.recv().unwrap();
+    typed_pending_rx.recv().unwrap();
     assert_eq!(
         handle.request_stop(StopReason::UserCancelled),
         StopRequestStatus::Accepted
     );
     assert_eq!(stopped_rx.recv().unwrap(), StopReason::UserCancelled);
+    external.release_typed_outcome();
     assert!(matches!(
         handle.wait_outcome().unwrap(),
         OperationOutcome::Stopped(_)
@@ -197,7 +229,8 @@ fn stopped_early_outcome_waits_for_input_release_and_domain_settlement() {
     let domain_snapshot = external.snapshot();
     assert_eq!(domain_summary.kind, ChildOutcomeKind::Succeeded);
     assert_eq!(domain_snapshot.outcome.as_ref(), Some(&domain_summary));
-    assert_eq!(domain_snapshot.execution, ExecutionPhase::Running);
+    assert_eq!(domain_snapshot.execution, ExecutionPhase::Finished);
+    assert!(!domain_snapshot.input_released);
     assert_eq!(
         domain_snapshot.stop.as_ref().map(|stop| stop.reason),
         Some(StopReason::UserCancelled)
