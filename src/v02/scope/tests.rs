@@ -17,6 +17,7 @@ use crate::v02::report::ResourceManageErrorKind;
 use crate::v02::report::ResourceScopeId;
 use crate::v02::report::ResourceScopeOptions;
 use crate::v02::report::StopReason;
+use crate::v02::report::StopRequestStatus;
 use crate::v02::resource::ResourceKey;
 
 #[test]
@@ -73,8 +74,14 @@ fn test_stopped_operation_scope_rejects_resource_admission_with_original_value()
     let (_, manager) = ManagerCore::for_test();
     manager
         .try_submit_body(|scope| {
-            assert!(scope.request_stop(StopReason::UserCancelled));
-            assert!(!scope.request_stop(StopReason::ParentStopped));
+            assert_eq!(
+                scope.request_stop(StopReason::UserCancelled),
+                StopRequestStatus::Accepted
+            );
+            assert_eq!(
+                scope.request_stop(StopReason::ParentStopped),
+                StopRequestStatus::AlreadyRequested
+            );
             assert_eq!(scope.context().stop_reason(), Some(StopReason::UserCancelled));
 
             assert!(matches!(scope.reserve_resource(), Err(ResourceCapacityError::Stopped)));
