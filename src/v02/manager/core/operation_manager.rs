@@ -6,23 +6,23 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
-use std::future::Future;
 use std::panic;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::task::Poll;
 
 use super::AdmissionError;
 use super::AsyncOperationManager;
-use super::ChildOutcomeSummary;
 use super::ChildRelease;
 use super::DiagnosticSummary;
 use super::ExecutionFrameGuard;
 use super::ExecutionKind;
 use super::ExecutionPhase;
+use super::ExternalExecutionContext;
+use super::ExternalOutcomePublisher;
+use super::ExternalStopControl;
 use super::ManagedOperationControl;
 use super::ManagerCore;
 use super::OperationCore;
@@ -41,275 +41,11 @@ use super::SubmissionTarget;
 use super::SubmitError;
 use super::block_on;
 use super::child_outcome_summary;
+use super::drive_external;
 use super::lock;
 use super::panic_message;
 use crate::v02::protocol::OperationControl;
 use crate::v02::scope::ExecutionContextGuard;
-
-/// Tracks execution resources for a manager-driven external operation.
-pub struct ExternalExecutionContext {
-    operation: Arc<OperationCore>,
-    lease: Arc<dyn super::SubmissionLease>,
-    scope: Arc<ScopeCore>,
-    frame: Mutex<Option<ExecutionFrameGuard>>,
-    finalized: AtomicBool,
-}
-
-impl ExternalExecutionContext {
-    pub(super) fn new(
-        operation: Arc<OperationCore>,
-        lease: Arc<dyn super::SubmissionLease>,
-        scope: Arc<ScopeCore>,
-        frame: Option<ExecutionFrameGuard>,
-    ) -> Self {
-        Self {
-            operation,
-            lease,
-            scope,
-            frame: Mutex::new(frame),
-            finalized: AtomicBool::new(false),
-        }
-    }
-
-    pub(super) fn finish(&self) {
-        if self.finalized.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.operation.set_execution(ExecutionPhase::Finished);
-        self.lease.execution_finished();
-        drop(lock(&self.frame).take());
-        self.scope.mark_body_finished();
-    }
-}
-
-/// Routes manager stop requests to an externally driven operation.
-pub struct ExternalStopControl {
-    pub(super) managed: Arc<ManagedOperationControl>,
-}
-
-/// Shared one-shot callback for publishing a typed external operation outcome.
-pub type ExternalOutcomePublisher<T, E> = Arc<Mutex<Option<Box<dyn FnOnce(OperationOutcome<T, E>) + Send + 'static>>>>;
-
-/// Shared result of claiming an external task for its operation identity.
-pub type ExternalBindResult = Arc<Mutex<Option<Result<(), crate::v02::report::ExecutionFailure>>>>;
-
-/// Drives an external task until its outcome and required cleanup are observed.
-///
-/// # Type Parameters
-///
-/// - `T`: Successful value produced by the external task.
-/// - `E`: Error value produced by the external task.
-/// - `P`: Prepared external task implementation.
-///
-/// # Parameters
-///
-/// - `scope`: Manager-owned scope assigned to the task.
-/// - `adapter`: Prepared task being activated and polled.
-/// - `bind_state`: Shared result of the task's identity claim.
-/// - `managed_state`: Shared manager control installed before dispatch.
-/// - `execution_state`: Shared execution context used to finalize the task.
-/// - `publisher_state`: One-shot callback that receives the task outcome.
-/// - `activation_permitted`: Whether manager lifecycle state permits starting.
-pub async fn drive_external<T, E, P>(
-    scope: OperationScope,
-    adapter: Arc<P>,
-    bind_state: ExternalBindResult,
-    managed_state: Arc<Mutex<Option<Arc<ManagedOperationControl>>>>,
-    execution_state: Arc<Mutex<Option<Arc<ExternalExecutionContext>>>>,
-    publisher_state: ExternalOutcomePublisher<T, E>,
-    activation_permitted: bool,
-) where
-    T: Send + 'static,
-    E: Send + 'static,
-    P: crate::v02::adapter::PreparedExternalOperation<T, E>,
-{
-    let operation_id = scope.id();
-    let scope_core_for_settlement = Arc::clone(&scope.core);
-    let context = scope.context();
-    let bind = lock(&bind_state)
-        .take()
-        .expect("accepted external operation has a bind result");
-    let mut activated = false;
-    let mut typed = if let Err(failure) = bind {
-        let _ = panic::catch_unwind(AssertUnwindSafe(|| adapter.clone().abandon()));
-        Some(OperationOutcome::ExecutionFailed(failure))
-    } else if !activation_permitted {
-        let _ = panic::catch_unwind(AssertUnwindSafe(|| adapter.clone().abandon()));
-        Some(OperationOutcome::Stopped(crate::v02::report::StopReport {
-            reason: context
-                .stop_reason()
-                .unwrap_or(crate::v02::report::StopReason::ParentStopped),
-            accepted_at: None,
-        }))
-    } else {
-        match panic::catch_unwind(AssertUnwindSafe(|| adapter.snapshot())) {
-            Err(payload) => {
-                let _ = panic::catch_unwind(AssertUnwindSafe(|| adapter.clone().abandon()));
-                Some(OperationOutcome::ExecutionFailed(
-                    crate::v02::report::ExecutionFailure {
-                        operation_id,
-                        summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
-                        source: None,
-                    },
-                ))
-            }
-            Ok(snapshot) if snapshot.operation_id != operation_id => {
-                let _ = panic::catch_unwind(AssertUnwindSafe(|| adapter.clone().abandon()));
-                Some(OperationOutcome::ExecutionFailed(
-                    crate::v02::report::ExecutionFailure {
-                        operation_id,
-                        summary: DiagnosticSummary::new("external snapshot identity mismatch"),
-                        source: None,
-                    },
-                ))
-            }
-            Ok(_) => match panic::catch_unwind(AssertUnwindSafe(|| adapter.clone().activate(scope))) {
-                Ok(Ok(())) => {
-                    activated = true;
-                    None
-                }
-                Ok(Err(failure)) => Some(OperationOutcome::ExecutionFailed(failure)),
-                Err(payload) => Some(OperationOutcome::ExecutionFailed(
-                    crate::v02::report::ExecutionFailure {
-                        operation_id,
-                        summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
-                        source: None,
-                    },
-                )),
-            },
-        }
-    };
-    let managed = lock(&managed_state)
-        .as_ref()
-        .cloned()
-        .expect("manager control is installed before dispatch");
-    let finish_execution = || {
-        if let Some(context) = lock(&execution_state).as_ref() {
-            context.finish();
-        }
-    };
-    let mut published = false;
-    let mut summary: Option<ChildOutcomeSummary> = None;
-    let mut release = false;
-    let mut release_polled = false;
-    let mut settlement: Option<Arc<crate::v02::report::SettlementReport>> = None;
-    let mut typed_poll_done = typed.is_some();
-    let mut stop_signal = Box::pin(context.stop_requested());
-    let mut stop_forwarded = false;
-    let mut summary_poll_done = !activated;
-    let mut summary_poll_failed = false;
-    let mut typed_poll_failed = false;
-    let mut release_poll_failed = false;
-    let mut settlement_poll_failed = false;
-    if activated && let Some(reason) = context.stop_reason() {
-        let _ = panic::catch_unwind(AssertUnwindSafe(|| adapter.request_stop(reason)));
-        stop_forwarded = true;
-    }
-    if typed_poll_done {
-        if let Some(callback) = lock(&publisher_state).take() {
-            callback(typed.take().expect("outcome exists"));
-            published = true;
-            finish_execution();
-        }
-    }
-    std::future::poll_fn(|cx| {
-        if activated && !stop_forwarded {
-            if let Poll::Ready(reason) = stop_signal.as_mut().poll(cx) {
-                let _ = panic::catch_unwind(AssertUnwindSafe(|| adapter.request_stop(reason)));
-                stop_forwarded = true;
-            }
-        }
-        if activated && !typed_poll_done {
-            match panic::catch_unwind(AssertUnwindSafe(|| adapter.poll_take_outcome(cx))) {
-                Ok(Poll::Ready(outcome)) => {
-                    typed = Some(outcome);
-                    typed_poll_done = true;
-                }
-                Ok(Poll::Pending) => {}
-                Err(payload) => {
-                    typed = Some(OperationOutcome::ExecutionFailed(
-                        crate::v02::report::ExecutionFailure {
-                            operation_id,
-                            summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
-                            source: None,
-                        },
-                    ));
-                    typed_poll_done = true;
-                    typed_poll_failed = true;
-                }
-            }
-        }
-        if activated && !summary_poll_done {
-            match panic::catch_unwind(AssertUnwindSafe(|| adapter.poll_outcome(cx))) {
-                Ok(Poll::Ready(value)) => {
-                    summary = Some(value);
-                    summary_poll_done = true;
-                }
-                Ok(Poll::Pending) => {}
-                Err(_) => {
-                    summary_poll_done = true;
-                    summary_poll_failed = true;
-                }
-            }
-        }
-        if !release_polled && !release_poll_failed {
-            match panic::catch_unwind(AssertUnwindSafe(|| adapter.poll_release(cx))) {
-                Ok(Poll::Ready(value)) => {
-                    release_polled = true;
-                    release = managed.confirm_input_release(value);
-                }
-                Ok(Poll::Pending) => {}
-                Err(_) => release_poll_failed = true,
-            }
-        }
-        if settlement.is_none() && !settlement_poll_failed {
-            match panic::catch_unwind(AssertUnwindSafe(|| adapter.poll_settlement(cx))) {
-                Ok(Poll::Ready(value)) if value.operation_id == operation_id => settlement = Some(value),
-                Ok(Poll::Ready(_)) => settlement_poll_failed = true,
-                Ok(Poll::Pending) => {}
-                Err(_) => settlement_poll_failed = true,
-            }
-        }
-        if typed_poll_done && !published && (!activated || summary_poll_done || typed_poll_failed) {
-            if activated {
-                let expected = typed.as_ref().map(|value| child_outcome_summary(operation_id, value));
-                if summary_poll_failed
-                    || summary
-                        .as_ref()
-                        .is_none_or(|value| Some(value) != expected.as_ref() || value.operation_id != operation_id)
-                {
-                    typed = Some(OperationOutcome::ExecutionFailed(
-                        crate::v02::report::ExecutionFailure {
-                            operation_id,
-                            summary: DiagnosticSummary::new("external outcome summary mismatch"),
-                            source: None,
-                        },
-                    ));
-                }
-            }
-            if let Some(callback) = lock(&publisher_state).take() {
-                if let Some(outcome) = typed.take() {
-                    callback(outcome);
-                    finish_execution();
-                    published = true;
-                }
-            }
-        }
-        if published && release && settlement.is_some() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    })
-    .await;
-    scope_core_for_settlement.finish_external_driver_settlement();
-}
-
-impl StopControl for ExternalStopControl {
-    fn request_stop(&self, reason: crate::v02::report::StopReason) {
-        StopControl::request_stop(self.managed.as_ref(), reason);
-    }
-}
 
 /// A synchronous submission view over a shared manager coordinator.
 ///
@@ -359,7 +95,10 @@ impl OperationManager {
         let existing = match &self.target {
             SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => groups,
         };
-        if existing.iter().any(|item| Arc::ptr_eq(item, &group.group_core())) {
+        if existing
+            .iter()
+            .any(|item| Arc::ptr_eq(item, &group.group_core()))
+        {
             return Ok(self.clone());
         }
         if existing.len() >= self.core.max_groups_per_operation {
@@ -400,8 +139,10 @@ impl OperationManager {
     {
         let bind_result: Arc<Mutex<Option<Result<(), crate::v02::report::ExecutionFailure>>>> =
             Arc::new(Mutex::new(None));
-        let managed_control: Arc<Mutex<Option<Arc<ManagedOperationControl>>>> = Arc::new(Mutex::new(None));
-        let execution_context: Arc<Mutex<Option<Arc<ExternalExecutionContext>>>> = Arc::new(Mutex::new(None));
+        let managed_control: Arc<Mutex<Option<Arc<ManagedOperationControl>>>> =
+            Arc::new(Mutex::new(None));
+        let execution_context: Arc<Mutex<Option<Arc<ExternalExecutionContext>>>> =
+            Arc::new(Mutex::new(None));
         let outcome_publisher: ExternalOutcomePublisher<T, E> = Arc::new(Mutex::new(None));
         let activation_permitted = Arc::new(AtomicBool::new(false));
         let state_for_preflight = Arc::clone(&bind_result);
@@ -483,7 +224,9 @@ impl OperationManager {
     ///
     /// Returns `ManagerCreateError` if the configured production resources
     /// cannot be initialized.
-    pub fn new(options: crate::v02::report::ManagerOptions) -> Result<Self, crate::v02::report::ManagerCreateError> {
+    pub fn new(
+        options: crate::v02::report::ManagerOptions,
+    ) -> Result<Self, crate::v02::report::ManagerCreateError> {
         crate::v02::manager::production::new_sync(options)
     }
 
@@ -531,7 +274,8 @@ impl OperationManager {
     /// The call stops new submissions while accepted work continues to drain.
     #[inline]
     pub fn close_admission(&self) {
-        self.core.request_shutdown(crate::v02::report::ShutdownMode::Drain);
+        self.core
+            .request_shutdown(crate::v02::report::ShutdownMode::Drain);
     }
 
     /// Requests shutdown and returns a handle for observing its completion.
@@ -572,7 +316,8 @@ impl OperationManager {
     pub fn group(
         &self,
         options: crate::v02::report::GroupOptions,
-    ) -> Result<crate::v02::manager::group::OperationGroup, crate::v02::report::ManagerCreateError> {
+    ) -> Result<crate::v02::manager::group::OperationGroup, crate::v02::report::ManagerCreateError>
+    {
         crate::v02::manager::group::OperationGroup::new(self.clone(), options)
     }
 
@@ -616,12 +361,17 @@ impl OperationManager {
     pub(crate) fn service_resource_scope(
         &self,
         capacity: usize,
-    ) -> Result<crate::v02::resource::service::ServiceResourceScope, crate::v02::report::ResourceScopeError> {
+    ) -> Result<
+        crate::v02::resource::service::ServiceResourceScope,
+        crate::v02::report::ResourceScopeError,
+    > {
         self.core
             .service_resource_scope(
                 capacity,
                 match &self.target {
-                    SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => groups.clone(),
+                    SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => {
+                        groups.clone()
+                    }
                 },
             )
             .map(crate::v02::resource::service::ServiceResourceScope::new)
@@ -647,7 +397,10 @@ impl OperationManager {
     ///
     /// This manager view with its target updated to use `group`.
     #[inline]
-    pub(crate) fn with_group_core(mut self, group: Arc<crate::v02::manager::group::GroupCore>) -> Self {
+    pub(crate) fn with_group_core(
+        mut self,
+        group: Arc<crate::v02::manager::group::GroupCore>,
+    ) -> Self {
         match &mut self.target {
             SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => {
                 if !groups.iter().any(|item| Arc::ptr_eq(item, &group)) {
@@ -687,7 +440,11 @@ impl OperationManager {
     /// # Errors
     ///
     /// Returns the original body with the admission or operation setup error.
-    pub fn submit<T, E, F>(&self, options: OperationOptions, body: F) -> Result<OperationHandle<T, E>, SubmitError<F>>
+    pub fn submit<T, E, F>(
+        &self,
+        options: OperationOptions,
+        body: F,
+    ) -> Result<OperationHandle<T, E>, SubmitError<F>>
     where
         T: Send + 'static,
         E: Send + 'static,
@@ -697,7 +454,8 @@ impl OperationManager {
         loop {
             match self.try_submit(
                 options.clone(),
-                body.take().expect("submission body remains available until accepted"),
+                body.take()
+                    .expect("submission body remains available until accepted"),
             ) {
                 Ok(handle) => return Ok(handle),
                 Err(error) => {
@@ -763,8 +521,18 @@ impl OperationManager {
             let scope_core = Arc::clone(&scope.core);
             Some(scope_core.resolve_outcome(body(scope)))
         };
-        match self.try_submit_raw_with_preflight(options, runner, |_| Ok(()), None, true, None, None, None, None, None)
-        {
+        match self.try_submit_raw_with_preflight(
+            options,
+            runner,
+            |_| Ok(()),
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ) {
             Ok(handle) => Ok(handle),
             Err(error) => {
                 let (reason, rejected_runner) = error.into_parts();
@@ -807,9 +575,12 @@ impl OperationManager {
         let external_mode = external_execution.is_some();
         let external_execution_for_runner = external_execution.clone();
         let runner = move |scope: OperationScope| {
-            let body = lock(&body_for_job).take().expect("accepted body is present");
-            let (operation, slot, lease, parent, control) =
-                lock(&parts_for_job).take().expect("accepted runner capsule is present");
+            let body = lock(&body_for_job)
+                .take()
+                .expect("accepted body is present");
+            let (operation, slot, lease, parent, control) = lock(&parts_for_job)
+                .take()
+                .expect("accepted runner capsule is present");
             let scope_core = Arc::clone(&scope.core);
             let operation_id = scope.id();
             let mut frame = Some(ExecutionFrameGuard::new(Arc::clone(&scope_core)));
@@ -822,7 +593,10 @@ impl OperationManager {
                     frame.take(),
                 )));
             }
-            let manager_core = scope_core.manager().upgrade().expect("active scope manager exists");
+            let manager_core = scope_core
+                .manager()
+                .upgrade()
+                .expect("active scope manager exists");
             let groups = scope_core.groups().to_vec();
             let result = {
                 let _context = ExecutionContextGuard::enter(&manager_core, operation_id, &groups);
@@ -831,7 +605,9 @@ impl OperationManager {
             if external_execution.is_none() {
                 operation.set_execution(ExecutionPhase::Finished);
                 lease.execution_finished();
-            } else if let Some(context) = lock(external_execution_for_runner.as_ref().unwrap()).as_ref() {
+            } else if let Some(context) =
+                lock(external_execution_for_runner.as_ref().unwrap()).as_ref()
+            {
                 context.finish();
             }
             if confirm_input_release {
@@ -844,11 +620,15 @@ impl OperationManager {
                 scope_core.on_outcomes_ready(move || {
                     let outcome = match result {
                         Ok(Some(outcome)) => outcome,
-                        Ok(None) => OperationOutcome::ExecutionFailed(crate::v02::report::ExecutionFailure {
-                            operation_id,
-                            summary: DiagnosticSummary::new("external driver ended without publishing an outcome"),
-                            source: None,
-                        }),
+                        Ok(None) => OperationOutcome::ExecutionFailed(
+                            crate::v02::report::ExecutionFailure {
+                                operation_id,
+                                summary: DiagnosticSummary::new(
+                                    "external driver ended without publishing an outcome",
+                                ),
+                                source: None,
+                            },
+                        ),
                         Err(payload) => OperationOutcome::Panicked(PanicSummary {
                             operation_id,
                             phase: ExecutionPhase::Running,
@@ -1024,7 +804,9 @@ impl OperationManager {
         let mut operation = self
             .submit(options, body)
             .map_err(crate::v02::report::RunError::Submit)?;
-        operation.wait_outcome().map_err(crate::v02::report::RunError::Outcome)
+        operation
+            .wait_outcome()
+            .map_err(crate::v02::report::RunError::Outcome)
     }
 
     /// Submits a synchronous operation and waits for both outcome and
@@ -1068,7 +850,10 @@ impl OperationManager {
         let settlement = operation
             .wait_settlement()
             .map_err(crate::v02::report::RunError::Observation)?;
-        Ok(crate::v02::report::OperationCompletion { outcome, settlement })
+        Ok(crate::v02::report::OperationCompletion {
+            outcome,
+            settlement,
+        })
     }
 
     /// Submits a unit-returning body through the test execution port.
@@ -1085,7 +870,8 @@ impl OperationManager {
     where
         F: FnOnce(OperationScope) + Send + 'static,
     {
-        self.core.submit_scope(&self.target, OperationOptions::default(), body)
+        self.core
+            .submit_scope(&self.target, OperationOptions::default(), body)
     }
 
     /// Submits a configured unit-returning body through the test port.

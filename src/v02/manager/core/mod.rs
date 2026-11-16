@@ -9,6 +9,9 @@
 //! Shared admission and operation-tree coordination for manager views.
 
 mod async_operation_manager;
+mod external_execution_context;
+mod external_operation_driver;
+mod external_stop_control;
 mod internal;
 mod operation_manager;
 
@@ -20,6 +23,11 @@ use std::sync::Mutex;
 use std::task::Poll;
 
 pub use async_operation_manager::AsyncOperationManager;
+pub(super) use external_execution_context::ExternalExecutionContext;
+pub(super) use external_operation_driver::ExternalBindResult;
+pub(super) use external_operation_driver::ExternalOutcomePublisher;
+pub(super) use external_operation_driver::drive_external;
+pub(super) use external_stop_control::ExternalStopControl;
 pub(crate) use internal::CatchUnwindFuture;
 pub(crate) use internal::ExecutionKind;
 pub(crate) use internal::ManagerCore;
@@ -33,12 +41,7 @@ pub(crate) use internal::SubmissionReservation;
 pub(crate) use internal::SubmissionTarget;
 use internal::ThreadUnparker;
 pub(crate) use internal::dispose_panic_payload;
-pub(super) use operation_manager::ExternalBindResult;
-pub(super) use operation_manager::ExternalExecutionContext;
-pub(super) use operation_manager::ExternalOutcomePublisher;
-pub(super) use operation_manager::ExternalStopControl;
 pub use operation_manager::OperationManager;
-pub(super) use operation_manager::drive_external;
 
 use crate::v02::adapter::ManagedOperationControl;
 use crate::v02::manager::capacity::ScopeCapacity;
