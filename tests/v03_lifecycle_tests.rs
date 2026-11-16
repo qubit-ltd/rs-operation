@@ -284,14 +284,34 @@ fn queue_capacity_does_not_block_stop_for_an_accepted_external_operation() {
         .unwrap();
     started_rx.recv().unwrap();
     let external = External::held();
+    let (stopped_tx, stopped_rx) = mpsc::channel();
+    *external.stop_forwarded.lock().unwrap() = Some(stopped_tx);
     let mut queued = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&external))
         .unwrap();
+
+    let (body_started_tx, body_started_rx) = mpsc::channel();
+    let rejected = match manager.try_submit(OperationOptions::default(), move |_| {
+        let _ = body_started_tx.send(());
+        Ok::<_, ()>(())
+    }) {
+        Err(error) => error,
+        Ok(_) => panic!("second submission must be rejected while the only queue slot is occupied"),
+    };
+    let (reason, returned_body) = rejected.into_parts();
+    assert_eq!(reason, AdmissionError::Busy);
+    drop(returned_body);
+    assert!(
+        body_started_rx.try_recv().is_err(),
+        "rejected body is returned without execution"
+    );
+
     assert_eq!(
         queued.request_stop(StopReason::UserCancelled),
         StopRequestStatus::Accepted
     );
     release_tx.send(()).unwrap();
+    assert_eq!(stopped_rx.recv().unwrap(), StopReason::UserCancelled);
     assert!(matches!(
         queued.wait_outcome().unwrap(),
         OperationOutcome::Stopped(_)
