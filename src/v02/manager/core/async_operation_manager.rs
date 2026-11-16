@@ -69,6 +69,25 @@ pub struct AsyncOperationManager {
 }
 impl AsyncOperationManager {
     /// Attempts to submit a prepared external operation.
+    ///
+    /// # Type Parameters
+    ///
+    /// - `T`: Successful value produced by the external task.
+    /// - `E`: Error value produced by the external task.
+    /// - `P`: Prepared external task implementation.
+    ///
+    /// # Parameters
+    ///
+    /// - `options`: Admission and resource settings for the operation.
+    /// - `prepared`: Task that the manager binds and drives asynchronously.
+    ///
+    /// # Returns
+    ///
+    /// A handle for the accepted operation, or the original task if rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original task with the admission error when it is rejected.
     pub fn try_submit_external<T, E, P>(
         &self,
         options: OperationOptions,

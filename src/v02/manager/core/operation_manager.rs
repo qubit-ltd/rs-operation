@@ -46,6 +46,7 @@ use super::panic_message;
 use crate::v02::protocol::OperationControl;
 use crate::v02::scope::ExecutionContextGuard;
 
+/// Tracks execution resources for a manager-driven external operation.
 pub struct ExternalExecutionContext {
     operation: Arc<OperationCore>,
     lease: Arc<dyn super::SubmissionLease>,
@@ -81,14 +82,34 @@ impl ExternalExecutionContext {
     }
 }
 
+/// Routes manager stop requests to an externally driven operation.
 pub struct ExternalStopControl {
     pub(super) managed: Arc<ManagedOperationControl>,
 }
 
+/// Shared one-shot callback for publishing a typed external operation outcome.
 pub type ExternalOutcomePublisher<T, E> = Arc<Mutex<Option<Box<dyn FnOnce(OperationOutcome<T, E>) + Send + 'static>>>>;
 
+/// Shared result of claiming an external task for its operation identity.
 pub type ExternalBindResult = Arc<Mutex<Option<Result<(), crate::v02::report::ExecutionFailure>>>>;
 
+/// Drives an external task until its outcome and required cleanup are observed.
+///
+/// # Type Parameters
+///
+/// - `T`: Successful value produced by the external task.
+/// - `E`: Error value produced by the external task.
+/// - `P`: Prepared external task implementation.
+///
+/// # Parameters
+///
+/// - `scope`: Manager-owned scope assigned to the task.
+/// - `adapter`: Prepared task being activated and polled.
+/// - `bind_state`: Shared result of the task's identity claim.
+/// - `managed_state`: Shared manager control installed before dispatch.
+/// - `execution_state`: Shared execution context used to finalize the task.
+/// - `publisher_state`: One-shot callback that receives the task outcome.
+/// - `activation_permitted`: Whether manager lifecycle state permits starting.
 pub async fn drive_external<T, E, P>(
     scope: OperationScope,
     adapter: Arc<P>,
@@ -348,6 +369,25 @@ impl OperationManager {
     }
 
     /// Attempts to submit a prepared external operation.
+    ///
+    /// # Type Parameters
+    ///
+    /// - `T`: Successful value produced by the external task.
+    /// - `E`: Error value produced by the external task.
+    /// - `P`: Prepared external task implementation.
+    ///
+    /// # Parameters
+    ///
+    /// - `options`: Admission and resource settings for the operation.
+    /// - `prepared`: Task that the manager binds and drives synchronously.
+    ///
+    /// # Returns
+    ///
+    /// A handle for the accepted operation, or the original task if rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original task with the admission error when it is rejected.
     pub fn try_submit_external<T, E, P>(
         &self,
         options: OperationOptions,

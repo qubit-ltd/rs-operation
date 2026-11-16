@@ -77,6 +77,7 @@ pub(crate) struct ManagerCore {
     scope_limits: ScopeLimits,
     /// Maximum number of diagnostic entries retained in each scope.
     diagnostic_limit: usize,
+    /// Maximum number of group policies that may be attached to one operation.
     pub(crate) max_groups_per_operation: usize,
 }
 
@@ -109,6 +110,8 @@ impl ManagerCore {
     /// - `root_context`: context inherited by root operations.
     /// - `scope_limits`: default limits used by operation scopes.
     /// - `diagnostic_limit`: maximum diagnostic entries retained per scope.
+    /// - `max_groups_per_operation`: maximum group policies attached to an
+    ///   operation.
     ///
     /// # Returns
     ///
