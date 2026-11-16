@@ -26,6 +26,7 @@ use std::fmt;
 ///         }
 ///         AdmissionError::DeadlineExpired => "deadline",
 ///         AdmissionError::ExecutorUnavailable => "executor",
+///         AdmissionError::AlreadyBound => "binding",
 ///         AdmissionError::WouldDeadlock => "execution context",
 ///     }
 /// }
