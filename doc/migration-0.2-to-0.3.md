@@ -10,7 +10,7 @@ Implement `PreparedExternalOperation<T, E>` for work owned by an application exe
 
 ## Stop request return value
 
-`OperationHandle::request_stop` and `OperationScope::request_stop` return `StopRequestStatus` rather than `bool`:
+`OperationHandle::request_stop`, `AsyncOperationHandle::request_stop`, and `OperationScope::request_stop` return `StopRequestStatus` rather than `bool`:
 
 ```rust,ignore
 match handle.request_stop(StopReason::UserCancelled) {

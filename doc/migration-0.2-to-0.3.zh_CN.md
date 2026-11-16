@@ -10,7 +10,7 @@
 
 ## 停止请求返回值
 
-`OperationHandle::request_stop` 和 `OperationScope::request_stop` 返回 `StopRequestStatus`，不再返回 `bool`：
+`OperationHandle::request_stop`、`AsyncOperationHandle::request_stop` 和 `OperationScope::request_stop` 返回 `StopRequestStatus`，不再返回 `bool`：
 
 ```rust,ignore
 match handle.request_stop(StopReason::UserCancelled) {
