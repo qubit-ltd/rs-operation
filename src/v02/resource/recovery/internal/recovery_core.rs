@@ -51,191 +51,6 @@ pub(crate) struct RecoveryCore {
     pub(in crate::v02::resource::recovery) retry_route: Mutex<Option<RetryRoute>>,
 }
 
-#[cfg(test)]
-mod tests {
-    use std::error::Error;
-    use std::future::ready;
-    use std::sync::Arc;
-    use std::sync::Weak;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
-
-    use super::RecoveryCore;
-    use crate::v02::report::CleanupFailure;
-    use crate::v02::report::CleanupStage;
-    use crate::v02::report::DiagnosticSummary;
-    use crate::v02::report::ManagerId;
-    use crate::v02::report::ResourceId;
-    use crate::v02::resource::recovery::RecoveryAction;
-    use crate::v02::resource::recovery::RecoveryFuture;
-
-    struct NoopAction;
-
-    impl RecoveryAction for NoopAction {
-        fn retry(&self, _payload: crate::v02::resource::recovery::RecoveryPayload) -> RecoveryFuture {
-            Box::pin(ready(Ok(())))
-        }
-    }
-
-    fn failure(resource_id: ResourceId, sequence: usize) -> CleanupFailure {
-        CleanupFailure {
-            resource_id,
-            stage: CleanupStage::Drop,
-            summary: DiagnosticSummary::new(&format!("failure-{sequence}")),
-            source: None,
-        }
-    }
-
-    #[test]
-    fn test_retry_failure_history_retains_only_latest_sixty_four() {
-        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
-        let owner: crate::v02::resource::recovery::RecoveryPayload = Arc::new(());
-        let core = Arc::new(RecoveryCore::new(
-            vec![resource_id],
-            Arc::clone(&owner),
-            Arc::new(NoopAction),
-        ));
-
-        assert_eq!(core.snapshot().last_failures.len(), 0);
-        assert_eq!(Arc::strong_count(&owner), 2);
-        for sequence in 0..130 {
-            let attempt = core.try_retry().expect("retry should be admitted");
-            attempt.finish(Err(failure(resource_id, sequence)));
-        }
-
-        let snapshot = core.snapshot();
-        assert_eq!(snapshot.last_failures.len(), 64);
-        assert_eq!(snapshot.last_failures[0].summary.as_str(), "failure-66");
-        assert_eq!(snapshot.last_failures[63].summary.as_str(), "failure-129");
-        assert_eq!(snapshot.failures_total, 130);
-        assert!(snapshot.failures_truncated);
-        assert_eq!(snapshot.attempts, 130);
-        assert_eq!(Arc::strong_count(&owner), 2, "eviction must not release the owner");
-    }
-
-    #[test]
-    fn test_failure_history_truncates_at_sixty_fifth_failure() {
-        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
-        for count in [1, 64, 65] {
-            let core = Arc::new(RecoveryCore::new(vec![resource_id], Arc::new(()), Arc::new(NoopAction)));
-            for sequence in 0..count {
-                let attempt = core.try_retry().expect("retry should be admitted");
-                attempt.finish(Err(failure(resource_id, sequence)));
-            }
-            let snapshot = core.snapshot();
-            assert_eq!(snapshot.last_failures.len(), count.min(64));
-            assert_eq!(snapshot.failures_total, count);
-            assert_eq!(snapshot.failures_truncated, count > 64);
-        }
-    }
-
-    #[test]
-    fn test_failure_history_metadata_saturates_clears_and_survives_transfer() {
-        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
-        let core = Arc::new(RecoveryCore::new(vec![resource_id], Arc::new(()), Arc::new(NoopAction)));
-        {
-            let mut state = super::lock(&core.state);
-            state.failures_total = usize::MAX;
-            state.failures_truncated = true;
-            state.append_failure(failure(resource_id, 1));
-        }
-        let saturated = core.snapshot();
-        assert_eq!(saturated.failures_total, usize::MAX);
-        assert!(saturated.failures_truncated);
-        assert_eq!(saturated.last_failures.len(), 1);
-
-        assert!(core.mark_transferred());
-        assert_eq!(core.snapshot().failures_total, usize::MAX);
-        core.restore_from_store().expect("transfer should restore");
-        assert_eq!(core.snapshot().last_failures.len(), 1);
-
-        let attempt = core.try_retry().expect("retry should be admitted");
-        attempt.finish(Ok(()));
-        let resolved = core.snapshot();
-        assert!(resolved.last_failures.is_empty());
-        assert_eq!(resolved.failures_total, 0);
-        assert!(!resolved.failures_truncated);
-        assert_eq!(resolved.attempts, 1, "success must preserve the attempt count");
-    }
-
-    #[test]
-    fn test_unconfirmed_failures_from_many_resources_are_bounded() {
-        let resources = (0..130)
-            .map(|slot| ResourceId::new(ManagerId::from_raw(1), slot, 3))
-            .collect();
-        let core = Arc::new(RecoveryCore::new(resources, Arc::new(()), Arc::new(NoopAction)));
-        let attempt = core.try_retry().expect("retry should be admitted");
-        let generation = super::lock(&core.state).generation;
-        core.mark_cancelled(generation, None);
-
-        let snapshot = core.snapshot();
-        assert_eq!(snapshot.phase, crate::v02::report::RecoveryPhase::Unconfirmed);
-        assert_eq!(snapshot.last_failures.len(), 64);
-        assert_eq!(snapshot.failures_total, 130);
-        assert!(snapshot.failures_truncated);
-        assert_eq!(snapshot.attempts, 1);
-        drop(attempt);
-    }
-
-    struct LockCheckingError {
-        core: Weak<RecoveryCore>,
-        lock_was_available_on_drop: Arc<AtomicBool>,
-    }
-
-    impl std::fmt::Debug for LockCheckingError {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("LockCheckingError")
-        }
-    }
-
-    impl std::fmt::Display for LockCheckingError {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("lock checking failure")
-        }
-    }
-
-    impl Error for LockCheckingError {}
-
-    impl Drop for LockCheckingError {
-        fn drop(&mut self) {
-            let lock_was_available = self
-                .core
-                .upgrade()
-                .is_some_and(|core| core.state.try_lock().is_ok());
-            self.lock_was_available_on_drop.store(lock_was_available, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn test_evicted_error_is_dropped_after_state_unlock() {
-        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
-        let core = Arc::new(RecoveryCore::new(vec![resource_id], Arc::new(()), Arc::new(NoopAction)));
-        let lock_was_available_on_drop = Arc::new(AtomicBool::new(false));
-        {
-            let mut state = super::lock(&core.state);
-            state.append_failure(CleanupFailure {
-                resource_id,
-                stage: CleanupStage::Drop,
-                summary: DiagnosticSummary::new("eviction probe"),
-                source: Some(Arc::new(LockCheckingError {
-                    core: Arc::downgrade(&core),
-                    lock_was_available_on_drop: Arc::clone(&lock_was_available_on_drop),
-                })),
-            });
-            for sequence in 1..64 {
-                state.append_failure(failure(resource_id, sequence));
-            }
-        }
-        let attempt = core.try_retry().expect("retry should be admitted");
-        attempt.finish(Err(failure(resource_id, 65)));
-        drop(attempt);
-        assert!(
-            lock_was_available_on_drop.load(Ordering::SeqCst),
-            "evicted source destructor should be able to acquire the recovery state lock"
-        );
-    }
-}
-
 impl Drop for RecoveryCore {
     /// Retains unresolved cleanup ownership instead of dropping the resource.
     ///
@@ -633,5 +448,188 @@ impl RecoveryCore {
     /// The number of resource IDs retained in the group.
     pub(in crate::v02::resource::recovery) fn resource_count(&self) -> usize {
         self.resources.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::future::ready;
+    use std::sync::Arc;
+    use std::sync::Weak;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use super::RecoveryCore;
+    use crate::v02::report::CleanupFailure;
+    use crate::v02::report::CleanupStage;
+    use crate::v02::report::DiagnosticSummary;
+    use crate::v02::report::ManagerId;
+    use crate::v02::report::ResourceId;
+    use crate::v02::resource::recovery::RecoveryAction;
+    use crate::v02::resource::recovery::RecoveryFuture;
+
+    struct NoopAction;
+
+    impl RecoveryAction for NoopAction {
+        fn retry(&self, _payload: crate::v02::resource::recovery::RecoveryPayload) -> RecoveryFuture {
+            Box::pin(ready(Ok(())))
+        }
+    }
+
+    fn failure(resource_id: ResourceId, sequence: usize) -> CleanupFailure {
+        CleanupFailure {
+            resource_id,
+            stage: CleanupStage::Drop,
+            summary: DiagnosticSummary::new(&format!("failure-{sequence}")),
+            source: None,
+        }
+    }
+
+    #[test]
+    fn test_retry_failure_history_retains_only_latest_sixty_four() {
+        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
+        let owner: crate::v02::resource::recovery::RecoveryPayload = Arc::new(());
+        let core = Arc::new(RecoveryCore::new(
+            vec![resource_id],
+            Arc::clone(&owner),
+            Arc::new(NoopAction),
+        ));
+
+        assert_eq!(core.snapshot().last_failures.len(), 0);
+        assert_eq!(Arc::strong_count(&owner), 2);
+        for sequence in 0..130 {
+            let attempt = core.try_retry().expect("retry should be admitted");
+            attempt.finish(Err(failure(resource_id, sequence)));
+        }
+
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.last_failures.len(), 64);
+        assert_eq!(snapshot.last_failures[0].summary.as_str(), "failure-66");
+        assert_eq!(snapshot.last_failures[63].summary.as_str(), "failure-129");
+        assert_eq!(snapshot.failures_total, 130);
+        assert!(snapshot.failures_truncated);
+        assert_eq!(snapshot.attempts, 130);
+        assert_eq!(Arc::strong_count(&owner), 2, "eviction must not release the owner");
+    }
+
+    #[test]
+    fn test_failure_history_truncates_at_sixty_fifth_failure() {
+        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
+        for count in [1, 64, 65] {
+            let core = Arc::new(RecoveryCore::new(vec![resource_id], Arc::new(()), Arc::new(NoopAction)));
+            for sequence in 0..count {
+                let attempt = core.try_retry().expect("retry should be admitted");
+                attempt.finish(Err(failure(resource_id, sequence)));
+            }
+            let snapshot = core.snapshot();
+            assert_eq!(snapshot.last_failures.len(), count.min(64));
+            assert_eq!(snapshot.failures_total, count);
+            assert_eq!(snapshot.failures_truncated, count > 64);
+        }
+    }
+
+    #[test]
+    fn test_failure_history_metadata_saturates_clears_and_survives_transfer() {
+        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
+        let core = Arc::new(RecoveryCore::new(vec![resource_id], Arc::new(()), Arc::new(NoopAction)));
+        {
+            let mut state = super::lock(&core.state);
+            state.failures_total = usize::MAX;
+            state.failures_truncated = true;
+            state.append_failure(failure(resource_id, 1));
+        }
+        let saturated = core.snapshot();
+        assert_eq!(saturated.failures_total, usize::MAX);
+        assert!(saturated.failures_truncated);
+        assert_eq!(saturated.last_failures.len(), 1);
+
+        assert!(core.mark_transferred());
+        assert_eq!(core.snapshot().failures_total, usize::MAX);
+        core.restore_from_store().expect("transfer should restore");
+        assert_eq!(core.snapshot().last_failures.len(), 1);
+
+        let attempt = core.try_retry().expect("retry should be admitted");
+        attempt.finish(Ok(()));
+        let resolved = core.snapshot();
+        assert!(resolved.last_failures.is_empty());
+        assert_eq!(resolved.failures_total, 0);
+        assert!(!resolved.failures_truncated);
+        assert_eq!(resolved.attempts, 1, "success must preserve the attempt count");
+    }
+
+    #[test]
+    fn test_unconfirmed_failures_from_many_resources_are_bounded() {
+        let resources = (0..130)
+            .map(|slot| ResourceId::new(ManagerId::from_raw(1), slot, 3))
+            .collect();
+        let core = Arc::new(RecoveryCore::new(resources, Arc::new(()), Arc::new(NoopAction)));
+        let attempt = core.try_retry().expect("retry should be admitted");
+        let generation = super::lock(&core.state).generation;
+        core.mark_cancelled(generation, None);
+
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.phase, crate::v02::report::RecoveryPhase::Unconfirmed);
+        assert_eq!(snapshot.last_failures.len(), 64);
+        assert_eq!(snapshot.failures_total, 130);
+        assert!(snapshot.failures_truncated);
+        assert_eq!(snapshot.attempts, 1);
+        drop(attempt);
+    }
+
+    struct LockCheckingError {
+        core: Weak<RecoveryCore>,
+        lock_was_available_on_drop: Arc<AtomicBool>,
+    }
+
+    impl std::fmt::Debug for LockCheckingError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("LockCheckingError")
+        }
+    }
+
+    impl std::fmt::Display for LockCheckingError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("lock checking failure")
+        }
+    }
+
+    impl Error for LockCheckingError {}
+
+    impl Drop for LockCheckingError {
+        fn drop(&mut self) {
+            let lock_was_available = self.core.upgrade().is_some_and(|core| core.state.try_lock().is_ok());
+            self.lock_was_available_on_drop
+                .store(lock_was_available, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_evicted_error_is_dropped_after_state_unlock() {
+        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
+        let core = Arc::new(RecoveryCore::new(vec![resource_id], Arc::new(()), Arc::new(NoopAction)));
+        let lock_was_available_on_drop = Arc::new(AtomicBool::new(false));
+        {
+            let mut state = super::lock(&core.state);
+            state.append_failure(CleanupFailure {
+                resource_id,
+                stage: CleanupStage::Drop,
+                summary: DiagnosticSummary::new("eviction probe"),
+                source: Some(Arc::new(LockCheckingError {
+                    core: Arc::downgrade(&core),
+                    lock_was_available_on_drop: Arc::clone(&lock_was_available_on_drop),
+                })),
+            });
+            for sequence in 1..64 {
+                state.append_failure(failure(resource_id, sequence));
+            }
+        }
+        let attempt = core.try_retry().expect("retry should be admitted");
+        attempt.finish(Err(failure(resource_id, 65)));
+        drop(attempt);
+        assert!(
+            lock_was_available_on_drop.load(Ordering::SeqCst),
+            "evicted source destructor should be able to acquire the recovery state lock"
+        );
     }
 }
