@@ -60,6 +60,9 @@ struct Prepared {
     summary_ready: std::sync::atomic::AtomicBool,
     summary_waker: std::sync::Mutex<Option<Waker>>,
     summary_polls: std::sync::atomic::AtomicUsize,
+    summary_kind: std::sync::atomic::AtomicUsize,
+    summary_id: std::sync::Mutex<Option<OperationId>>,
+    typed_outcome: std::sync::Mutex<Option<OperationOutcome<usize, ()>>>,
     settlement_ready: std::sync::atomic::AtomicBool,
     settlement_waker: std::sync::Mutex<Option<Waker>>,
     settlement_polls: std::sync::atomic::AtomicUsize,
@@ -105,11 +108,19 @@ impl OperationControl for Prepared {
             *self.summary_waker.lock().unwrap() = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        Poll::Ready(ChildOutcomeSummary {
-            operation_id: self.id.lock().unwrap().expect("bound before polling"),
-            kind: ChildOutcomeKind::Succeeded,
-            summary: DiagnosticSummary::new("inference completed"),
-        })
+        let operation_id = self
+            .summary_id
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| self.id.lock().unwrap().expect("bound before polling"));
+        let (kind, summary) = match self.summary_kind.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => (ChildOutcomeKind::Failed, "failed for a domain-specific reason"),
+            2 => (ChildOutcomeKind::Stopped, "stopped by a policy decision"),
+            3 => (ChildOutcomeKind::Failed, "failure classification mismatch"),
+            _ => (ChildOutcomeKind::Succeeded, "inference completed"),
+        };
+        Poll::Ready(ChildOutcomeSummary { operation_id, kind, summary: DiagnosticSummary::new(summary) })
     }
     fn poll_release(&self, cx: &mut Context<'_>) -> Poll<ChildRelease> {
         assert_eq!(
@@ -204,6 +215,9 @@ impl Prepared {
             summary_ready: std::sync::atomic::AtomicBool::new(true),
             summary_waker: std::sync::Mutex::new(None),
             summary_polls: std::sync::atomic::AtomicUsize::new(0),
+            summary_kind: std::sync::atomic::AtomicUsize::new(0),
+            summary_id: std::sync::Mutex::new(None),
+            typed_outcome: std::sync::Mutex::new(None),
             settlement_ready: std::sync::atomic::AtomicBool::new(true),
             settlement_waker: std::sync::Mutex::new(None),
             settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -281,7 +295,7 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
             *self.outcome_waker.lock().unwrap() = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        Poll::Ready(OperationOutcome::Succeeded(7))
+        Poll::Ready(self.typed_outcome.lock().unwrap().take().unwrap_or(OperationOutcome::Succeeded(7)))
     }
 }
 
@@ -308,6 +322,9 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+            summary_kind: std::sync::atomic::AtomicUsize::new(0),
+            summary_id: std::sync::Mutex::new(None),
+            typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -384,6 +401,9 @@ fn test_post_claim_bind_failure_is_accepted_and_abandoned_once() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+            summary_kind: std::sync::atomic::AtomicUsize::new(0),
+            summary_id: std::sync::Mutex::new(None),
+            typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -429,6 +449,9 @@ fn test_stop_during_bind_wins_before_commit_and_abandons_without_activation() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+            summary_kind: std::sync::atomic::AtomicUsize::new(0),
+            summary_id: std::sync::Mutex::new(None),
+            typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -493,6 +516,9 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+            summary_kind: std::sync::atomic::AtomicUsize::new(0),
+            summary_id: std::sync::Mutex::new(None),
+            typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -542,6 +568,9 @@ fn test_already_bound_claim_rolls_back_provisional_parent_child_link() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+            summary_kind: std::sync::atomic::AtomicUsize::new(0),
+            summary_id: std::sync::Mutex::new(None),
+            typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -597,6 +626,9 @@ fn test_dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+            summary_kind: std::sync::atomic::AtomicUsize::new(0),
+            summary_id: std::sync::Mutex::new(None),
+            typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -771,6 +803,59 @@ fn test_typed_result_waits_for_matching_summary_when_facts_arrive_out_of_order()
         OperationOutcome::Succeeded(7)
     ));
     waiter.join().unwrap();
+}
+
+#[test]
+fn test_external_summary_diagnostics_are_free_for_failed_and_stopped_outcomes() {
+    for (kind, outcome) in [
+        (1, OperationOutcome::Failed(())),
+        (2, OperationOutcome::Stopped(qubit_operation::StopReport {
+            reason: StopReason::UserCancelled,
+            accepted_at: None,
+        })),
+    ] {
+        let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+        let prepared = Prepared::ready_fixture();
+        prepared.summary_kind.store(kind, std::sync::atomic::Ordering::SeqCst);
+        *prepared.typed_outcome.lock().unwrap() = Some(outcome);
+        let mut handle = manager
+            .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
+            .unwrap();
+        match kind {
+            1 => assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Failed(()))),
+            _ => assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Stopped(_))),
+        }
+        handle.wait_settlement().unwrap();
+    }
+}
+
+#[test]
+fn test_external_summary_rejects_wrong_classification_and_identity() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let first = Prepared::ready_fixture();
+    let first_handle = manager
+        .try_submit_external(OperationOptions::default(), Arc::clone(&first))
+        .unwrap();
+    let foreign_id = first.id.lock().unwrap().expect("first operation is bound");
+    let mut first_handle = first_handle;
+    assert!(matches!(first_handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
+    first_handle.wait_settlement().unwrap();
+
+    let wrong_kind = Prepared::ready_fixture();
+    wrong_kind.summary_kind.store(3, std::sync::atomic::Ordering::SeqCst);
+    let mut handle = manager
+        .try_submit_external(OperationOptions::default(), Arc::clone(&wrong_kind))
+        .unwrap();
+    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::ExecutionFailed(_)));
+    handle.wait_settlement().unwrap();
+
+    let wrong_id = Prepared::ready_fixture();
+    *wrong_id.summary_id.lock().unwrap() = Some(foreign_id);
+    let mut handle = manager
+        .try_submit_external(OperationOptions::default(), Arc::clone(&wrong_id))
+        .unwrap();
+    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::ExecutionFailed(_)));
+    handle.wait_settlement().unwrap();
 }
 
 #[test]
@@ -973,6 +1058,9 @@ fn test_async_manager_drives_external_activation_on_portable_executor() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+            summary_kind: std::sync::atomic::AtomicUsize::new(0),
+            summary_id: std::sync::Mutex::new(None),
+            typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
