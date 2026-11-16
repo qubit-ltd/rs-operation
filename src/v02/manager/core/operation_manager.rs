@@ -23,6 +23,7 @@ use super::ExecutionPhase;
 use super::ExternalExecutionContext;
 use super::ExternalOutcomePublisher;
 use super::ExternalStopControl;
+use super::ExternalSubmissionState;
 use super::ManagedOperationControl;
 use super::ManagerCore;
 use super::OperationCore;
@@ -105,10 +106,7 @@ impl OperationManager {
         let existing = match &self.target {
             SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => groups,
         };
-        if existing
-            .iter()
-            .any(|item| Arc::ptr_eq(item, &group.group_core()))
-        {
+        if existing.iter().any(|item| Arc::ptr_eq(item, &group.group_core())) {
             return Ok(self.clone());
         }
         if existing.len() >= self.core.max_groups_per_operation {
@@ -149,10 +147,8 @@ impl OperationManager {
     {
         let bind_result: Arc<Mutex<Option<Result<(), crate::v02::report::ExecutionFailure>>>> =
             Arc::new(Mutex::new(None));
-        let managed_control: Arc<Mutex<Option<Arc<ManagedOperationControl>>>> =
-            Arc::new(Mutex::new(None));
-        let execution_context: Arc<Mutex<Option<Arc<ExternalExecutionContext>>>> =
-            Arc::new(Mutex::new(None));
+        let managed_control: Arc<Mutex<Option<Arc<ManagedOperationControl>>>> = Arc::new(Mutex::new(None));
+        let execution_context: Arc<Mutex<Option<Arc<ExternalExecutionContext>>>> = Arc::new(Mutex::new(None));
         let outcome_publisher: ExternalOutcomePublisher<T, E> = Arc::new(Mutex::new(None));
         let activation_permitted = Arc::new(AtomicBool::new(false));
         let state_for_preflight = Arc::clone(&bind_result);
@@ -204,13 +200,15 @@ impl OperationManager {
             options,
             runner,
             preflight,
-            Some(domain),
-            false,
-            Some(abandon),
-            Some(Arc::clone(&managed_control)),
-            Some(Arc::clone(&execution_context)),
-            Some(Arc::clone(&outcome_publisher)),
-            Some(Arc::clone(&activation_permitted)),
+            ExternalSubmissionState {
+                external_control: Some(domain),
+                confirm_input_release: false,
+                on_abandon: Some(abandon),
+                external_managed: Some(Arc::clone(&managed_control)),
+                external_execution: Some(Arc::clone(&execution_context)),
+                early_publisher: Some(Arc::clone(&outcome_publisher)),
+                activation_permitted: Some(Arc::clone(&activation_permitted)),
+            },
         ) {
             Ok(handle) => Ok(handle),
             Err(error) => {
@@ -234,9 +232,7 @@ impl OperationManager {
     ///
     /// Returns `ManagerCreateError` if the configured production resources
     /// cannot be initialized.
-    pub fn new(
-        options: crate::v02::report::ManagerOptions,
-    ) -> Result<Self, crate::v02::report::ManagerCreateError> {
+    pub fn new(options: crate::v02::report::ManagerOptions) -> Result<Self, crate::v02::report::ManagerCreateError> {
         crate::v02::manager::production::new_sync(options)
     }
 
@@ -284,8 +280,7 @@ impl OperationManager {
     /// The call stops new submissions while accepted work continues to drain.
     #[inline]
     pub fn close_admission(&self) {
-        self.core
-            .request_shutdown(crate::v02::report::ShutdownMode::Drain);
+        self.core.request_shutdown(crate::v02::report::ShutdownMode::Drain);
     }
 
     /// Requests shutdown and returns a handle for observing its completion.
@@ -326,8 +321,7 @@ impl OperationManager {
     pub fn group(
         &self,
         options: crate::v02::report::GroupOptions,
-    ) -> Result<crate::v02::manager::group::OperationGroup, crate::v02::report::ManagerCreateError>
-    {
+    ) -> Result<crate::v02::manager::group::OperationGroup, crate::v02::report::ManagerCreateError> {
         crate::v02::manager::group::OperationGroup::new(self.clone(), options)
     }
 
@@ -371,17 +365,12 @@ impl OperationManager {
     pub(crate) fn service_resource_scope(
         &self,
         capacity: usize,
-    ) -> Result<
-        crate::v02::resource::service::ServiceResourceScope,
-        crate::v02::report::ResourceScopeError,
-    > {
+    ) -> Result<crate::v02::resource::service::ServiceResourceScope, crate::v02::report::ResourceScopeError> {
         self.core
             .service_resource_scope(
                 capacity,
                 match &self.target {
-                    SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => {
-                        groups.clone()
-                    }
+                    SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => groups.clone(),
                 },
             )
             .map(crate::v02::resource::service::ServiceResourceScope::new)
@@ -407,10 +396,7 @@ impl OperationManager {
     ///
     /// This manager view with its target updated to use `group`.
     #[inline]
-    pub(crate) fn with_group_core(
-        mut self,
-        group: Arc<crate::v02::manager::group::GroupCore>,
-    ) -> Self {
+    pub(crate) fn with_group_core(mut self, group: Arc<crate::v02::manager::group::GroupCore>) -> Self {
         match &mut self.target {
             SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => {
                 if !groups.iter().any(|item| Arc::ptr_eq(item, &group)) {
@@ -450,11 +436,7 @@ impl OperationManager {
     /// # Errors
     ///
     /// Returns the original body with the admission or operation setup error.
-    pub fn submit<T, E, F>(
-        &self,
-        options: OperationOptions,
-        body: F,
-    ) -> Result<OperationHandle<T, E>, SubmitError<F>>
+    pub fn submit<T, E, F>(&self, options: OperationOptions, body: F) -> Result<OperationHandle<T, E>, SubmitError<F>>
     where
         T: Send + 'static,
         E: Send + 'static,
@@ -464,8 +446,7 @@ impl OperationManager {
         loop {
             match self.try_submit(
                 options.clone(),
-                body.take()
-                    .expect("submission body remains available until accepted"),
+                body.take().expect("submission body remains available until accepted"),
             ) {
                 Ok(handle) => return Ok(handle),
                 Err(error) => {
@@ -535,13 +516,15 @@ impl OperationManager {
             options,
             runner,
             |_| Ok(()),
-            None,
-            true,
-            None,
-            None,
-            None,
-            None,
-            None,
+            ExternalSubmissionState {
+                external_control: None,
+                confirm_input_release: true,
+                on_abandon: None,
+                external_managed: None,
+                external_execution: None,
+                early_publisher: None,
+                activation_permitted: None,
+            },
         ) {
             Ok(handle) => Ok(handle),
             Err(error) => {
@@ -572,13 +555,8 @@ impl OperationManager {
     /// - `options`: Admission and scope settings for the operation.
     /// - `body`: Operation body retained until dispatch.
     /// - `preflight`: Identity claim run after admission succeeds.
-    /// - `external_control`: Optional protocol control for an external operation.
-    /// - `confirm_input_release`: Whether input release must be confirmed.
-    /// - `on_abandon`: Optional callback run if the reserved operation is abandoned.
-    /// - `external_managed`: Optional slot for manager control of an external operation.
-    /// - `external_execution`: Optional slot for external execution lifecycle state.
-    /// - `early_publisher`: Optional callback for publishing an early outcome.
-    /// - `activation_permitted`: Optional flag that gates external body activation.
+    /// - `external_state`: Optional protocol control, release, and lifecycle
+    ///   state for the submitted operation.
     ///
     /// # Returns
     ///
@@ -586,19 +564,14 @@ impl OperationManager {
     ///
     /// # Errors
     ///
-    /// Returns the body with the admission error when the operation is rejected.
+    /// Returns the body with the admission error when the operation is
+    /// rejected.
     fn try_submit_raw_with_preflight<T, E, F, C>(
         &self,
         options: OperationOptions,
         body: F,
         preflight: C,
-        external_control: Option<Arc<dyn OperationControl>>,
-        confirm_input_release: bool,
-        on_abandon: Option<Box<dyn FnOnce() + Send>>,
-        external_managed: Option<Arc<Mutex<Option<Arc<ManagedOperationControl>>>>>,
-        external_execution: Option<Arc<Mutex<Option<Arc<ExternalExecutionContext>>>>>,
-        early_publisher: Option<ExternalOutcomePublisher<T, E>>,
-        activation_permitted: Option<Arc<AtomicBool>>,
+        external_state: ExternalSubmissionState<T, E>,
     ) -> Result<OperationHandle<T, E>, SubmitError<F>>
     where
         T: Send + 'static,
@@ -606,6 +579,15 @@ impl OperationManager {
         F: FnOnce(OperationScope) -> Option<OperationOutcome<T, E>> + Send + 'static,
         C: FnOnce(OperationId) -> Result<(), AdmissionError>,
     {
+        let ExternalSubmissionState {
+            external_control,
+            confirm_input_release,
+            on_abandon,
+            external_managed,
+            external_execution,
+            early_publisher,
+            activation_permitted,
+        } = external_state;
         let body_cell = Arc::new(Mutex::new(Some(body)));
         let body_for_job = Arc::clone(&body_cell);
         let early_published = Arc::new(AtomicBool::new(false));
@@ -615,12 +597,9 @@ impl OperationManager {
         let external_mode = external_execution.is_some();
         let external_execution_for_runner = external_execution.clone();
         let runner = move |scope: OperationScope| {
-            let body = lock(&body_for_job)
-                .take()
-                .expect("accepted body is present");
-            let (operation, slot, lease, parent, control) = lock(&parts_for_job)
-                .take()
-                .expect("accepted runner capsule is present");
+            let body = lock(&body_for_job).take().expect("accepted body is present");
+            let (operation, slot, lease, parent, control) =
+                lock(&parts_for_job).take().expect("accepted runner capsule is present");
             let scope_core = Arc::clone(&scope.core);
             let operation_id = scope.id();
             let mut frame = Some(ExecutionFrameGuard::new(Arc::clone(&scope_core)));
@@ -633,10 +612,7 @@ impl OperationManager {
                     frame.take(),
                 )));
             }
-            let manager_core = scope_core
-                .manager()
-                .upgrade()
-                .expect("active scope manager exists");
+            let manager_core = scope_core.manager().upgrade().expect("active scope manager exists");
             let groups = scope_core.groups().to_vec();
             let result = {
                 let _context = ExecutionContextGuard::enter(&manager_core, operation_id, &groups);
@@ -645,9 +621,7 @@ impl OperationManager {
             if external_execution.is_none() {
                 operation.set_execution(ExecutionPhase::Finished);
                 lease.execution_finished();
-            } else if let Some(context) =
-                lock(external_execution_for_runner.as_ref().unwrap()).as_ref()
-            {
+            } else if let Some(context) = lock(external_execution_for_runner.as_ref().unwrap()).as_ref() {
                 context.finish();
             }
             if confirm_input_release {
@@ -660,15 +634,11 @@ impl OperationManager {
                 scope_core.on_outcomes_ready(move || {
                     let outcome = match result {
                         Ok(Some(outcome)) => outcome,
-                        Ok(None) => OperationOutcome::ExecutionFailed(
-                            crate::v02::report::ExecutionFailure {
-                                operation_id,
-                                summary: DiagnosticSummary::new(
-                                    "external driver ended without publishing an outcome",
-                                ),
-                                source: None,
-                            },
-                        ),
+                        Ok(None) => OperationOutcome::ExecutionFailed(crate::v02::report::ExecutionFailure {
+                            operation_id,
+                            summary: DiagnosticSummary::new("external driver ended without publishing an outcome"),
+                            source: None,
+                        }),
                         Err(payload) => OperationOutcome::Panicked(PanicSummary {
                             operation_id,
                             phase: ExecutionPhase::Running,
@@ -844,9 +814,7 @@ impl OperationManager {
         let mut operation = self
             .submit(options, body)
             .map_err(crate::v02::report::RunError::Submit)?;
-        operation
-            .wait_outcome()
-            .map_err(crate::v02::report::RunError::Outcome)
+        operation.wait_outcome().map_err(crate::v02::report::RunError::Outcome)
     }
 
     /// Submits a synchronous operation and waits for both outcome and
@@ -890,10 +858,7 @@ impl OperationManager {
         let settlement = operation
             .wait_settlement()
             .map_err(crate::v02::report::RunError::Observation)?;
-        Ok(crate::v02::report::OperationCompletion {
-            outcome,
-            settlement,
-        })
+        Ok(crate::v02::report::OperationCompletion { outcome, settlement })
     }
 
     /// Submits a unit-returning body through the test execution port.
@@ -910,8 +875,7 @@ impl OperationManager {
     where
         F: FnOnce(OperationScope) + Send + 'static,
     {
-        self.core
-            .submit_scope(&self.target, OperationOptions::default(), body)
+        self.core.submit_scope(&self.target, OperationOptions::default(), body)
     }
 
     /// Submits a configured unit-returning body through the test port.

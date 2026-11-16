@@ -13,18 +13,32 @@ use std::task::Poll;
 use std::task::Wake;
 use std::task::Waker;
 
+use qubit_operation::AdmissionError;
+use qubit_operation::AsyncOperationManager;
+use qubit_operation::ChildOutcomeKind;
 use qubit_operation::ChildOutcomeSummary;
 use qubit_operation::ChildRelease;
 use qubit_operation::ChildSnapshot;
+use qubit_operation::DiagnosticSummary;
 use qubit_operation::ExecutionFailure;
+use qubit_operation::ExecutionPhase;
 use qubit_operation::ExternalBindError;
+use qubit_operation::ManagerLimits;
+use qubit_operation::ManagerOptions;
+use qubit_operation::OperationControl;
 use qubit_operation::OperationId;
+use qubit_operation::OperationManager;
+use qubit_operation::OperationOptions;
 use qubit_operation::OperationOutcome;
 use qubit_operation::OperationScope;
 use qubit_operation::PreparedExternalOperation;
 use qubit_operation::SettlementReport;
+use qubit_operation::SettlementStatus;
+use qubit_operation::SettlementWait;
+use qubit_operation::ShutdownMode;
 use qubit_operation::StopReason;
-use qubit_operation::StopReport;
+use qubit_operation::StopRequestStatus;
+use qubit_operation::ThreadPoolExecutorOptions;
 
 struct Prepared {
     activated: std::sync::atomic::AtomicUsize,

@@ -20,6 +20,11 @@ pub struct ExternalStopControl {
 }
 
 impl StopControl for ExternalStopControl {
+    /// Forwards the requested stop reason to the managed operation control.
+    ///
+    /// # Parameters
+    ///
+    /// - `reason`: Stop reason forwarded to the managed operation.
     fn request_stop(&self, reason: crate::v02::report::StopReason) {
         StopControl::request_stop(self.managed.as_ref(), reason);
     }

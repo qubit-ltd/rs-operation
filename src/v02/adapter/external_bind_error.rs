@@ -16,5 +16,5 @@ pub enum ExternalBindError {
     /// This prepared operation has already been bound to another submission.
     AlreadyBound,
     /// Binding failed after the adapter claimed this operation.
-    Failed(ExecutionFailure),
+    Failed(#[doc = "Execution failure reported when the binding could not complete."] ExecutionFailure),
 }

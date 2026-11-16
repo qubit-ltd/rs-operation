@@ -31,8 +31,7 @@ use super::panic_message;
 ///
 /// - `T`: Successful value produced by the external task.
 /// - `E`: Error value produced by the external task.
-pub type ExternalOutcomePublisher<T, E> =
-    Arc<Mutex<Option<Box<dyn FnOnce(OperationOutcome<T, E>) + Send + 'static>>>>;
+pub type ExternalOutcomePublisher<T, E> = Arc<Mutex<Option<Box<dyn FnOnce(OperationOutcome<T, E>) + Send + 'static>>>>;
 
 /// Shared result of claiming an external task for its operation identity.
 pub type ExternalBindResult = Arc<Mutex<Option<Result<(), crate::v02::report::ExecutionFailure>>>>;
@@ -107,22 +106,20 @@ pub async fn drive_external<T, E, P>(
                     },
                 ))
             }
-            Ok(_) => {
-                match panic::catch_unwind(AssertUnwindSafe(|| adapter.clone().activate(scope))) {
-                    Ok(Ok(())) => {
-                        activated = true;
-                        None
-                    }
-                    Ok(Err(failure)) => Some(OperationOutcome::ExecutionFailed(failure)),
-                    Err(payload) => Some(OperationOutcome::ExecutionFailed(
-                        crate::v02::report::ExecutionFailure {
-                            operation_id,
-                            summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
-                            source: None,
-                        },
-                    )),
+            Ok(_) => match panic::catch_unwind(AssertUnwindSafe(|| adapter.clone().activate(scope))) {
+                Ok(Ok(())) => {
+                    activated = true;
+                    None
                 }
-            }
+                Ok(Err(failure)) => Some(OperationOutcome::ExecutionFailed(failure)),
+                Err(payload) => Some(OperationOutcome::ExecutionFailed(
+                    crate::v02::report::ExecutionFailure {
+                        operation_id,
+                        summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
+                        source: None,
+                    },
+                )),
+            },
         }
     };
     let managed = lock(&managed_state)
@@ -151,19 +148,18 @@ pub async fn drive_external<T, E, P>(
         let _ = panic::catch_unwind(AssertUnwindSafe(|| adapter.request_stop(reason)));
         stop_forwarded = true;
     }
-    if typed_poll_done {
-        if let Some(callback) = lock(&publisher_state).take() {
-            callback(typed.take().expect("outcome exists"));
-            published = true;
-            finish_execution();
-        }
+    if typed_poll_done && let Some(callback) = lock(&publisher_state).take() {
+        callback(typed.take().expect("outcome exists"));
+        published = true;
+        finish_execution();
     }
     std::future::poll_fn(|cx| {
-        if activated && !stop_forwarded {
-            if let Poll::Ready(reason) = stop_signal.as_mut().poll(cx) {
-                let _ = panic::catch_unwind(AssertUnwindSafe(|| adapter.request_stop(reason)));
-                stop_forwarded = true;
-            }
+        if activated
+            && !stop_forwarded
+            && let Poll::Ready(reason) = stop_signal.as_mut().poll(cx)
+        {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| adapter.request_stop(reason)));
+            stop_forwarded = true;
         }
         if activated && !typed_poll_done {
             match panic::catch_unwind(AssertUnwindSafe(|| adapter.poll_take_outcome(cx))) {
@@ -210,9 +206,7 @@ pub async fn drive_external<T, E, P>(
         }
         if settlement.is_none() && !settlement_poll_failed {
             match panic::catch_unwind(AssertUnwindSafe(|| adapter.poll_settlement(cx))) {
-                Ok(Poll::Ready(value)) if value.operation_id == operation_id => {
-                    settlement = Some(value)
-                }
+                Ok(Poll::Ready(value)) if value.operation_id == operation_id => settlement = Some(value),
                 Ok(Poll::Ready(_)) => settlement_poll_failed = true,
                 Ok(Poll::Pending) => {}
                 Err(_) => settlement_poll_failed = true,
@@ -220,13 +214,11 @@ pub async fn drive_external<T, E, P>(
         }
         if typed_poll_done && !published && (!activated || summary_poll_done || typed_poll_failed) {
             if activated {
-                let expected = typed
-                    .as_ref()
-                    .map(|value| child_outcome_summary(operation_id, value));
+                let expected = typed.as_ref().map(|value| child_outcome_summary(operation_id, value));
                 if summary_poll_failed
-                    || summary.as_ref().is_none_or(|value| {
-                        Some(value) != expected.as_ref() || value.operation_id != operation_id
-                    })
+                    || summary
+                        .as_ref()
+                        .is_none_or(|value| Some(value) != expected.as_ref() || value.operation_id != operation_id)
                 {
                     typed = Some(OperationOutcome::ExecutionFailed(
                         crate::v02::report::ExecutionFailure {
@@ -237,12 +229,12 @@ pub async fn drive_external<T, E, P>(
                     ));
                 }
             }
-            if let Some(callback) = lock(&publisher_state).take() {
-                if let Some(outcome) = typed.take() {
-                    callback(outcome);
-                    finish_execution();
-                    published = true;
-                }
+            if let Some(callback) = lock(&publisher_state).take()
+                && let Some(outcome) = typed.take()
+            {
+                callback(outcome);
+                finish_execution();
+                published = true;
             }
         }
         if published && release && settlement.is_some() {

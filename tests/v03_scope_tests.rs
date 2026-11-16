@@ -41,8 +41,10 @@ fn test_distinct_groups_both_track_a_bound_operation() {
 
 #[test]
 fn test_group_binding_limit_uses_manager_configuration() {
-    let mut options = ManagerOptions::default();
-    options.max_groups_per_operation = 1;
+    let options = ManagerOptions {
+        max_groups_per_operation: 1,
+        ..ManagerOptions::default()
+    };
     let manager = OperationManager::new(options).unwrap();
     let first = manager.group(GroupOptions { capacity: 2 }).unwrap();
     let second = manager.group(GroupOptions { capacity: 2 }).unwrap();
@@ -55,8 +57,10 @@ fn test_group_binding_limit_uses_manager_configuration() {
 
 #[test]
 fn test_zero_group_binding_limit_is_rejected() {
-    let mut options = ManagerOptions::default();
-    options.max_groups_per_operation = 0;
+    let options = ManagerOptions {
+        max_groups_per_operation: 0,
+        ..ManagerOptions::default()
+    };
     assert!(matches!(
         OperationManager::new(options),
         Err(ManagerCreateError::InvalidOptions {
@@ -406,8 +410,10 @@ fn test_group_binding_rejects_another_manager_and_does_not_mutate_original_view(
 
 #[test]
 fn test_inherited_parent_group_counts_toward_group_binding_limit() {
-    let mut options = ManagerOptions::default();
-    options.max_groups_per_operation = 1;
+    let options = ManagerOptions {
+        max_groups_per_operation: 1,
+        ..ManagerOptions::default()
+    };
     let manager = OperationManager::new(options).unwrap();
     let parent_group = manager.group(GroupOptions { capacity: 2 }).unwrap();
     let second_group = manager.group(GroupOptions { capacity: 2 }).unwrap();

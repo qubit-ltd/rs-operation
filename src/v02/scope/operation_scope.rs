@@ -250,7 +250,8 @@ impl OperationScope {
     ///
     /// # Parameters
     ///
-    /// * `record` — application-reported effect to add to this operation's report.
+    /// * `record` — application-reported effect to add to this operation's
+    ///   report.
     pub fn record_effect(
         &self,
         record: crate::v02::report::EffectRecord,

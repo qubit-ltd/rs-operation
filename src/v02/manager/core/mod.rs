@@ -12,6 +12,7 @@ mod async_operation_manager;
 mod external_execution_context;
 mod external_operation_driver;
 mod external_stop_control;
+mod external_submission_state;
 mod internal;
 mod operation_manager;
 
@@ -28,6 +29,7 @@ pub(super) use external_operation_driver::ExternalBindResult;
 pub(super) use external_operation_driver::ExternalOutcomePublisher;
 pub(super) use external_operation_driver::drive_external;
 pub(super) use external_stop_control::ExternalStopControl;
+pub(super) use external_submission_state::ExternalSubmissionState;
 pub(crate) use internal::CatchUnwindFuture;
 pub(crate) use internal::ExecutionKind;
 pub(crate) use internal::ManagerCore;

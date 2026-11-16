@@ -40,6 +40,11 @@ pub enum GroupBindingError {
 }
 
 impl fmt::Display for GroupBindingError {
+    /// Formats this error using its variant name.
+    ///
+    /// # Parameters
+    ///
+    /// - `f`: Formatter that receives the error text.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
     }
