@@ -59,6 +59,7 @@ pub(crate) fn new_sync(options: ManagerOptions) -> Result<OperationManager, Mana
         root_context,
         options.scope_limits,
         options.limits.diagnostic_events,
+        options.max_groups_per_operation,
     );
     Ok(core.root_view())
 }
@@ -101,6 +102,7 @@ fn validate_options(options: &ManagerOptions) -> Result<(), ManagerCreateError> 
         ("limits.unconsumed_outcomes", limits.unconsumed_outcomes),
         ("limits.cleanup_concurrency", limits.cleanup_concurrency),
         ("limits.diagnostic_events", limits.diagnostic_events),
+        ("max_groups_per_operation", options.max_groups_per_operation),
         ("scope_limits.child_operations", options.scope_limits.child_operations),
         ("scope_limits.resources", options.scope_limits.resources),
         ("scope_limits.resource_scopes", options.scope_limits.resource_scopes),

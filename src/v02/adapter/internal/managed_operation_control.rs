@@ -380,7 +380,7 @@ mod tests {
             diagnostic_limit: 8,
             capacity,
             resource_scope: resources,
-            group: None,
+            groups: Vec::new(),
         })
     }
 

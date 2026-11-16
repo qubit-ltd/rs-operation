@@ -88,7 +88,7 @@ pub(crate) struct ScopeCore {
     /// Operation resource registry ended with this scope.
     resource_scope: ResourceScope,
     /// Optional operation group tracking this scope's execution and resources.
-    group: Option<Arc<GroupCore>>,
+    groups: Vec<Arc<GroupCore>>,
     /// Wakes admission/settlement observers after child-state changes.
     children_changed: Notify,
     /// Child, resource, stop, and completion state guarded as one snapshot.
@@ -121,7 +121,7 @@ impl ScopeCore {
             diagnostic_limit,
             capacity,
             resource_scope,
-            group,
+            groups,
         } = init;
         let core = Arc::new(Self {
             id,
@@ -132,7 +132,7 @@ impl ScopeCore {
             diagnostic_limit,
             capacity,
             resource_scope: resource_scope.internal_clone(),
-            group,
+            groups,
             children_changed: Notify::new(),
             resource_progress: Mutex::new(HashMap::new()),
             operation_core: Mutex::new(None),
@@ -264,7 +264,11 @@ impl ScopeCore {
     /// otherwise.
     #[inline]
     pub(crate) fn group(&self) -> Option<&Arc<GroupCore>> {
-        self.group.as_ref()
+        self.groups.first()
+    }
+
+    pub(crate) fn groups(&self) -> &[Arc<GroupCore>] {
+        &self.groups
     }
 
     /// Borrows the resource registry whose end and settlement belong to this
@@ -1310,7 +1314,7 @@ mod lifecycle_tests {
             diagnostic_limit: 8,
             capacity,
             resource_scope: resources.internal_clone(),
-            group: None,
+            groups: Vec::new(),
         });
         assert!(!scope.settlement_ready());
         scope.end();

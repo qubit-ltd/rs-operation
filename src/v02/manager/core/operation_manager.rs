@@ -66,12 +66,36 @@ pub struct OperationManager {
 impl OperationManager {
     /// Returns a view constrained by the supplied service group.
     ///
-    /// Group membership admission is implemented by the follow-up scope task.
+    /// The returned view retains its parent target and applies the group's
+    /// admission boundary to future submissions.
     pub fn with_group(
         &self,
-        _group: &crate::v02::manager::group::OperationGroup,
+        group: &crate::v02::manager::group::OperationGroup,
     ) -> Result<Self, crate::v02::report::GroupBindingError> {
-        Err(crate::v02::report::GroupBindingError::Closed)
+        if !Arc::ptr_eq(&self.core, &group.manager_core()) {
+            return Err(crate::v02::report::GroupBindingError::WrongManager);
+        }
+        if let SubmissionTarget::Parent { scope, .. } = &self.target {
+            let Some(scope) = scope.upgrade() else {
+                return Err(crate::v02::report::GroupBindingError::ScopeEnded);
+            };
+            if !scope.is_open() {
+                return Err(crate::v02::report::GroupBindingError::ScopeEnded);
+            }
+        }
+        if !group.snapshot().accepting {
+            return Err(crate::v02::report::GroupBindingError::Closed);
+        }
+        let existing = match &self.target {
+            SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => groups,
+        };
+        if existing.iter().any(|item| Arc::ptr_eq(item, &group.group_core())) {
+            return Ok(self.clone());
+        }
+        if existing.len() >= self.core.max_groups_per_operation {
+            return Err(crate::v02::report::GroupBindingError::CapacityExceeded);
+        }
+        Ok(self.clone().with_group_core(group.group_core()))
     }
 
     /// Attempts to submit a prepared external operation.
@@ -242,7 +266,7 @@ impl OperationManager {
             .service_resource_scope(
                 capacity,
                 match &self.target {
-                    SubmissionTarget::Root { group } | SubmissionTarget::Parent { group, .. } => group.clone(),
+                    SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => groups.first().cloned(),
                 },
             )
             .map(crate::v02::resource::service::ServiceResourceScope::new)
@@ -270,10 +294,11 @@ impl OperationManager {
     #[inline]
     pub(crate) fn with_group_core(mut self, group: Arc<crate::v02::manager::group::GroupCore>) -> Self {
         match &mut self.target {
-            SubmissionTarget::Root { group: target_group } => *target_group = Some(group),
-            SubmissionTarget::Parent {
-                group: target_group, ..
-            } => *target_group = Some(group),
+            SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => {
+                if !groups.iter().any(|item| Arc::ptr_eq(item, &group)) {
+                    groups.push(group);
+                }
+            }
         }
         self
     }

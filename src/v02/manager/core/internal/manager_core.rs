@@ -77,6 +77,7 @@ pub(crate) struct ManagerCore {
     scope_limits: ScopeLimits,
     /// Maximum number of diagnostic entries retained in each scope.
     diagnostic_limit: usize,
+    pub(crate) max_groups_per_operation: usize,
 }
 
 impl ManagerCore {
@@ -93,7 +94,7 @@ impl ManagerCore {
         root_context: OperationContext,
         scope_limits: ScopeLimits,
     ) -> Arc<Self> {
-        Self::new_with_diagnostic_limit(port, root_context, scope_limits, 256)
+        Self::new_with_diagnostic_limit(port, root_context, scope_limits, 256, 16)
     }
 
     /// Builds a coordinator and bounds diagnostic retention per operation.
@@ -117,6 +118,7 @@ impl ManagerCore {
         root_context: OperationContext,
         scope_limits: ScopeLimits,
         diagnostic_limit: usize,
+        max_groups_per_operation: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(ManagerState {
@@ -137,6 +139,7 @@ impl ManagerCore {
             root_context: Arc::new(root_context),
             scope_limits,
             diagnostic_limit,
+            max_groups_per_operation,
         })
     }
 
@@ -185,7 +188,7 @@ impl ManagerCore {
     ///
     /// - `self`: coordinator shared by the returned root view.
     pub(crate) fn root_view(self: &Arc<Self>) -> OperationManager {
-        OperationManager::from_parts(Arc::clone(self), SubmissionTarget::Root { group: None })
+        OperationManager::from_parts(Arc::clone(self), SubmissionTarget::Root { groups: Vec::new() })
     }
 
     /// Creates a child-targeted view that becomes invalid when `scope` ends.
@@ -204,7 +207,7 @@ impl ManagerCore {
             SubmissionTarget::Parent {
                 id: scope.id(),
                 scope: Arc::downgrade(scope),
-                group: scope.group().cloned(),
+                groups: scope.groups().to_vec(),
             },
         )
     }
@@ -247,9 +250,9 @@ impl ManagerCore {
     where
         F: Send + 'static,
     {
-        let (parent, group) = match target {
-            SubmissionTarget::Root { group } => (None, group.as_ref()),
-            SubmissionTarget::Parent { id, scope, group } => {
+        let (parent, groups) = match target {
+            SubmissionTarget::Root { groups } => (None, groups),
+            SubmissionTarget::Parent { id, scope, groups } => {
                 let Some(scope) = scope.upgrade() else {
                     return Err(SubmitError::new(AdmissionError::ScopeEnded, body));
                 };
@@ -259,16 +262,17 @@ impl ManagerCore {
                 if let Err(error) = scope.context().check() {
                     return Err(SubmitError::new(map_context_error(error), body));
                 }
-                (Some((*id, scope)), group.as_ref())
+                (Some((*id, scope)), groups)
             }
         };
-        let group_permit = match group {
-            Some(group) => match group.reserve(parent.is_some()) {
-                Ok(permit) => Some(permit),
+        let mut group_permits = Vec::new();
+        for group in groups {
+            match group.reserve(parent.is_some()) {
+                Ok(permit) => group_permits.push(permit),
                 Err(reason) => return Err(SubmitError::new(reason, body)),
-            },
-            None => None,
-        };
+            }
+        }
+        let group = groups.first();
         if options.limits == ScopeLimits::default() {
             options.limits = self.scope_limits;
         }
@@ -304,7 +308,7 @@ impl ManagerCore {
             diagnostic_limit: self.diagnostic_limit,
             capacity: Arc::clone(&permit.capacity),
             resource_scope: permit.resource_scope.internal_clone(),
-            group: group.cloned(),
+            groups: groups.clone(),
         });
         {
             let mut state = lock(&self.state);
@@ -325,16 +329,19 @@ impl ManagerCore {
                     body,
                 ));
             }
-            if let Some(group) = group
-                && !group.register_scope(id, Arc::downgrade(&scope_core))
-            {
-                drop(state);
-                return Err(SubmitError::new(AdmissionError::Stopped, body));
+            let mut registered_groups: Vec<&Arc<crate::v02::manager::group::GroupCore>> = Vec::new();
+            for group in groups {
+                if !group.register_scope(id, Arc::downgrade(&scope_core)) {
+                    for registered in registered_groups { registered.unregister_scope(id); }
+                    drop(state);
+                    return Err(SubmitError::new(AdmissionError::Stopped, body));
+                }
+                registered_groups.push(group);
             }
             if let Some((_, parent_scope)) = parent.as_ref()
                 && !parent_scope.mark_child(id, Arc::downgrade(&scope_core), scope_core.options().requirement)
             {
-                if let Some(group) = group {
+                for group in groups {
                     group.unregister_scope(id);
                 }
                 drop(state);
@@ -345,10 +352,9 @@ impl ManagerCore {
             state.relationships.push((id, parent_id));
         }
         let mut permit = permit;
-        if let Some(group_permit) = group_permit {
+        for group_permit in group_permits {
             permit.lifecycle = Arc::new(crate::v02::manager::group::GroupLease::new(
-                Arc::clone(&permit.lifecycle),
-                group_permit,
+                Arc::clone(&permit.lifecycle), group_permit,
             ));
         }
         Ok((body, id, scope_core, permit))
@@ -506,7 +512,7 @@ impl ManagerCore {
             let mut state = lock(&manager.state);
             state.active_scopes.remove(&operation_id);
             drop(state);
-            if let Some(group) = scope_for_callback.group() {
+            for group in scope_for_callback.groups() {
                 group.settlement_finished(operation_id);
             }
             manager.shutdown_changed.notify_all();
@@ -1103,8 +1109,8 @@ impl ManagerCore {
         options: OperationOptions,
     ) -> Result<(), AdmissionError> {
         let parent = super::super::resolve_wait_parent(target)?;
-        let group = match target {
-            SubmissionTarget::Root { group } | SubmissionTarget::Parent { group, .. } => group.as_ref(),
+        let groups = match target {
+            SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => groups,
         };
         let descendant = parent.is_some();
         let mut port_wait = self.port.wait_for_capacity(parent.clone(), execution, options);
@@ -1112,10 +1118,13 @@ impl ManagerCore {
         loop {
             let manager_generation = self.shutdown_notify.generation();
             let mut manager_changed = Box::pin(self.shutdown_notify.notified_since(manager_generation));
-            let group_generation = group.map(|group| group.admission_generation());
-            let mut group_changed = group
-                .zip(group_generation)
-                .map(|(group, generation)| Box::pin(group.admission_notified_since(generation)));
+            let mut group_changed: Vec<_> = groups
+                .iter()
+                .map(|group| {
+                    let generation = group.admission_generation();
+                    Box::pin(group.admission_notified_since(generation))
+                })
+                .collect();
 
             let phase = lock(&self.state).phase;
             match (phase, descendant) {
@@ -1135,18 +1144,16 @@ impl ManagerCore {
                     return Err(super::super::map_context_error(error));
                 }
             }
-            let group_available = match group {
-                Some(group) => group.retry_admission(descendant)?,
-                None => true,
-            };
+            let mut group_available = true;
+            for group in groups {
+                group_available &= group.retry_admission(descendant)?;
+            }
 
             let capacity_result = std::future::poll_fn(|context| {
                 if manager_changed.as_mut().poll(context).is_ready() {
                     return Poll::Ready(None);
                 }
-                if let Some(changed) = group_changed.as_mut()
-                    && changed.as_mut().poll(context).is_ready()
-                {
+                if group_changed.iter_mut().any(|changed| changed.as_mut().poll(context).is_ready()) {
                     return Poll::Ready(None);
                 }
                 if let Some(wait) = scope_wait.as_mut()
@@ -1204,6 +1211,7 @@ impl ManagerCore {
             OperationContext::new(crate::v02::report::ContextOptions::default()).unwrap(),
             ScopeLimits::default(),
             diagnostic_limit,
+            16,
         );
         let root = core.root_view();
         (core, root)

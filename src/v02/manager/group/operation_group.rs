@@ -81,6 +81,16 @@ impl OperationGroup {
         })
     }
 
+    /// Returns the shared manager coordinator used by this group.
+    pub(crate) fn manager_core(&self) -> Arc<crate::v02::manager::core::ManagerCore> {
+        self.manager.core_arc()
+    }
+
+    /// Returns the shared admission state for this group.
+    pub(crate) fn group_core(&self) -> Arc<GroupCore> {
+        Arc::clone(&self.core)
+    }
+
     /// Returns the configured concurrent operation limit for this group.
     ///
     /// # Returns

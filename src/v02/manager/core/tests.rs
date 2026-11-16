@@ -281,7 +281,7 @@ fn test_async_submit_parent_close_and_stop_interrupt_wait_and_preserve_body() {
             diagnostic_limit: 8,
             capacity,
             resource_scope,
-            group: None,
+            groups: Vec::new(),
         });
         let child_manager = OperationManager::bound(Arc::clone(&core), &parent);
         let async_child_manager = child_manager.as_async();

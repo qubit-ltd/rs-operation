@@ -37,5 +37,5 @@ pub(crate) struct ScopeCoreInit {
     /// Resource registry attached to this scope.
     pub(crate) resource_scope: ResourceScope,
     /// Optional operation group tracking execution and resources.
-    pub(crate) group: Option<Arc<GroupCore>>,
+    pub(crate) groups: Vec<Arc<GroupCore>>,
 }

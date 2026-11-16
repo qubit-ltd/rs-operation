@@ -23,7 +23,7 @@ impl ExecutionFrameGuard {
     ///
     /// * `scope` — operation scope whose end is tied to this stack frame.
     pub(crate) fn new(scope: Arc<ScopeCore>) -> Self {
-        if let Some(group) = scope.group() {
+        for group in scope.groups() {
             group.execution_started(scope.id());
         }
         Self { scope }

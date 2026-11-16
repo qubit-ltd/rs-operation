@@ -18,7 +18,7 @@ pub(crate) enum SubmissionTarget {
     /// Routes a root manager view into an optional operation group.
     Root {
         /// Group admission policy applied to root submissions, when present.
-        group: Option<Arc<crate::v02::manager::group::GroupCore>>,
+        groups: Vec<Arc<crate::v02::manager::group::GroupCore>>,
     },
     /// Routes submissions through a still-live parent operation scope.
     Parent {
@@ -27,6 +27,6 @@ pub(crate) enum SubmissionTarget {
         /// Non-owning link that lets a child view detect a completed parent.
         scope: Weak<ScopeCore>,
         /// Group policy inherited by submissions through this parent view.
-        group: Option<Arc<crate::v02::manager::group::GroupCore>>,
+        groups: Vec<Arc<crate::v02::manager::group::GroupCore>>,
     },
 }
