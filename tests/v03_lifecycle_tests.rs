@@ -6,11 +6,15 @@ use std::task::{Context, Poll, Waker};
 
 struct External {
     id: Mutex<Option<OperationId>>,
+    phase: AtomicUsize,
+    stop: Mutex<Option<StopReport>>,
+    outcome_published: AtomicBool,
     release: AtomicBool,
     settlement: AtomicBool,
     release_waker: Mutex<Option<Waker>>,
     settlement_waker: Mutex<Option<Waker>>,
     settlement_polled: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    stop_forwarded: Mutex<Option<std::sync::mpsc::Sender<StopReason>>>,
     worker_owner: Mutex<Option<Arc<DropProbe>>>,
     stops: AtomicUsize,
     polls: AtomicUsize,
@@ -20,11 +24,15 @@ impl External {
     fn held() -> Arc<Self> {
         Arc::new(Self {
             id: Mutex::new(None),
+            phase: AtomicUsize::new(0),
+            stop: Mutex::new(None),
+            outcome_published: AtomicBool::new(false),
             release: AtomicBool::new(false),
             settlement: AtomicBool::new(false),
             release_waker: Mutex::new(None),
             settlement_waker: Mutex::new(None),
             settlement_polled: Mutex::new(None),
+            stop_forwarded: Mutex::new(None),
             worker_owner: Mutex::new(None),
             stops: AtomicUsize::new(0),
             polls: AtomicUsize::new(0),
@@ -39,6 +47,7 @@ impl External {
     fn release_input(&self) {
         self.worker_owner.lock().unwrap().take();
         Self::open(&self.release, &self.release_waker);
+        self.phase.store(2, Ordering::SeqCst);
     }
     fn release_settlement(&self) {
         Self::open(&self.settlement, &self.settlement_waker);
@@ -46,16 +55,39 @@ impl External {
 }
 
 impl OperationControl for External {
-    fn request_stop(&self, _: StopReason) {
+    fn request_stop(&self, reason: StopReason) {
         self.stops.fetch_add(1, Ordering::SeqCst);
+        let mut stop = self.stop.lock().unwrap();
+        if stop.is_none() {
+            *stop = Some(StopReport {
+                reason,
+                accepted_at: None,
+            });
+        }
+        if let Some(signal) = self.stop_forwarded.lock().unwrap().take() {
+            let _ = signal.send(reason);
+        }
     }
     fn snapshot(&self) -> ChildSnapshot {
+        let operation_id = self.id.lock().unwrap().expect("bound");
+        let outcome = self
+            .outcome_published
+            .load(Ordering::SeqCst)
+            .then(|| ChildOutcomeSummary {
+                operation_id,
+                kind: ChildOutcomeKind::Succeeded,
+                summary: DiagnosticSummary::new("worker completed successfully"),
+            });
         ChildSnapshot {
-            operation_id: self.id.lock().unwrap().expect("bound"),
-            execution: ExecutionPhase::Queued,
-            stop: None,
-            outcome: None,
-            input_released: false,
+            operation_id,
+            execution: match self.phase.load(Ordering::SeqCst) {
+                0 => ExecutionPhase::Queued,
+                1 => ExecutionPhase::Running,
+                _ => ExecutionPhase::Finished,
+            },
+            stop: self.stop.lock().unwrap().clone(),
+            outcome,
+            input_released: self.release.load(Ordering::SeqCst),
             settlement: None,
         }
     }
@@ -63,7 +95,7 @@ impl OperationControl for External {
         Poll::Ready(ChildOutcomeSummary {
             operation_id: self.id.lock().unwrap().expect("bound"),
             kind: ChildOutcomeKind::Succeeded,
-            summary: DiagnosticSummary::new("worker completed"),
+            summary: DiagnosticSummary::new("worker completed successfully"),
         })
     }
     fn poll_release(&self, cx: &mut Context<'_>) -> Poll<ChildRelease> {
@@ -123,10 +155,12 @@ impl PreparedExternalOperation<usize, ()> for External {
         Ok(())
     }
     fn activate(self: Arc<Self>, _: OperationScope) -> Result<(), ExecutionFailure> {
+        self.phase.store(1, Ordering::SeqCst);
         Ok(())
     }
     fn abandon(self: Arc<Self>) {}
     fn poll_take_outcome(&self, _: &mut Context<'_>) -> Poll<OperationOutcome<usize, ()>> {
+        self.outcome_published.store(true, Ordering::SeqCst);
         Poll::Ready(OperationOutcome::Succeeded(42))
     }
 }
@@ -137,19 +171,42 @@ fn stopped_early_outcome_waits_for_input_release_and_domain_settlement() {
     let external = External::held();
     let owner_drops = Arc::new(AtomicUsize::new(0));
     *external.worker_owner.lock().unwrap() = Some(Arc::new(DropProbe(Arc::clone(&owner_drops))));
+    let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+    *external.stop_forwarded.lock().unwrap() = Some(stopped_tx);
     let (polled_tx, polled_rx) = std::sync::mpsc::channel();
     *external.settlement_polled.lock().unwrap() = Some(polled_tx);
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&external))
         .unwrap();
+    while external.phase.load(Ordering::SeqCst) != 1 {
+        std::thread::yield_now();
+    }
     assert_eq!(
         handle.request_stop(StopReason::UserCancelled),
         StopRequestStatus::Accepted
     );
+    assert_eq!(stopped_rx.recv().unwrap(), StopReason::UserCancelled);
     assert!(matches!(
         handle.wait_outcome().unwrap(),
         OperationOutcome::Stopped(_)
     ));
+    let domain_summary = match external.poll_outcome(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(summary) => summary,
+        Poll::Pending => panic!("domain completion summary is ready"),
+    };
+    let domain_snapshot = external.snapshot();
+    assert_eq!(domain_summary.kind, ChildOutcomeKind::Succeeded);
+    assert_eq!(domain_snapshot.outcome.as_ref(), Some(&domain_summary));
+    assert_eq!(domain_snapshot.execution, ExecutionPhase::Running);
+    assert_eq!(
+        domain_snapshot.stop.as_ref().map(|stop| stop.reason),
+        Some(StopReason::UserCancelled)
+    );
+    assert_eq!(
+        domain_summary.kind,
+        ChildOutcomeKind::Succeeded,
+        "domain reports success consistently; framework stop policy publishes Stopped"
+    );
     polled_rx.recv().unwrap();
     assert!(matches!(
         handle
