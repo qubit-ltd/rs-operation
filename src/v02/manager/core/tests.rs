@@ -1111,14 +1111,13 @@ fn test_production_cancel_abandons_adapter_without_running_unstarted_body() {
 fn test_production_parent_stop_and_adapter_activation_have_one_gate_winner() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let (core, _id, scope, reservation) = reserve_production_root(&manager);
-    scope.commit_start().unwrap();
 
     let start = Arc::new(Barrier::new(3));
     let activate_scope = Arc::clone(&scope);
     let activate_start = Arc::clone(&start);
     let activate = std::thread::spawn(move || {
         activate_start.wait();
-        activate_scope.activate_start()
+        activate_scope.commit_and_activate_start()
     });
     let stop_scope = Arc::clone(&scope);
     let stop_start = Arc::clone(&start);
@@ -1135,6 +1134,31 @@ fn test_production_parent_stop_and_adapter_activation_have_one_gate_winner() {
     ));
     assert!(scope.context().stop_reason().is_some());
 
+    scope.end();
+    drop(reservation);
+    core.finish_shutdown();
+}
+
+#[test]
+fn test_external_start_arbitration_commit_wins_before_later_stop() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let (core, _id, scope, reservation) = reserve_production_root(&manager);
+    scope.commit_and_activate_start().unwrap();
+    assert!(scope.request_stop(StopReason::UserCancelled));
+    scope.end();
+    drop(reservation);
+    core.finish_shutdown();
+}
+
+#[test]
+fn test_external_start_arbitration_stop_wins_before_commit() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let (core, _id, scope, reservation) = reserve_production_root(&manager);
+    assert!(scope.request_stop(StopReason::UserCancelled));
+    assert_eq!(
+        scope.commit_and_activate_start(),
+        Err(crate::v02::adapter::AdapterErrorKind::Stopped)
+    );
     scope.end();
     drop(reservation);
     core.finish_shutdown();

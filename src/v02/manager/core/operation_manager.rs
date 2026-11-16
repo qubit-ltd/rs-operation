@@ -104,6 +104,7 @@ pub async fn drive_external<T, E, P>(
     P: crate::v02::adapter::PreparedExternalOperation<T, E>,
 {
     let operation_id = scope.id();
+    let scope_core_for_settlement = Arc::clone(&scope.core);
     let context = scope.context();
     let bind = lock(&bind_state)
         .take()
@@ -286,7 +287,8 @@ pub async fn drive_external<T, E, P>(
             Poll::Pending
         }
     })
-    .await
+    .await;
+    scope_core_for_settlement.finish_external_driver_settlement();
 }
 
 impl StopControl for ExternalStopControl {
@@ -929,6 +931,9 @@ impl OperationManager {
                 });
             }));
         }
+        if external_mode {
+            scope.retain_external_driver_settlement();
+        }
         self.core.register_settlement(
             Arc::clone(&scope),
             Arc::clone(&operation),
@@ -959,7 +964,7 @@ impl OperationManager {
         let mut abandon_external = on_abandon;
         let execution = reservation.execution;
         if external_mode {
-            let start_permitted = scope.commit_start().is_ok() && scope.activate_start().is_ok();
+            let start_permitted = scope.commit_and_activate_start().is_ok();
             activation_permitted
                 .as_ref()
                 .expect("external submissions have an activation decision")

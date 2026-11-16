@@ -24,6 +24,10 @@ struct Prepared {
     summary_ready: std::sync::atomic::AtomicBool,
     summary_waker: std::sync::Mutex<Option<Waker>>,
     summary_polls: std::sync::atomic::AtomicUsize,
+    settlement_ready: std::sync::atomic::AtomicBool,
+    settlement_waker: std::sync::Mutex<Option<Waker>>,
+    settlement_polls: std::sync::atomic::AtomicUsize,
+    captured_manager: std::sync::Mutex<Option<OperationManager>>,
 }
 
 struct BindGate {
@@ -92,12 +96,21 @@ impl OperationControl for Prepared {
             confirmed_at: None,
         })
     }
-    fn poll_settlement(&self, _: &mut Context<'_>) -> Poll<Arc<SettlementReport>> {
+    fn poll_settlement(&self, cx: &mut Context<'_>) -> Poll<Arc<SettlementReport>> {
         assert_eq!(
             self.panic_flags.load(std::sync::atomic::Ordering::SeqCst) & 8,
             0,
             "poll_settlement panic requested"
         );
+        self.settlement_polls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !self
+            .settlement_ready
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            *self.settlement_waker.lock().unwrap() = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
         let operation_id = self.id.lock().unwrap().expect("bound before polling");
         Poll::Ready(Arc::new(SettlementReport {
             operation_id,
@@ -128,6 +141,14 @@ impl OperationControl for Prepared {
 }
 
 impl Prepared {
+    fn release_settlement(&self) {
+        self.settlement_ready
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(waker) = self.settlement_waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+
     fn release_summary(&self) {
         self.summary_ready
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -157,6 +178,10 @@ impl Prepared {
             summary_ready: std::sync::atomic::AtomicBool::new(true),
             summary_waker: std::sync::Mutex::new(None),
             summary_polls: std::sync::atomic::AtomicUsize::new(0),
+            settlement_ready: std::sync::atomic::AtomicBool::new(true),
+            settlement_waker: std::sync::Mutex::new(None),
+            settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+            captured_manager: std::sync::Mutex::new(None),
         })
     }
 
@@ -201,7 +226,7 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
         }
         Ok(())
     }
-    fn activate(self: Arc<Self>, _: OperationScope) -> Result<(), ExecutionFailure> {
+    fn activate(self: Arc<Self>, scope: OperationScope) -> Result<(), ExecutionFailure> {
         self.activated
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         assert!(
@@ -210,7 +235,15 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "activate panic requested"
         );
+        if self.panic_flags.load(std::sync::atomic::Ordering::SeqCst) & 32 != 0 {
+            return Err(ExecutionFailure {
+                operation_id: self.id.lock().unwrap().expect("bound before activation"),
+                summary: DiagnosticSummary::new("activate returned an error"),
+                source: None,
+            });
+        }
         *self.activation_thread.lock().unwrap() = std::thread::current().name().map(str::to_owned);
+        *self.captured_manager.lock().unwrap() = Some(scope.manager());
         Ok(())
     }
     fn abandon(self: Arc<Self>) {
@@ -256,6 +289,10 @@ fn accepted_external_task_is_bound_activated_and_delivers_its_unique_outcome() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+        settlement_ready: std::sync::atomic::AtomicBool::new(true),
+        settlement_waker: std::sync::Mutex::new(None),
+        settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        captured_manager: std::sync::Mutex::new(None),
     });
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
@@ -361,6 +398,10 @@ fn post_claim_bind_failure_is_accepted_and_abandoned_once() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+        settlement_ready: std::sync::atomic::AtomicBool::new(true),
+        settlement_waker: std::sync::Mutex::new(None),
+        settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        captured_manager: std::sync::Mutex::new(None),
     });
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
@@ -410,6 +451,10 @@ fn stop_during_bind_wins_before_commit_and_abandons_without_activation() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+        settlement_ready: std::sync::atomic::AtomicBool::new(true),
+        settlement_waker: std::sync::Mutex::new(None),
+        settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        captured_manager: std::sync::Mutex::new(None),
     });
     let submit_manager = manager.clone();
     let submit_prepared = Arc::clone(&prepared);
@@ -482,6 +527,10 @@ fn parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+        settlement_ready: std::sync::atomic::AtomicBool::new(true),
+        settlement_waker: std::sync::Mutex::new(None),
+        settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        captured_manager: std::sync::Mutex::new(None),
     });
     let submit = std::thread::spawn({
         let prepared = Arc::clone(&prepared);
@@ -542,6 +591,10 @@ fn already_bound_claim_rolls_back_provisional_parent_child_link() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+        settlement_ready: std::sync::atomic::AtomicBool::new(true),
+        settlement_waker: std::sync::Mutex::new(None),
+        settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        captured_manager: std::sync::Mutex::new(None),
     });
     let mut first = first_manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
@@ -596,6 +649,10 @@ fn dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+        settlement_ready: std::sync::atomic::AtomicBool::new(true),
+        settlement_waker: std::sync::Mutex::new(None),
+        settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        captured_manager: std::sync::Mutex::new(None),
     });
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
@@ -666,6 +723,31 @@ fn callback_panics_are_captured_and_activation_panic_is_not_abandoned() {
         0
     );
     activation_handle.wait_settlement().unwrap();
+
+    let activation_error = Prepared::ready_fixture();
+    activation_error
+        .panic_flags
+        .store(32, std::sync::atomic::Ordering::SeqCst);
+    let mut error_handle = manager
+        .try_submit_external(OperationOptions::default(), Arc::clone(&activation_error))
+        .unwrap();
+    assert!(matches!(
+        error_handle.wait_outcome().unwrap(),
+        OperationOutcome::ExecutionFailed(_)
+    ));
+    assert_eq!(
+        activation_error
+            .activated
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        activation_error
+            .abandon_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    error_handle.wait_settlement().unwrap();
 }
 
 #[test]
@@ -705,6 +787,53 @@ fn request_stop_and_outcome_poll_panics_are_captured() {
 }
 
 #[test]
+fn release_and_settlement_poll_panics_keep_scope_pending_without_fabricating_facts() {
+    for panic_bit in [4, 8] {
+        let manager = OperationManager::new(ManagerOptions {
+            sync_executor: ThreadPoolExecutorOptions {
+                worker_count: 1,
+                ..ThreadPoolExecutorOptions::default()
+            },
+            ..ManagerOptions::default()
+        })
+        .unwrap();
+        let prepared = Prepared::ready_fixture();
+        prepared
+            .panic_flags
+            .store(panic_bit, std::sync::atomic::Ordering::SeqCst);
+        let mut handle = manager
+            .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
+            .unwrap();
+        assert!(matches!(
+            handle.wait_outcome().unwrap(),
+            OperationOutcome::Succeeded(7)
+        ));
+        assert!(matches!(
+            handle
+                .wait_settlement_for(std::time::Duration::from_millis(10))
+                .unwrap(),
+            SettlementWait::Pending(_)
+        ));
+        let shutdown = manager.request_shutdown(ShutdownMode::Drain);
+        assert_eq!(shutdown.snapshot().active_operations, 1);
+        assert_eq!(
+            prepared
+                .abandon_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        drop(handle);
+
+        // Each case intentionally leaves one driver pending because the
+        // adapter panicked before supplying required lifecycle evidence.
+        // Leak only this bounded test manager so executor teardown cannot wait
+        // on the deliberately unresolved task.
+        std::mem::forget(shutdown);
+        std::mem::forget(manager);
+    }
+}
+
+#[test]
 fn typed_result_waits_for_matching_summary_when_facts_arrive_out_of_order() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Prepared::ready_fixture();
@@ -739,6 +868,99 @@ fn typed_result_waits_for_matching_summary_when_facts_arrive_out_of_order() {
         OperationOutcome::Succeeded(7)
     ));
     waiter.join().unwrap();
+}
+
+#[test]
+fn external_frame_ends_at_typed_outcome_while_release_is_still_pending() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let prepared = Prepared::ready_fixture();
+    prepared
+        .release_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut handle = manager
+        .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
+        .unwrap();
+    assert!(matches!(
+        handle.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(7)
+    ));
+    let scoped_manager = prepared
+        .captured_manager
+        .lock()
+        .unwrap()
+        .take()
+        .expect("activate receives the execution frame manager");
+    let child = Prepared::ready_fixture();
+    let error = scoped_manager
+        .try_submit_external::<usize, (), _>(OperationOptions::default(), child)
+        .err()
+        .expect("typed outcome ends the execution frame before release");
+    assert_eq!(error.reason(), AdmissionError::ScopeEnded);
+    assert!(matches!(
+        handle
+            .wait_settlement_for(std::time::Duration::from_millis(1))
+            .unwrap(),
+        SettlementWait::Pending(_)
+    ));
+    prepared.release_inputs();
+    handle.wait_settlement().unwrap();
+    let release_polls_after_ready = prepared
+        .release_polls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..1000 {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        prepared
+            .release_polls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        release_polls_after_ready,
+        "the driver must not poll release again after Ready"
+    );
+}
+
+#[test]
+fn typed_outcome_precedes_settlement_and_ready_settlement_is_not_repolled() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let prepared = Prepared::ready_fixture();
+    prepared
+        .settlement_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut handle = manager
+        .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
+        .unwrap();
+    assert!(matches!(
+        handle.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(7)
+    ));
+    while prepared
+        .settlement_polls
+        .load(std::sync::atomic::Ordering::SeqCst)
+        == 0
+    {
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        handle
+            .wait_settlement_for(std::time::Duration::from_millis(5))
+            .unwrap(),
+        SettlementWait::Pending(_)
+    ));
+    prepared.release_settlement();
+    handle.wait_settlement().unwrap();
+    let ready_polls = prepared
+        .settlement_polls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..1000 {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        prepared
+            .settlement_polls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        ready_polls,
+        "the driver must not poll settlement again after Ready"
+    );
 }
 
 #[test]
@@ -886,6 +1108,10 @@ fn async_manager_drives_external_activation_on_portable_executor() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
+        settlement_ready: std::sync::atomic::AtomicBool::new(true),
+        settlement_waker: std::sync::Mutex::new(None),
+        settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        captured_manager: std::sync::Mutex::new(None),
     });
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))

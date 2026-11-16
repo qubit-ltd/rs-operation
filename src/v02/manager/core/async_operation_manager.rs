@@ -285,6 +285,7 @@ impl AsyncOperationManager {
                 let _ = slot_for_publisher.publish(outcome);
             });
         }));
+        scope.retain_external_driver_settlement();
         self.core.register_settlement(
             Arc::clone(&scope),
             Arc::clone(&operation),
@@ -302,7 +303,7 @@ impl AsyncOperationManager {
             managed: Arc::clone(&control),
         });
         let handle = AsyncOperationHandle::new(Arc::clone(&operation), Arc::clone(&slot), stop);
-        let start_permitted = scope.commit_start().is_ok() && scope.activate_start().is_ok();
+        let start_permitted = scope.commit_and_activate_start().is_ok();
         activation_permitted.store(start_permitted, Ordering::Release);
         let execution = reservation.execution;
         let future = runner(OperationScope::new(

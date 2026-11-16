@@ -603,6 +603,25 @@ impl ScopeCore {
         self.attach_resource_scope_inner(resource_scope, Some(permit))
     }
 
+    /// Keeps operation settlement pending until an external lifecycle driver
+    /// has observed outcome, release, and settlement evidence.
+    pub(crate) fn retain_external_driver_settlement(&self) {
+        let mut state = lock(&self.state);
+        state.pending_resource_scopes = state.pending_resource_scopes.saturating_add(1);
+    }
+
+    /// Releases the external-driver settlement reservation after all required
+    /// control facts have been observed.
+    pub(crate) fn finish_external_driver_settlement(&self) {
+        let callback = {
+            let mut state = lock(&self.state);
+            state.pending_resource_scopes = state.pending_resource_scopes.saturating_sub(1);
+            Self::take_settlement_callback(&mut state)
+        };
+        self.children_changed.notify_waiters();
+        invoke_callback(callback);
+    }
+
     /// Records the first child result, applies required-failure policy, and
     /// wakes outcomes.
     ///
@@ -850,6 +869,28 @@ impl ScopeCore {
                 return Err(AdapterErrorKind::ScopeEnded);
             }
             if state.start != StartState::Committed {
+                return Err(AdapterErrorKind::AlreadyCommitted);
+            }
+            state.start = StartState::Activated;
+            Ok(())
+        })
+    }
+
+    /// Atomically arbitrates an external activation against scope and manager
+    /// stop requests. Returning `Ok(())` commits the activation right; a later
+    /// stop cannot revoke that decision before the adapter callback runs.
+    pub(crate) fn commit_and_activate_start(&self) -> Result<(), AdapterErrorKind> {
+        self.with_lifecycle_gate(|| {
+            if self.ancestor_stop_accepted() || self.manager_stopped_commits() {
+                lock(&self.state).start = StartState::Abandoned;
+                return Err(AdapterErrorKind::Stopped);
+            }
+            let mut state = lock(&self.state);
+            if !state.open {
+                state.start = StartState::Abandoned;
+                return Err(AdapterErrorKind::ScopeEnded);
+            }
+            if state.start != StartState::Reserved {
                 return Err(AdapterErrorKind::AlreadyCommitted);
             }
             state.start = StartState::Activated;
