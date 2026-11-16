@@ -133,6 +133,8 @@ pub struct SimulatedProvider {
     state: Mutex<ProviderState>,
     changed: Condvar,
     drops: Mutex<Option<Arc<AtomicUsize>>>,
+    #[cfg(test)]
+    outcome_taken_signal: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl Default for SimulatedProvider {
@@ -141,6 +143,8 @@ impl Default for SimulatedProvider {
             state: Mutex::new(ProviderState::default()),
             changed: Condvar::new(),
             drops: Mutex::new(None),
+            #[cfg(test)]
+            outcome_taken_signal: Mutex::new(None),
         }
     }
 }
@@ -245,23 +249,24 @@ impl SimulatedProvider {
         state.input.as_ref().expect("activation retains input").clone()
     }
 
-    fn wait_for_outcome(&self) {
-        let mut state = self.state.lock().expect("provider state poisoned");
-        while state.outcome.is_none() {
-            state = self.changed.wait(state).expect("provider state poisoned");
-        }
-    }
-
     /// Runs all provider phases and returns the manager's combined report and
     /// observable input drop counts.
     ///
     /// The manager driver runs independently while the application explicitly
     /// advances the simulated provider through stop, release, and settlement.
     fn run_lifecycle_demo() -> ProviderLifecycleDemo {
+        Self::run_lifecycle_demo_inner(|_| {}, || {})
+    }
+
+    fn run_lifecycle_demo_inner(
+        configure_provider: impl FnOnce(&Arc<Self>),
+        after_publish: impl FnOnce(),
+    ) -> ProviderLifecycleDemo {
         let manager = OperationManager::new(ManagerOptions::default()).expect("manager creation");
         let drops = Arc::new(AtomicUsize::new(0));
         let provider = Arc::new(Self::default());
         provider.set_drop_counter(Arc::clone(&drops));
+        configure_provider(&provider);
         let mut handle = manager
             .try_submit_external::<String, String, _>(OperationOptions::default(), Arc::clone(&provider))
             .expect("simulated provider admission");
@@ -272,7 +277,7 @@ impl SimulatedProvider {
             "the application initiates stop through its operation handle"
         );
         provider.publish_outcome();
-        provider.wait_for_outcome();
+        after_publish();
         let _typed_outcome = handle.wait_outcome().expect("typed provider outcome");
         assert!(
             provider.state.lock().expect("provider state poisoned").input.is_some(),
@@ -311,6 +316,28 @@ impl SimulatedProvider {
             report,
             drops_before_release,
             drops_after_settlement,
+        }
+    }
+
+    #[cfg(test)]
+    fn restore_outcome_for_test(&self) {
+        let (outcome_waker, summary_waker) = {
+            let mut state = self.state.lock().expect("provider state poisoned");
+            let id = state.id.expect("manager binds before activation");
+            state.outcome = Some(OperationOutcome::Stopped(StopReport {
+                reason: StopReason::UserCancelled,
+                accepted_at: None,
+            }));
+            state.summary = Some(ChildOutcomeSummary {
+                operation_id: id,
+                kind: ChildOutcomeKind::Stopped,
+                summary: DiagnosticSummary::new("test cleanup restored consumed outcome"),
+            });
+            (state.outcome_waker.take(), state.summary_waker.take())
+        };
+        self.changed.notify_all();
+        for waker in [outcome_waker, summary_waker].into_iter().flatten() {
+            waker.wake();
         }
     }
 }
@@ -463,6 +490,16 @@ impl PreparedExternalOperation<String, String> for SimulatedProvider {
     fn poll_take_outcome(&self, cx: &mut Context<'_>) -> Poll<OperationOutcome<String, String>> {
         let mut state = self.state.lock().expect("provider state poisoned");
         if let Some(outcome) = state.outcome.take() {
+            drop(state);
+            #[cfg(test)]
+            if let Some(signal) = self
+                .outcome_taken_signal
+                .lock()
+                .expect("outcome signal poisoned")
+                .take()
+            {
+                let _ = signal.send(());
+            }
             Poll::Ready(outcome)
         } else {
             let old_waker = state.outcome_waker.replace(cx.waker().clone());
@@ -477,6 +514,31 @@ impl PreparedExternalOperation<String, String> for SimulatedProvider {
 /// Runs the complete simulated provider lifecycle and manager shutdown.
 pub fn demo_provider_lifecycle() -> ProviderLifecycleDemo {
     SimulatedProvider::run_lifecycle_demo()
+}
+
+/// Deterministic integration-test entry point that gates the demo after the
+/// manager has taken the provider's one-shot result.
+#[cfg(test)]
+pub(crate) fn demo_provider_lifecycle_with_consumption_gate(
+    taken: std::sync::mpsc::Sender<()>,
+    continue_rx: std::sync::mpsc::Receiver<()>,
+    cleanup_rx: std::sync::mpsc::Receiver<bool>,
+) -> ProviderLifecycleDemo {
+    SimulatedProvider::run_lifecycle_demo_inner(
+        move |provider| {
+            *provider
+                .outcome_taken_signal
+                .lock()
+                .expect("outcome signal poisoned") = Some(taken);
+            let cleanup_provider = Arc::clone(provider);
+            std::thread::spawn(move || {
+                if cleanup_rx.recv().unwrap_or(false) {
+                    cleanup_provider.restore_outcome_for_test();
+                }
+            });
+        },
+        move || continue_rx.recv().expect("test releases demo continuation"),
+    )
 }
 
 /// Compatibility helper used by the short stop/settlement guide snippet.
