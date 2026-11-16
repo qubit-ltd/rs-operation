@@ -50,6 +50,8 @@ pub(crate) use thread_pool_permit::ThreadPoolPermit;
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::panic::AssertUnwindSafe;
+    use std::panic::catch_unwind;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::Condvar;
@@ -181,8 +183,11 @@ mod tests {
         type Output = ();
 
         fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
-            self.polls.fetch_add(1, Ordering::SeqCst);
-            Poll::Pending
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
         }
     }
 
@@ -247,6 +252,87 @@ mod tests {
         );
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    fn active_task_waker(executor: &PortableExecutor) -> Waker {
+        let state = lock(&executor.inner.state);
+        Waker::from(Arc::clone(state.active.first().expect("active task should exist")))
+    }
+
+    #[test]
+    fn test_pending_without_waker_completes_after_internal_wake() {
+        let executor = PortableExecutor::new(PortableExecutorOptions {
+            worker_count: 1,
+            task_capacity: 1,
+            polls_per_turn: 8,
+        })
+        .unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        executor.reserve().unwrap().spawn(PendingWithoutWaker {
+            polls: Arc::clone(&polls),
+            drops: Arc::clone(&drops),
+        });
+
+        assert!(executor.poll_once());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        active_task_waker(&executor).wake();
+        assert!(executor.poll_once());
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let state = lock(&executor.inner.state);
+        assert_eq!(state.tasks, 0);
+        assert!(state.active.is_empty());
+    }
+
+    struct ReadyFuturePanickingOnDrop;
+
+    impl Future for ReadyFuturePanickingOnDrop {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            Poll::Ready(())
+        }
+    }
+
+    impl Drop for ReadyFuturePanickingOnDrop {
+        fn drop(&mut self) {
+            panic!("future drop probe");
+        }
+    }
+
+    #[test]
+    fn test_unwind_completion_releases_capacity_and_notifies() {
+        let executor = PortableExecutor::new(PortableExecutorOptions {
+            worker_count: 1,
+            task_capacity: 1,
+            polls_per_turn: 8,
+        })
+        .unwrap();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed_notifications = Arc::clone(&notifications);
+        executor.set_capacity_callback(Arc::new(move || {
+            if observed_notifications.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("capacity callback probe");
+            }
+        }));
+        executor
+            .reserve()
+            .unwrap()
+            .spawn(ReadyFuturePanickingOnDrop);
+
+        let panic = catch_unwind(AssertUnwindSafe(|| executor.poll_once()))
+            .expect_err("Future destructor should propagate its panic");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"future drop probe"));
+
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        let state = lock(&executor.inner.state);
+        assert_eq!(state.tasks, 0);
+        assert!(state.active.is_empty());
+        assert!(state.ready.is_empty());
+        drop(state);
+        assert!(executor.reserve().is_ok());
     }
 
     #[test]
