@@ -526,10 +526,7 @@ pub(crate) fn demo_provider_lifecycle_with_consumption_gate(
 ) -> ProviderLifecycleDemo {
     SimulatedProvider::run_lifecycle_demo_inner(
         move |provider| {
-            *provider
-                .outcome_taken_signal
-                .lock()
-                .expect("outcome signal poisoned") = Some(taken);
+            *provider.outcome_taken_signal.lock().expect("outcome signal poisoned") = Some(taken);
             let cleanup_provider = Arc::clone(provider);
             std::thread::spawn(move || {
                 if cleanup_rx.recv().unwrap_or(false) {
@@ -549,9 +546,11 @@ pub fn request_worker_stop(control: &impl OperationControl) {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::mpsc;
     use std::task::Context;
     use std::task::Poll;
     use std::task::Waker;
+    use std::time::Duration;
 
     use qubit_operation::ChildOutcomeKind;
     use qubit_operation::ChildOutcomeSummary;
@@ -564,9 +563,61 @@ mod tests {
 
     use super::SimulatedProvider;
     use super::demo_provider_lifecycle;
+    use super::demo_provider_lifecycle_with_consumption_gate;
     use super::outcome_is_stopped;
     use super::request_provider_stop;
     use super::request_worker_stop;
+
+    #[test]
+    fn test_guide_provider_consumed_outcome_progresses() {
+        let (taken_tx, taken_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let (cleanup_tx, cleanup_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let demo_thread = std::thread::spawn(move || {
+            let demo = demo_provider_lifecycle_with_consumption_gate(taken_tx, continue_rx, cleanup_rx);
+            let _ = done_tx.send(demo);
+        });
+
+        if taken_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+            let _ = continue_tx.send(());
+            let _ = cleanup_tx.send(true);
+            let _ = done_rx.recv_timeout(Duration::from_secs(2));
+            demo_thread.join().expect("demo thread is cleaned up");
+            panic!("manager takes the published outcome before demo continuation");
+        }
+        continue_tx.send(()).expect("demo continuation is waiting");
+        let (progressed_without_cleanup, demo) = match done_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(demo) => {
+                let _ = cleanup_tx.send(false);
+                (true, demo)
+            }
+            Err(_) => {
+                // The pre-fix wait needs a value in the consumed slot to escape. Restore
+                // one only to let that implementation clean up its thread before failing.
+                cleanup_tx.send(true).expect("cleanup worker is available");
+                let demo = done_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("legacy demo completes after bounded cleanup");
+                (false, demo)
+            }
+        };
+        demo_thread.join().expect("demo thread completes");
+        assert!(
+            progressed_without_cleanup,
+            "demo must progress after the manager consumes the outcome"
+        );
+
+        assert_eq!(demo.drops_before_release, 0);
+        assert_eq!(demo.drops_after_settlement, 1);
+        assert!(demo.report.all_released());
+        let domain = demo
+            .report
+            .external_settlement
+            .as_ref()
+            .expect("provider domain report is retained");
+        assert_eq!(domain.operation_id, demo.report.operation_id);
+    }
 
     #[test]
     fn test_demo_runs_complete_provider_lifecycle() {
