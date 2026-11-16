@@ -967,6 +967,27 @@ fn reserve_production_root(
 }
 
 #[test]
+fn test_preflight_rejection_returns_body_before_scope_registration() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let core = manager.core_arc();
+    let rejected = core.reserve_scope_with_preflight(
+        &manager.target,
+        OperationOptions::default(),
+        ExecutionKind::Sync,
+        17usize,
+        |_| Err(AdmissionError::AlreadyBound),
+    );
+    let error = match rejected {
+        Ok(_) => panic!("preflight rejection must roll back reservation"),
+        Err(error) => error,
+    };
+    let (reason, body) = error.into_parts();
+    assert_eq!(reason, AdmissionError::AlreadyBound);
+    assert_eq!(body, 17);
+    assert_eq!(core.active_scope_count(), 0);
+}
+
+#[test]
 fn test_production_cancel_abandons_adapter_without_running_unstarted_body() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let (core, id, scope, reservation) = reserve_production_root(&manager);

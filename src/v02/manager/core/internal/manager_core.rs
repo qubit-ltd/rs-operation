@@ -243,12 +243,29 @@ impl ManagerCore {
     pub(in crate::v02::manager::core) fn reserve_scope<F>(
         self: &Arc<Self>,
         target: &SubmissionTarget,
-        mut options: OperationOptions,
+        options: OperationOptions,
         execution: ExecutionKind,
         body: F,
     ) -> Result<(F, OperationId, Arc<ScopeCore>, SubmissionReservation), SubmitError<F>>
     where
         F: Send + 'static,
+    {
+        self.reserve_scope_with_preflight(target, options, execution, body, |_| Ok(()))
+    }
+
+    /// Reserves a scope while running a one-shot identity claim after
+    /// capacity/executor admission succeeds and before parent/group registration.
+    pub(in crate::v02::manager::core) fn reserve_scope_with_preflight<F, C>(
+        self: &Arc<Self>,
+        target: &SubmissionTarget,
+        mut options: OperationOptions,
+        execution: ExecutionKind,
+        body: F,
+        preflight: C,
+    ) -> Result<(F, OperationId, Arc<ScopeCore>, SubmissionReservation), SubmitError<F>>
+    where
+        F: Send + 'static,
+        C: FnOnce(OperationId) -> Result<(), AdmissionError>,
     {
         let (parent, groups) = match target {
             SubmissionTarget::Root { groups } => (None, groups),
@@ -294,6 +311,11 @@ impl ManagerCore {
             Ok(permit) => permit,
             Err(reason) => return Err(SubmitError::new(reason, body)),
         };
+        // Invoke foreign code after reversible admission and outside internal
+        // locks, but before registering the operation with its parent/groups.
+        if let Err(reason) = preflight(id) {
+            return Err(SubmitError::new(reason, body));
+        }
         self.track_resource_recoveries(&permit.resource_scope, groups.clone());
         let scope_core = ScopeCore::new(ScopeCoreInit {
             id,
