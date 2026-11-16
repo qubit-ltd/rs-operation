@@ -43,6 +43,8 @@
 
 结算可能报告需要恢复的资源。应保持恢复 owner 可达并按报告继续处理；诊断容量限制可能截断摘要，但不会丢弃恢复 store 持有的资源 owner。外部 worker 仍持有资源或清理、恢复尚未完成时，管理器关闭可以保持 Pending。保留 shutdown handle，并在 worker 或恢复流程取得进展后再次观察。
 
+每个恢复快照最多保留最近 64 条清理失败，按从旧到新的顺序排列。`failures_total` 以饱和计数统计上次确认清理以来的全部失败事件，`failures_truncated` 表示是否已淘汰较早条目。成功清理会清空历史并重置这两个字段。Attempt 报告暴露的是完成时保留的历史，不是单独的单次尝试事件列表。需要完整日志的应用应自行将每次失败写入日志系统；该上限约束条目数量，不限制单个错误来源的大小。
+
 ## 5. 能力边界与示例
 
 本库协调生命周期，不实现 provider 协议、文件或命令适配器、业务重试、补偿或分布式恢复。应用仍须负责共享资源内容的同步，并保证适配器报告的停止和释放事实准确。完整 provider 生命周期见 [provider_read.rs](examples-0.3.0/provider_read.rs)；[leased_temp.rs](examples-0.3.0/leased_temp.rs) 只是简短的停止/结算辅助片段。两者都使用模拟 provider 边界，不是真实文件或推理适配器。资源型结果示例见 [inference.rs](examples-0.3.0/inference.rs)。Cargo 会把这些示例作为 library target 编译。

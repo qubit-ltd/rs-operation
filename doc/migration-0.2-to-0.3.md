@@ -30,6 +30,10 @@ Either `T` or `E` may contain a `ResourceRef<T>`, directly or through another ob
 
 Outcome and settlement remain separate: an early business result or stop does not mean background work has released its inputs.
 
+## Recovery failure history
+
+`RecoverySnapshot` adds `failures_total` and `failures_truncated`. Hand-written struct literals must initialize both fields, and exhaustive destructuring must name them or use `..`. `last_failures` now retains only the most recent 64 failures in oldest-to-newest order; successful cleanup clears the history and resets both metadata fields. `RecoveryAttemptReport.failures` remains the retained history at attempt completion, not a separate per-attempt event list. Applications that need complete historical logs should emit failures to their own logging system. The entry limit does not bound the size of an individual error source.
+
 ## Group limits and errors
 
 `ManagerOptions` adds `max_groups_per_operation`, defaulting to 16 distinct service groups. Set it explicitly if a known application topology needs another bound. `OperationManager::with_group` now returns `Result<OperationManager, GroupBindingError>`; handle the added `CapacityExceeded` variant when binding would exceed the configured limit. Existing variants are `WrongManager`, `Closed`, and `ScopeEnded`. Binding an already-bound identical group remains idempotent and does not consume another slot.

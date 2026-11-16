@@ -30,6 +30,10 @@ match handle.request_stop(StopReason::UserCancelled) {
 
 Outcome 与 settlement 彼此独立：提前得到业务结果或停止结果，不代表后台工作已归还输入。
 
+## Recovery 失败历史
+
+`RecoverySnapshot` 新增 `failures_total` 和 `failures_truncated`。手写结构体字面量需要初始化这两个字段；穷尽解构需要显式列出新字段或使用 `..`。`last_failures` 现在只保留最近 64 条失败，并按从旧到新的顺序排列；成功清理会清空历史并重置两个元数据字段。`RecoveryAttemptReport.failures` 仍是尝试完成时保留的历史，不是单独的单次尝试事件列表。需要完整历史日志的应用应自行把失败写入日志系统。条目上限不限制单个错误来源的大小。
+
 ## 组上限与错误
 
 `ManagerOptions` 新增 `max_groups_per_operation`，不同服务组默认最多 16 个。若已知的应用拓扑需要其他上限，请显式配置。`OperationManager::with_group` 返回 `Result<OperationManager, GroupBindingError>`；绑定会超过上限时，要处理新增的 `CapacityExceeded`。已有变体为 `WrongManager`、`Closed` 和 `ScopeEnded`。重复绑定同一组仍是幂等操作，不额外占用名额。

@@ -45,7 +45,17 @@ pub(in crate::v02::resource::recovery) struct State {
 }
 
 impl State {
-    /// Adds a failure and returns any oldest entry evicted to enforce the limit.
+    /// Adds a failure and returns any oldest entry evicted to enforce the
+    /// limit.
+    ///
+    /// # Parameters
+    ///
+    /// * `self` — recovery state whose failure history is updated.
+    /// * `failure` — failure event to append.
+    ///
+    /// # Returns
+    ///
+    /// The oldest failure evicted to keep the history within its fixed limit.
     pub(super) fn append_failure(&mut self, failure: CleanupFailure) -> Option<CleanupFailure> {
         self.failures_total = self.failures_total.saturating_add(1);
         let evicted = if self.failures.len() == RECOVERY_FAILURE_HISTORY_LIMIT {

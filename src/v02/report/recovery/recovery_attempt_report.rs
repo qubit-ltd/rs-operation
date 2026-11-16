@@ -16,6 +16,9 @@ use crate::v02::report::RecoverySnapshot;
 pub struct RecoveryAttemptReport {
     /// Recovery state after the attempt completed.
     pub recovery: RecoverySnapshot,
-    /// Failures produced by this attempt.
+    /// Retained failure history at the time this attempt completed. This is a
+    /// snapshot of `recovery.last_failures`, not a per-attempt event list; use
+    /// `recovery.failures_total` and `recovery.failures_truncated` for the
+    /// history count and truncation status.
     pub failures: Arc<[CleanupFailure]>,
 }

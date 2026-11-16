@@ -13,12 +13,19 @@ use crate::v02::report::RecoveryId;
 use crate::v02::report::RecoveryPhase;
 use crate::v02::report::ResourceId;
 
-/// Point-in-time recovery state and cleanup failures retained while unresolved.
+/// Point-in-time recovery state and recent cleanup failures retained while
+/// unresolved.
 ///
 /// Obtain this snapshot from
 /// [`RecoveryHandle::snapshot`](crate::RecoveryHandle::snapshot).
-/// Failed attempts add their failures to `last_failures`; successful cleanup
-/// clears that list.
+/// Failed attempts add their failures to `last_failures`, which retains at most
+/// the 64 most recent entries in oldest-to-newest order. `failures_total` is a
+/// saturating count of all failure events since the last confirmed cleanup,
+/// while `failures_truncated` reports whether older entries were evicted.
+/// Successful cleanup clears the retained list and resets both metadata
+/// fields. Applications that need a complete failure log should emit each
+/// failure to their own logging system when observed; the retained history is
+/// diagnostic context, not a complete event log.
 ///
 /// # Examples
 ///
@@ -40,11 +47,11 @@ pub struct RecoverySnapshot {
     pub resources: Arc<[ResourceId]>,
     /// Number of cleanup attempts started for this record.
     pub attempts: usize,
-    /// Total failures since the last confirmed cleanup, saturating at `usize::MAX`.
+    /// Total failures since the last confirmed cleanup, saturating at
+    /// `usize::MAX`.
     pub failures_total: usize,
     /// Whether `last_failures` omits older failures.
     pub failures_truncated: bool,
-    /// Failures accumulated from unsuccessful attempts while cleanup is
-    /// unresolved.
+    /// The most recent 64 failures, ordered from oldest to newest.
     pub last_failures: Arc<[CleanupFailure]>,
 }

@@ -83,13 +83,21 @@ impl RecoveryHandle {
 
     /// Returns a point-in-time snapshot of this group's recovery state.
     ///
+    /// The snapshot retains at most 64 recent failures in oldest-to-newest
+    /// order. `failures_total` counts all failure events since the last
+    /// confirmed cleanup, saturating at `usize::MAX`; `failures_truncated`
+    /// indicates that older entries were evicted. Successful cleanup clears
+    /// the history and resets both fields. Applications that need a complete
+    /// history should emit each failure to their own logging system.
+    ///
     /// # Parameters
     ///
     /// - `self`: The handle whose recovery state is observed.
     ///
     /// # Returns
     ///
-    /// The current phase, resources, attempt count and retained failures.
+    /// The current phase, resources, attempt count, recent failures, and
+    /// failure-history metadata.
     pub fn snapshot(&self) -> RecoverySnapshot {
         self.core.snapshot()
     }
