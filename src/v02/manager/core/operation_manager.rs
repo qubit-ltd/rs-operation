@@ -631,6 +631,7 @@ impl OperationManager {
                 });
             }
             if !early_published_for_runner.load(Ordering::Acquire) {
+                let callback_scope = Arc::clone(&scope_core);
                 scope_core.on_outcomes_ready(move || {
                     let outcome = match result {
                         Ok(Some(outcome)) => outcome,
@@ -645,6 +646,7 @@ impl OperationManager {
                             summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
                         }),
                     };
+                    let outcome = callback_scope.resolve_typed_outcome(outcome);
                     let summary = child_outcome_summary(operation_id, &outcome);
                     control.publish_outcome(summary.clone());
                     if let Some(parent) = parent {

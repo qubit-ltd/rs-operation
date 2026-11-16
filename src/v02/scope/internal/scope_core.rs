@@ -1627,29 +1627,56 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn test_required_failure_stops_siblings_but_optional_failure_does_not_fail_parent() {
-        let sibling = Arc::new(Mutex::new(None::<Arc<ScopeCore>>));
-        let sibling_in_body = Arc::clone(&sibling);
-        let (_, manager) = ManagerCore::for_test();
+    fn test_required_failure_stops_an_open_sibling() {
+        let (manager_core, manager) = ManagerCore::for_test();
         manager
             .try_submit_body(move |scope| {
                 let parent = Arc::clone(&scope.core);
-                let failed = scope.manager().try_submit_body(|_| {}).unwrap();
-                scope
-                    .manager()
-                    .try_submit_body(move |sibling_scope| {
-                        *sibling_in_body.lock().unwrap() = Some(Arc::clone(&sibling_scope.core));
-                    })
-                    .unwrap();
+                let sibling_id = OperationId::new_unique();
+                let manager_capacity = ManagerCapacityPools::new(ManagerLimits::default());
+                let capacity = Arc::new(ScopeCapacity::root_for_operation(
+                    &manager_capacity,
+                    sibling_id,
+                    ScopeLimits::default(),
+                ));
+                let resources = ResourceScope::new(
+                    ManagerId::new_unique(),
+                    ResourceScopeId::new_unique(),
+                    Arc::clone(&capacity),
+                    Arc::new(NoCleanup),
+                );
+                let sibling = ScopeCore::new(ScopeCoreInit {
+                    id: sibling_id,
+                    manager: Arc::downgrade(&manager_core),
+                    parent: Some(Arc::downgrade(&parent)),
+                    context: parent.context.child(ContextOptions::default()).unwrap(),
+                    options: OperationOptions::default(),
+                    diagnostic_limit: 8,
+                    capacity,
+                    resource_scope: resources.internal_clone(),
+                    groups: Vec::new(),
+                });
+                assert!(parent.mark_child(sibling_id, Arc::downgrade(&sibling), ChildRequirement::Required,));
+                let failed_id = OperationId::new_unique();
+                assert!(parent.mark_child(failed_id, Weak::new(), ChildRequirement::Required));
                 parent
-                    .record_child_outcome(outcome(failed, ChildOutcomeKind::Failed))
+                    .record_child_outcome(outcome(failed_id, ChildOutcomeKind::Failed))
                     .unwrap();
+                assert_eq!(sibling.context.stop_reason(), Some(StopReason::RequiredChildFailed));
+                sibling.mark_body_finished();
+                parent
+                    .record_child_outcome(outcome(sibling_id, ChildOutcomeKind::Stopped))
+                    .unwrap();
+                for child_id in [failed_id, sibling_id] {
+                    assert!(parent.child_input_released(child_id));
+                    assert!(parent.record_child_settlement(child_id, Arc::new(settlement(child_id))));
+                }
             })
             .unwrap();
-        let sibling = sibling.lock().unwrap().take().unwrap();
-        assert_eq!(sibling.context.stop_reason(), Some(StopReason::RequiredChildFailed));
-        assert!(!sibling.mark_child(OperationId::new_unique(), Weak::new(), ChildRequirement::Required,));
+    }
 
+    #[test]
+    fn test_optional_failure_does_not_fail_parent() {
         let parent = Arc::new(Mutex::new(None::<Arc<ScopeCore>>));
         let parent_in_body = Arc::clone(&parent);
         let (_, manager) = ManagerCore::for_test();
