@@ -22,9 +22,8 @@ use super::PollSlot;
 use super::PortableInner;
 use super::PortablePermit;
 use super::PortableState;
-use super::PortableTask;
+use super::internal::CompletionGuard;
 use super::lock;
-use super::notify_capacity;
 use crate::v02::report::PortableExecutorOptions;
 
 /// Cooperative, runtime-independent executor for `Send` futures.
@@ -241,68 +240,5 @@ impl PortableExecutor {
     /// * `callback` is invoked after a task releases its reserved capacity.
     pub(crate) fn set_capacity_callback(&self, callback: Arc<dyn Fn() + Send + Sync + 'static>) {
         *lock(&self.inner.capacity_callback) = Some(callback);
-    }
-}
-
-/// Removes a completed task from the registry even if dropping its future
-/// unwinds.
-struct CompletionGuard<'a> {
-    inner: &'a PortableInner,
-    task: &'a PortableTask,
-    finished: bool,
-}
-
-impl<'a> CompletionGuard<'a> {
-    fn new(inner: &'a PortableInner, task: &'a PortableTask) -> Self {
-        Self {
-            inner,
-            task,
-            finished: false,
-        }
-    }
-
-    fn finish(&mut self) {
-        self.finished = true;
-        self.cleanup();
-    }
-
-    fn cleanup(&self) {
-        let removed = {
-            let mut state = lock(&self.inner.state);
-            let active_index = state
-                .active
-                .iter()
-                .position(|active| std::ptr::eq(active.as_ref(), self.task));
-            active_index.and_then(|index| {
-                let removed = state.active.swap_remove(index);
-                state
-                    .ready
-                    .retain(|queued| !std::ptr::eq(queued.as_ref(), self.task));
-                state.tasks -= 1;
-                Some(removed)
-            })
-        };
-        let removed_active = removed.is_some();
-        drop(removed);
-        if removed_active {
-            self.inner.ready_available.notify_all();
-            if std::thread::panicking() {
-                // Preserve the original Future destructor panic if a callback
-                // or one of its wakers also panics during unwind cleanup.
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    notify_capacity(&self.inner.capacity_callback);
-                }));
-            } else {
-                notify_capacity(&self.inner.capacity_callback);
-            }
-        }
-    }
-}
-
-impl Drop for CompletionGuard<'_> {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.cleanup();
-        }
     }
 }

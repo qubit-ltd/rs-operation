@@ -8,6 +8,8 @@
 
 mod portable_inner;
 pub(super) use portable_inner::PortableInner;
+mod completion_guard;
+pub(super) use completion_guard::CompletionGuard;
 mod portable_state;
 pub(super) use portable_state::PortableState;
 mod portable_task;

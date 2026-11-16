@@ -120,6 +120,8 @@ The runnable [family and capacity example](examples-0.2.0/family_and_capacity.rs
 
 Use `OperationManager` for synchronous bodies and `AsyncOperationManager` for async bodies. `as_async()` and `as_sync()` share the same lifecycle state; they are views, not independent managers. Async operation handles expose async observations.
 
+The async executor retains every submitted operation until its future completes. A waker only schedules another poll; dropping it does not cancel the operation. `ShutdownMode::Drain` still waits for accepted futures to complete.
+
 ### 5.2 Keep native inputs alive until actual use ends
 
 The [inference example](examples-0.2.0/inference.rs) demonstrates the key integration pattern: the operation body hands a `ResourceRef` to the domain worker, awaits the worker's completion signal, and returns its business result. The worker keeps its own reference until native inference has stopped accessing the input. Cancellation can request that the work stop, but it cannot prove an uninterruptible native call has stopped.

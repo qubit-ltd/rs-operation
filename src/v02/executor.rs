@@ -69,10 +69,10 @@ mod tests {
     use super::CleanupExecutor;
     use super::ExecutorCreateError;
     use super::ExecutorError;
-    use super::lock;
     use super::PortableExecutor;
     use super::ShutdownError;
     use super::ThreadPoolExecutor;
+    use super::lock;
     use super::pool_worker;
     use crate::v02::report::PortableExecutorOptions;
     use crate::v02::report::ThreadPoolExecutorOptions;
@@ -159,12 +159,9 @@ mod tests {
 
         assert_eq!(executor.poll_turn(), 1);
         assert_eq!(polls.load(Ordering::SeqCst), 1);
-        assert!(
-            !executor.poll_once(),
-            "a pending future must not be busy-polled"
-        );
+        assert!(!executor.poll_once(), "a pending future must not be busy-polled");
         let late_waker = saved.0.lock().unwrap().take().unwrap();
-        late_waker.clone().wake();
+        late_waker.wake_by_ref();
         assert!(executor.poll_once());
         assert_eq!(polls.load(Ordering::SeqCst), 2);
         assert_eq!(lock(&executor.inner.state).tasks, 0);
@@ -246,10 +243,7 @@ mod tests {
         assert_eq!(state.active.len(), 1);
         assert!(state.ready.is_empty());
         drop(state);
-        assert!(
-            !executor.poll_once(),
-            "pending task must not be busy-polled"
-        );
+        assert!(!executor.poll_once(), "pending task must not be busy-polled");
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
     }
@@ -286,6 +280,105 @@ mod tests {
         assert!(state.active.is_empty());
     }
 
+    #[test]
+    fn test_standalone_executor_drop_releases_pending_task() {
+        let executor = PortableExecutor::new(PortableExecutorOptions {
+            worker_count: 1,
+            task_capacity: 1,
+            polls_per_turn: 8,
+        })
+        .unwrap();
+        let weak_inner = Arc::downgrade(&executor.inner);
+        let drops = Arc::new(AtomicUsize::new(0));
+        executor.reserve().unwrap().spawn(PendingWithoutWaker {
+            polls: Arc::new(AtomicUsize::new(0)),
+            drops: Arc::clone(&drops),
+        });
+
+        assert!(executor.poll_once());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(executor);
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(weak_inner.upgrade().is_none());
+    }
+
+    struct PendingWhileHoldingExecutor {
+        _executor: PortableExecutor,
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Future for PendingWhileHoldingExecutor {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<()> {
+            if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }
+    }
+
+    impl Drop for PendingWhileHoldingExecutor {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_completed_future_releases_captured_executor_reference() {
+        let executor = PortableExecutor::new(PortableExecutorOptions {
+            worker_count: 1,
+            task_capacity: 1,
+            polls_per_turn: 8,
+        })
+        .unwrap();
+        let weak_inner = Arc::downgrade(&executor.inner);
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        executor.reserve().unwrap().spawn(PendingWhileHoldingExecutor {
+            _executor: executor.clone(),
+            polls: Arc::clone(&polls),
+            drops: Arc::clone(&drops),
+        });
+
+        assert!(executor.poll_once());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        active_task_waker(&executor).wake();
+        assert!(executor.poll_once());
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(executor);
+
+        assert!(weak_inner.upgrade().is_none());
+    }
+
+    #[test]
+    fn test_closed_executor_accepts_reserved_permit_and_worker_drains() {
+        let executor = PortableExecutor::new(PortableExecutorOptions {
+            worker_count: 1,
+            task_capacity: 1,
+            polls_per_turn: 8,
+        })
+        .unwrap();
+        let workers = executor.start_workers(1, "portable-close-test").unwrap();
+        let permit = executor.reserve().unwrap();
+
+        executor.close_admission();
+        assert!(matches!(executor.reserve(), Err(ExecutorError::Closed)));
+        permit.spawn(async {});
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let state = lock(&executor.inner.state);
+        assert_eq!(state.tasks, 0);
+        assert!(state.active.is_empty());
+        assert!(state.ready.is_empty());
+    }
+
     struct ReadyFuturePanickingOnDrop;
 
     impl Future for ReadyFuturePanickingOnDrop {
@@ -317,10 +410,7 @@ mod tests {
                 panic!("capacity callback probe");
             }
         }));
-        executor
-            .reserve()
-            .unwrap()
-            .spawn(ReadyFuturePanickingOnDrop);
+        executor.reserve().unwrap().spawn(ReadyFuturePanickingOnDrop);
 
         let panic = catch_unwind(AssertUnwindSafe(|| executor.poll_once()))
             .expect_err("Future destructor should propagate its panic");

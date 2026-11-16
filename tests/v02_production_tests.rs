@@ -12,9 +12,11 @@ use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Barrier;
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Waker;
 use std::time::Duration;
 
 use qubit_operation::AsyncCleanup;
@@ -124,6 +126,73 @@ fn test_real_sync_and_async_managers_run_typed_operations_and_shutdown() {
         OperationOutcome::Succeeded(23)
     ));
     assert!(asynchronous.wait_settlement().unwrap().all_released());
+    assert!(matches!(
+        manager
+            .as_sync()
+            .request_shutdown(ShutdownMode::Drain)
+            .wait_for(Duration::from_secs(3))
+            .unwrap(),
+        ShutdownWait::Completed(_)
+    ));
+}
+
+struct RetainedPendingOperation {
+    saved_waker: Arc<Mutex<Option<Waker>>>,
+    first_poll: Option<mpsc::Sender<()>>,
+    drops: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Future for RetainedPendingOperation {
+    type Output = Result<(), ()>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(first_poll) = self.first_poll.take() {
+            *self.saved_waker.lock().unwrap() = Some(context.waker().clone());
+            first_poll.send(()).unwrap();
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+}
+
+impl Drop for RetainedPendingOperation {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn test_async_manager_retains_pending_operation_until_woken() {
+    let manager = AsyncOperationManager::new(ManagerOptions::default()).unwrap();
+    let saved_waker = Arc::new(Mutex::new(None));
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (first_poll, polled) = mpsc::channel();
+    let mut operation = manager
+        .try_submit(OperationOptions::default(), {
+            let saved_waker = Arc::clone(&saved_waker);
+            let drops = Arc::clone(&drops);
+            move |_| RetainedPendingOperation {
+                saved_waker,
+                first_poll: Some(first_poll),
+                drops,
+            }
+        })
+        .unwrap()
+        .into_sync();
+
+    polled
+        .recv_timeout(Duration::from_secs(3))
+        .expect("the manager should poll the submitted async operation");
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    saved_waker.lock().unwrap().take().unwrap().wake();
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    assert!(operation.wait_settlement().unwrap().all_released());
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(matches!(
         manager
             .as_sync()

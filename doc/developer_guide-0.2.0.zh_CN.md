@@ -588,6 +588,8 @@ submit 同样适用于各层，只是等待准入：同步版本阻塞调用线�
 
 OperationManager 提交同步闭包、同步等待准入与结果；AsyncOperationManager 提交返回 Future 的闭包，异步等待。两者的 scope 和资源接口相同。
 
+异步执行器会持有已提交操作，直到其 Future 完成。waker 只负责安排下一次 poll；丢弃 waker 不会取消操作。`ShutdownMode::Drain` 仍会等待已接纳的 Future 实际完成。
+
 as_async/as_sync 返回同一管理核心的另一外观，共享容量和关闭状态，并保留原来的提交位置；单独 new 才是独立管理器。handle 的 into_async/into_sync 则消费原句柄，转移同一次结果接收权。
 
 下面是完整的应用函数，可与第 2 节 InputFile 放在同一模块。文件读取仍交给同步执行器，调用方通过异步 handle 等待，不在异步 poll 中执行阻塞文件 I/O：
