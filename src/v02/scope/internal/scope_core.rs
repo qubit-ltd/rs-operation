@@ -514,6 +514,16 @@ impl ScopeCore {
     /// Reserves a parent link before foreign bind runs, so parent shutdown
     /// observes and stops the pending child while the adapter call stays
     /// outside the scope lock.
+    ///
+    /// # Parameters
+    ///
+    /// * `id` — identifier of the child being reserved.
+    /// * `scope` — weak reference to the child's scope.
+    /// * `requirement` — whether child failure is required or optional.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the open parent accepted the provisional link.
     pub(crate) fn reserve_child(&self, id: OperationId, scope: Weak<ScopeCore>, requirement: ChildRequirement) -> bool {
         let mut state = lock(&self.state);
         if !state.open || state.stopping || self.context.check().is_err() {
@@ -534,6 +544,10 @@ impl ScopeCore {
     }
 
     /// Commits a provisional parent link after bind claims the adapter.
+    ///
+    /// # Parameters
+    ///
+    /// * `id` — identifier of the reserved child.
     pub(crate) fn commit_child_reservation(&self, id: OperationId) {
         let mut state = lock(&self.state);
         if !state.provisional_children.remove(&id) {
@@ -547,6 +561,10 @@ impl ScopeCore {
     /// Rolls back a provisional parent link when bind rejects an already
     /// claimed adapter. It also completes parent settlement if shutdown was
     /// waiting solely for this reservation.
+    ///
+    /// # Parameters
+    ///
+    /// * `id` — identifier of the reserved child to remove.
     pub(crate) fn rollback_child_reservation(&self, id: OperationId) {
         let callback = {
             let mut state = lock(&self.state);
@@ -1025,6 +1043,19 @@ impl ScopeCore {
 
     /// Applies this scope's stop and required-child policy to a typed outcome
     /// supplied by an external execution adapter.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `T` — success value carried by the typed outcome.
+    /// * `E` — error value carried by the typed outcome.
+    ///
+    /// # Parameters
+    ///
+    /// * `outcome` — adapter-provided outcome before scope policy is applied.
+    ///
+    /// # Returns
+    ///
+    /// The outcome with required-child failure or stop state applied.
     pub(crate) fn resolve_typed_outcome<T, E>(&self, outcome: OperationOutcome<T, E>) -> OperationOutcome<T, E> {
         if let Some(failure) = self.required_failure() {
             return OperationOutcome::ChildFailed(failure);

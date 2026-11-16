@@ -247,6 +247,10 @@ impl OperationScope {
     /// record budget. Capacity exhaustion preserves prior records and
     /// increments the visible overflow count. Records are application claims;
     /// they do not prove rollback or release.
+    ///
+    /// # Parameters
+    ///
+    /// * `record` — application-reported effect to add to this operation's report.
     pub fn record_effect(
         &self,
         record: crate::v02::report::EffectRecord,

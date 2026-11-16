@@ -200,6 +200,23 @@ impl GroupCore {
     /// `commit_parent` rejects the child, every insertion is rolled back before
     /// any group can observe it or request cancellation. Cancellation racing
     /// this transaction therefore observes either every membership or none.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `F` — callback that commits the child link after group validation.
+    ///
+    /// # Parameters
+    ///
+    /// * `groups` — groups that must register the operation atomically.
+    /// * `id` — identifier shared by the operation's group memberships.
+    /// * `scope` — weak reference to the operation scope to register.
+    /// * `descendant` — whether closed groups still admit this descendant.
+    /// * `commit_parent` — callback that commits the parent link.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after all memberships and the parent link commit, or the
+    /// admission error that prevented the transaction.
     #[cfg(test)]
     pub(crate) fn register_scope_many_with<F>(
         groups: &[Arc<Self>],
@@ -217,6 +234,24 @@ impl GroupCore {
     /// Registers an adapter claim that completed during the final admission
     /// preflight. A concurrent Cancel transition must produce a stopped
     /// accepted operation instead of returning an already claimed Arc.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `F` — callback that commits the child link after group validation.
+    ///
+    /// # Parameters
+    ///
+    /// * `groups` — groups that must register the operation atomically.
+    /// * `id` — identifier shared by the operation's group memberships.
+    /// * `scope` — weak reference to the operation scope to register.
+    /// * `descendant` — whether closed groups still admit this descendant.
+    /// * `claimed` — whether final admission preflight already claimed it.
+    /// * `commit_parent` — callback that commits the parent link.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` after all memberships and the parent link commit, or the
+    /// admission error that prevented the transaction.
     pub(crate) fn register_scope_many_with_claimed<F>(
         groups: &[Arc<Self>],
         id: OperationId,
@@ -648,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_later_group_reservation_never_exposes_earlier_capacity() {
+    fn test_failed_later_reservation_does_not_expose_earlier_capacity() {
         use std::sync::mpsc;
         use std::time::Instant;
 
@@ -695,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn canceled_later_group_rejects_batch_without_partial_scope_registration() {
+    fn test_canceled_later_group_prevents_partial_scope_registration() {
         let first = GroupCore::new(1);
         let later = GroupCore::new(1);
         let (first, later) = if first.id < later.id {
