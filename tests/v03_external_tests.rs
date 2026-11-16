@@ -20,6 +20,8 @@ use qubit_operation::ChildOutcomeSummary;
 use qubit_operation::ChildRelease;
 use qubit_operation::ChildSnapshot;
 use qubit_operation::DiagnosticSummary;
+use qubit_operation::EffectFact;
+use qubit_operation::EffectRecord;
 use qubit_operation::ExecutionFailure;
 use qubit_operation::ExecutionPhase;
 use qubit_operation::ExternalBindError;
@@ -66,6 +68,7 @@ struct Prepared {
     settlement_ready: std::sync::atomic::AtomicBool,
     settlement_waker: std::sync::Mutex<Option<Waker>>,
     settlement_polls: std::sync::atomic::AtomicUsize,
+    domain_settlement_status: std::sync::Mutex<Option<SettlementStatus>>,
     captured_manager: std::sync::Mutex<Option<OperationManager>>,
 }
 
@@ -150,12 +153,15 @@ impl OperationControl for Prepared {
             return Poll::Pending;
         }
         let operation_id = self.id.lock().unwrap().expect("bound before polling");
+        let status = self.domain_settlement_status.lock().unwrap().unwrap_or(SettlementStatus::Released);
+        let recovery = status == SettlementStatus::RecoveryRequired;
+        let transferred = status == SettlementStatus::Transferred;
         Poll::Ready(Arc::new(SettlementReport {
             operation_id,
-            status: SettlementStatus::Released,
+            status,
             released_count: 0,
-            transferred_count: 0,
-            recovery_count: 0,
+            transferred_count: usize::from(transferred),
+            recovery_count: usize::from(recovery),
             children: Arc::from([]),
             children_total: 0,
             children_truncated: false,
@@ -166,14 +172,19 @@ impl OperationControl for Prepared {
             resource_reports_total: 0,
             resource_reports_truncated: false,
             transfers: Arc::from([]),
-            transfers_total: 0,
-            transfers_truncated: false,
+            transfers_total: usize::from(transferred) + usize::from(transferred),
+            transfers_truncated: transferred,
             recoveries: Arc::from([]),
-            recoveries_total: 0,
-            recoveries_truncated: false,
-            effects: Arc::from([]),
-            effects_total: 0,
-            effect_overflow: 0,
+            recoveries_total: usize::from(recovery) + usize::from(recovery),
+            recoveries_truncated: recovery,
+            effects: Arc::from([EffectRecord {
+                operation_id,
+                resource_id: None,
+                fact: EffectFact::Known,
+                description: DiagnosticSummary::new("external side effect"),
+            }]),
+            effects_total: 2,
+            effect_overflow: 1,
             external_settlement: None,
         }))
     }
@@ -221,6 +232,7 @@ impl Prepared {
             settlement_ready: std::sync::atomic::AtomicBool::new(true),
             settlement_waker: std::sync::Mutex::new(None),
             settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+            domain_settlement_status: std::sync::Mutex::new(None),
             captured_manager: std::sync::Mutex::new(None),
         })
     }
@@ -328,6 +340,7 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
     });
     let mut handle = manager
@@ -357,7 +370,13 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
         "the retained driver must wait for a wake instead of busy polling"
     );
     prepared.release_inputs();
-    handle.wait_settlement().unwrap();
+    let report = handle.wait_settlement().unwrap();
+    let external = report.external_settlement.as_ref().expect("domain report must be retained");
+    assert_eq!(external.operation_id, report.operation_id);
+    assert_eq!(external.effects.len(), 1);
+    assert_eq!(external.effects_total, 2);
+    assert_eq!(external.effect_overflow, 1);
+    assert!(report.all_released());
     let outcome_polls_after_ready = prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst);
     for _ in 0..1000 {
         std::thread::yield_now();
@@ -407,6 +426,7 @@ fn test_post_claim_bind_failure_is_accepted_and_abandoned_once() {
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
     });
     let mut handle = manager
@@ -455,6 +475,7 @@ fn test_stop_during_bind_wins_before_commit_and_abandons_without_activation() {
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
     });
     let submit_manager = manager.clone();
@@ -522,6 +543,7 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
     });
     let submit = std::thread::spawn({
@@ -574,6 +596,7 @@ fn test_already_bound_claim_rolls_back_provisional_parent_child_link() {
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
     });
     let mut first = first_manager
@@ -632,6 +655,7 @@ fn test_dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
     });
     let mut handle = manager
@@ -826,6 +850,42 @@ fn test_external_summary_diagnostics_are_free_for_failed_and_stopped_outcomes() 
             _ => assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Stopped(_))),
         }
         handle.wait_settlement().unwrap();
+    }
+}
+
+#[test]
+fn test_domain_settlement_is_retained_and_drives_overall_status() {
+    for (domain_status, expected_status) in [
+        (SettlementStatus::Released, SettlementStatus::Released),
+        (SettlementStatus::Transferred, SettlementStatus::Transferred),
+        (SettlementStatus::RecoveryRequired, SettlementStatus::RecoveryRequired),
+    ] {
+        let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+        let prepared = Prepared::ready_fixture();
+        *prepared.domain_settlement_status.lock().unwrap() = Some(domain_status);
+        let mut handle = manager
+            .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
+            .expect("external task should be admitted");
+
+        assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
+        let report = handle.wait_settlement().unwrap();
+        let external = report.external_settlement.as_ref().expect("domain evidence must be retained");
+        assert_eq!(external.status, domain_status);
+        assert_eq!(report.status, expected_status);
+        assert_eq!(external.effects.len(), 1);
+        assert_eq!(external.effects_total, 2);
+        assert_eq!(external.effect_overflow, 1);
+        if domain_status == SettlementStatus::Transferred {
+            assert_eq!(external.transferred_count, 1);
+            assert!(external.transfers_truncated);
+        }
+        if domain_status == SettlementStatus::RecoveryRequired {
+            assert_eq!(external.recovery_count, 1);
+            assert!(external.recoveries_truncated);
+        }
+        assert_eq!(report.transferred_count, 0, "outer counts describe only scope evidence");
+        assert_eq!(report.recovery_count, 0, "outer counts describe only scope evidence");
+        assert_eq!(report.all_released(), domain_status == SettlementStatus::Released);
     }
 }
 
@@ -1064,6 +1124,7 @@ fn test_async_manager_drives_external_activation_on_portable_executor() {
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
+        domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
     });
     let mut handle = manager

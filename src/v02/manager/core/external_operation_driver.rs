@@ -249,5 +249,7 @@ pub async fn drive_external<T, E, P>(
         }
     })
     .await;
-    scope_core_for_settlement.finish_external_driver_settlement();
+    scope_core_for_settlement.finish_external_driver_settlement(
+        settlement.expect("external driver completed after settlement was observed"),
+    );
 }
