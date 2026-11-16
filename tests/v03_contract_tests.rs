@@ -1,6 +1,11 @@
-use qubit_operation::{OperationControl, OperationId, OperationScope, PreparedExternalOperation};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::Context;
+use std::task::Poll;
+
+use qubit_operation::OperationControl;
+use qubit_operation::OperationId;
+use qubit_operation::OperationScope;
+use qubit_operation::PreparedExternalOperation;
 
 struct Adapter;
 impl OperationControl for Adapter {
@@ -22,19 +27,13 @@ impl PreparedExternalOperation<(), ()> for Adapter {
     fn bind(&self, _: OperationId) -> Result<(), qubit_operation::ExternalBindError> {
         todo!()
     }
-    fn activate(
-        self: Arc<Self>,
-        _: OperationScope,
-    ) -> Result<(), qubit_operation::ExecutionFailure> {
+    fn activate(self: Arc<Self>, _: OperationScope) -> Result<(), qubit_operation::ExecutionFailure> {
         todo!()
     }
     fn abandon(self: Arc<Self>) {
         todo!()
     }
-    fn poll_take_outcome(
-        &self,
-        _: &mut Context<'_>,
-    ) -> Poll<qubit_operation::OperationOutcome<(), ()>> {
+    fn poll_take_outcome(&self, _: &mut Context<'_>) -> Poll<qubit_operation::OperationOutcome<(), ()>> {
         Poll::Pending
     }
 }
@@ -66,10 +65,7 @@ impl PreparedExternalOperation<NoCloneNoDebug, NoCloneNoDebug> for AdapterTyped 
     fn bind(&self, _: OperationId) -> Result<(), qubit_operation::ExternalBindError> {
         todo!()
     }
-    fn activate(
-        self: Arc<Self>,
-        _: OperationScope,
-    ) -> Result<(), qubit_operation::ExecutionFailure> {
+    fn activate(self: Arc<Self>, _: OperationScope) -> Result<(), qubit_operation::ExecutionFailure> {
         todo!()
     }
     fn abandon(self: Arc<Self>) {}
@@ -103,8 +99,7 @@ fn external_trait_is_object_safe_and_keeps_result_types_unconstrained() {
         let _ = adapter.poll_settlement(cx);
     }
     let _ = invoke_object_callbacks;
-    let adapter: Arc<dyn PreparedExternalOperation<NoCloneNoDebug, NoCloneNoDebug>> =
-        Arc::new(AdapterTyped);
+    let adapter: Arc<dyn PreparedExternalOperation<NoCloneNoDebug, NoCloneNoDebug>> = Arc::new(AdapterTyped);
     assert_eq!(Arc::strong_count(&adapter), 1);
     #[allow(dead_code)]
     fn manager_entry_points_compile(
@@ -125,10 +120,7 @@ fn external_trait_is_object_safe_and_keeps_result_types_unconstrained() {
 
 #[test]
 fn manager_group_limit_has_the_frozen_default() {
-    assert_eq!(
-        qubit_operation::ManagerOptions::default().max_groups_per_operation,
-        16
-    );
+    assert_eq!(qubit_operation::ManagerOptions::default().max_groups_per_operation, 16);
 }
 
 #[test]
@@ -146,24 +138,19 @@ fn scope_contract_signatures_are_publicly_frozen() {
         scope: &OperationScope,
         record: qubit_operation::EffectRecord,
     ) -> Result<(), qubit_operation::EffectRecordError> {
-        let _: qubit_operation::StopRequestStatus =
-            scope.request_stop(qubit_operation::StopReason::UserCancelled);
+        let _: qubit_operation::StopRequestStatus = scope.request_stop(qubit_operation::StopReason::UserCancelled);
         scope.record_effect(record)
     }
     let _ = scope_methods;
     let _reserve: fn(
         &qubit_operation::ResourceScope,
-    ) -> Result<
-        qubit_operation::ResourceReservation,
-        qubit_operation::ResourceCapacityError,
-    > = qubit_operation::ResourceScope::reserve_resource;
+    ) -> Result<qubit_operation::ResourceReservation, qubit_operation::ResourceCapacityError> =
+        qubit_operation::ResourceScope::reserve_resource;
     let _group: fn(
         &qubit_operation::OperationManager,
         &qubit_operation::OperationGroup,
-    ) -> Result<
-        qubit_operation::OperationManager,
-        qubit_operation::GroupBindingError,
-    > = qubit_operation::OperationManager::with_group;
+    ) -> Result<qubit_operation::OperationManager, qubit_operation::GroupBindingError> =
+        qubit_operation::OperationManager::with_group;
 }
 
 #[test]

@@ -1,5 +1,8 @@
 //! Resource-valued results must be consumed and dropped before settlement.
-use qubit_operation::{OperationHandle, OperationOutcome, OutcomeError, SettlementReport};
+use qubit_operation::OperationHandle;
+use qubit_operation::OperationOutcome;
+use qubit_operation::OutcomeError;
+use qubit_operation::SettlementReport;
 
 /// Wait for the typed result first; drop any returned resource before settling.
 pub fn take_result<T: Send + 'static, E: Send + 'static>(

@@ -233,8 +233,10 @@ impl OperationScope {
     /// # Returns
     ///
     /// Returns [`StopRequestStatus::Accepted`](crate::v02::report::StopRequestStatus::Accepted)
-    /// for a new request, [`StopRequestStatus::AlreadyRequested`](crate::v02::report::StopRequestStatus::AlreadyRequested)
-    /// when a stop request already exists, or [`StopRequestStatus::AlreadyFinished`](crate::v02::report::StopRequestStatus::AlreadyFinished)
+    /// for a new request,
+    /// [`StopRequestStatus::AlreadyRequested`](crate::v02::report::StopRequestStatus::AlreadyRequested)
+    /// when a stop request already exists, or
+    /// [`StopRequestStatus::AlreadyFinished`](crate::v02::report::StopRequestStatus::AlreadyFinished)
     /// after the scope has ended.
     #[must_use]
     pub fn request_stop(&self, reason: StopReason) -> crate::v02::report::StopRequestStatus {

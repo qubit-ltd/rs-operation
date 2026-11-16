@@ -16,12 +16,12 @@ mod v02;
 #[cfg(test)]
 mod tests;
 
+pub use v02::adapter::ExternalBindError;
+pub use v02::adapter::PreparedExternalOperation;
 pub use v02::context::CleanupContext;
 pub use v02::context::DeadlineSignal;
 pub use v02::context::OperationContext;
 pub use v02::context::StopSignal;
-pub use v02::adapter::ExternalBindError;
-pub use v02::adapter::PreparedExternalOperation;
 pub use v02::manager::core::AsyncOperationManager;
 pub use v02::manager::core::OperationManager;
 pub use v02::manager::group::AsyncOperationGroup;
@@ -62,8 +62,8 @@ pub use v02::report::EffectRecord;
 pub use v02::report::EffectRecordError;
 pub use v02::report::ExecutionFailure;
 pub use v02::report::ExecutionPhase;
-pub use v02::report::GroupId;
 pub use v02::report::GroupBindingError;
+pub use v02::report::GroupId;
 pub use v02::report::GroupOptions;
 pub use v02::report::GroupSnapshot;
 pub use v02::report::ManagerCreateError;

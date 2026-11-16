@@ -1,5 +1,6 @@
 //! A provider adapter reports early stop independently from releasing input.
-use qubit_operation::{OperationOutcome, StopReason};
+use qubit_operation::OperationOutcome;
+use qubit_operation::StopReason;
 
 /// The controller can request stop while the provider still owns its input.
 pub fn request_provider_stop<T, E>(control: &impl qubit_operation::OperationControl) {

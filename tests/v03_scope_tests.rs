@@ -1,6 +1,8 @@
-use qubit_operation::{
-    GroupBindingError, GroupOptions, ManagerCreateError, ManagerOptions, OperationManager,
-};
+use qubit_operation::GroupBindingError;
+use qubit_operation::GroupOptions;
+use qubit_operation::ManagerCreateError;
+use qubit_operation::ManagerOptions;
+use qubit_operation::OperationManager;
 
 #[test]
 fn with_group_returns_same_constraint_view_and_deduplicates() {
@@ -13,10 +15,7 @@ fn with_group_returns_same_constraint_view_and_deduplicates() {
     drop(repeated);
     drop(bound);
     group.close_admission();
-    assert!(matches!(
-        manager.with_group(&group),
-        Err(GroupBindingError::Closed)
-    ));
+    assert!(matches!(manager.with_group(&group), Err(GroupBindingError::Closed)));
 }
 
 #[test]
@@ -24,14 +23,8 @@ fn distinct_groups_both_track_a_bound_operation() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let first = manager.group(GroupOptions { capacity: 2 }).unwrap();
     let second = manager.group(GroupOptions { capacity: 2 }).unwrap();
-    let bound = manager
-        .with_group(&first)
-        .unwrap()
-        .with_group(&second)
-        .unwrap();
-    let mut operation = bound
-        .try_submit(Default::default(), |_| Ok::<_, ()>(()))
-        .unwrap();
+    let bound = manager.with_group(&first).unwrap().with_group(&second).unwrap();
+    let mut operation = bound.try_submit(Default::default(), |_| Ok::<_, ()>(())).unwrap();
     assert!(operation.wait_outcome().is_ok());
     operation.wait_settlement().unwrap();
     assert_eq!(first.snapshot().active_operations, 0);
@@ -69,16 +62,10 @@ fn closing_any_bound_group_rejects_new_submission() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let first = manager.group(GroupOptions { capacity: 2 }).unwrap();
     let second = manager.group(GroupOptions { capacity: 2 }).unwrap();
-    let bound = manager
-        .with_group(&first)
-        .unwrap()
-        .with_group(&second)
-        .unwrap();
+    let bound = manager.with_group(&first).unwrap().with_group(&second).unwrap();
     second.close_admission();
     let rejected = bound.try_submit(Default::default(), |_| Ok::<_, ()>(()));
-    assert!(
-        matches!(rejected, Err(error) if error.reason() == qubit_operation::AdmissionError::Closed)
-    );
+    assert!(matches!(rejected, Err(error) if error.reason() == qubit_operation::AdmissionError::Closed));
 }
 
 #[test]
@@ -90,9 +77,7 @@ fn parent_bound_view_inherits_and_adds_group_constraints() {
     let mut parent = first
         .try_submit(Default::default(), move |scope| {
             let bound = scope.manager().with_group(&second_for_child).unwrap();
-            let mut child = bound
-                .try_submit(Default::default(), |_| Ok::<_, ()>(9usize))
-                .unwrap();
+            let mut child = bound.try_submit(Default::default(), |_| Ok::<_, ()>(9usize)).unwrap();
             assert!(matches!(
                 child.wait_outcome().unwrap(),
                 qubit_operation::OperationOutcome::Succeeded(9)
@@ -113,9 +98,9 @@ fn default_group_limit_accepts_sixteen_and_deduplicates_before_rejecting_sevente
     let groups: Vec<_> = (0..17)
         .map(|_| manager.group(GroupOptions { capacity: 2 }).unwrap())
         .collect();
-    let bound = groups[..16].iter().fold(manager.clone(), |view, group| {
-        view.with_group(group).unwrap()
-    });
+    let bound = groups[..16]
+        .iter()
+        .fold(manager.clone(), |view, group| view.with_group(group).unwrap());
     let duplicate = bound.with_group(&groups[0]).unwrap();
     assert!(matches!(
         duplicate.with_group(&groups[16]),
@@ -129,11 +114,7 @@ fn every_bound_group_capacity_participates_in_admission() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let first = manager.group(GroupOptions { capacity: 1 }).unwrap();
     let second = manager.group(GroupOptions { capacity: 1 }).unwrap();
-    let bound = manager
-        .with_group(&first)
-        .unwrap()
-        .with_group(&second)
-        .unwrap();
+    let bound = manager.with_group(&first).unwrap().with_group(&second).unwrap();
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let mut held = bound
@@ -145,9 +126,7 @@ fn every_bound_group_capacity_participates_in_admission() {
         .unwrap();
     started_rx.recv().unwrap();
     let rejected = bound.try_submit(Default::default(), |_| Ok::<_, ()>(()));
-    assert!(
-        matches!(rejected, Err(error) if error.reason() == qubit_operation::AdmissionError::Busy)
-    );
+    assert!(matches!(rejected, Err(error) if error.reason() == qubit_operation::AdmissionError::Busy));
     release_tx.send(()).unwrap();
     let _ = held.wait_outcome().unwrap();
     held.wait_settlement().unwrap();
@@ -155,16 +134,14 @@ fn every_bound_group_capacity_participates_in_admission() {
 
 #[test]
 fn closing_any_group_stops_an_already_admitted_operation() {
-    use qubit_operation::{OperationOutcome, ShutdownMode};
     use std::sync::mpsc;
+
+    use qubit_operation::OperationOutcome;
+    use qubit_operation::ShutdownMode;
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let first = manager.group(GroupOptions { capacity: 1 }).unwrap();
     let second = manager.group(GroupOptions { capacity: 1 }).unwrap();
-    let bound = manager
-        .with_group(&first)
-        .unwrap()
-        .with_group(&second)
-        .unwrap();
+    let bound = manager.with_group(&first).unwrap().with_group(&second).unwrap();
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let mut held = bound
@@ -177,16 +154,16 @@ fn closing_any_group_stops_an_already_admitted_operation() {
     started_rx.recv().unwrap();
     let _shutdown = second.request_shutdown(ShutdownMode::Cancel);
     release_tx.send(()).unwrap();
-    assert!(matches!(
-        held.wait_outcome().unwrap(),
-        OperationOutcome::Stopped(_)
-    ));
+    assert!(matches!(held.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
     held.wait_settlement().unwrap();
 }
 
 #[test]
 fn effect_records_obey_inherited_quota_and_report_overflow() {
-    use qubit_operation::{DiagnosticSummary, EffectFact, EffectRecord, EffectRecordError};
+    use qubit_operation::DiagnosticSummary;
+    use qubit_operation::EffectFact;
+    use qubit_operation::EffectRecord;
+    use qubit_operation::EffectRecordError;
     let mut options = ManagerOptions::default();
     options.scope_limits.effect_records = 1;
     let manager = OperationManager::new(options).unwrap();
@@ -215,11 +192,15 @@ fn effect_records_obey_inherited_quota_and_report_overflow() {
 
 #[test]
 fn stopped_scope_rejects_effects_and_stop_status_distinguishes_finished() {
-    use qubit_operation::{
-        DiagnosticSummary, EffectFact, EffectRecord, EffectRecordError, StopReason,
-        StopRequestStatus,
-    };
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use qubit_operation::DiagnosticSummary;
+    use qubit_operation::EffectFact;
+    use qubit_operation::EffectRecord;
+    use qubit_operation::EffectRecordError;
+    use qubit_operation::StopReason;
+    use qubit_operation::StopRequestStatus;
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let saved = Arc::new(Mutex::new(None));
     let saved_body = Arc::clone(&saved);
@@ -253,16 +234,16 @@ fn stopped_scope_rejects_effects_and_stop_status_distinguishes_finished() {
         fact: EffectFact::Unknown,
         description: DiagnosticSummary::new("late"),
     };
-    assert_eq!(
-        scope.record_effect(record),
-        Err(EffectRecordError::ScopeEnded)
-    );
+    assert_eq!(scope.record_effect(record), Err(EffectRecordError::ScopeEnded));
 }
 
 #[test]
 fn parent_stop_reaches_operation_submitted_through_additional_group_view() {
-    use qubit_operation::{OperationOutcome, StopReason, StopRequestStatus};
     use std::sync::mpsc;
+
+    use qubit_operation::OperationOutcome;
+    use qubit_operation::StopReason;
+    use qubit_operation::StopRequestStatus;
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let parent_group = manager.group(GroupOptions { capacity: 3 }).unwrap();
     let child_group = manager.group(GroupOptions { capacity: 3 }).unwrap();
@@ -285,10 +266,7 @@ fn parent_stop_reaches_operation_submitted_through_additional_group_view() {
                 StopRequestStatus::Accepted
             );
             release_tx.send(()).unwrap();
-            assert!(matches!(
-                child.wait_outcome().unwrap(),
-                OperationOutcome::Stopped(_)
-            ));
+            assert!(matches!(child.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
             child.wait_settlement().unwrap();
             Ok::<_, ()>(())
         })
@@ -305,11 +283,7 @@ fn service_scope_registered_with_every_inherited_group() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let first = manager.group(GroupOptions { capacity: 3 }).unwrap();
     let second = manager.group(GroupOptions { capacity: 3 }).unwrap();
-    let bound = manager
-        .with_group(&first)
-        .unwrap()
-        .with_group(&second)
-        .unwrap();
+    let bound = manager.with_group(&first).unwrap().with_group(&second).unwrap();
     let service_group = bound.group(GroupOptions { capacity: 3 }).unwrap();
     let service = service_group
         .resource_scope(qubit_operation::ServiceResourceOptions { capacity: 1 })
@@ -327,18 +301,11 @@ fn execution_context_detects_every_bound_group_for_deadlock_checks() {
     let first = manager.group(GroupOptions { capacity: 2 }).unwrap();
     let second = manager.group(GroupOptions { capacity: 2 }).unwrap();
     let second_for_body = second.clone();
-    let bound = manager
-        .with_group(&first)
-        .unwrap()
-        .with_group(&second)
-        .unwrap();
+    let bound = manager.with_group(&first).unwrap().with_group(&second).unwrap();
     let mut operation = bound
         .try_submit(Default::default(), move |_| {
             let shutdown = second_for_body.request_shutdown(qubit_operation::ShutdownMode::Drain);
-            assert!(matches!(
-                shutdown.wait(),
-                Err(ObservationError::WouldDeadlock)
-            ));
+            assert!(matches!(shutdown.wait(), Err(ObservationError::WouldDeadlock)));
             Ok::<_, ()>(())
         })
         .unwrap();
@@ -348,12 +315,16 @@ fn execution_context_detects_every_bound_group_for_deadlock_checks() {
 
 #[test]
 fn resource_scope_reservations_commit_values_and_preserve_unreserved_owner() {
-    use qubit_operation::{
-        AsyncCleanup, CleanupContext, CleanupFuture, CleanupOutcome, OperationOptions,
-        ResourceScopeOptions,
-    };
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use qubit_operation::AsyncCleanup;
+    use qubit_operation::CleanupContext;
+    use qubit_operation::CleanupFuture;
+    use qubit_operation::CleanupOutcome;
+    use qubit_operation::OperationOptions;
+    use qubit_operation::ResourceScopeOptions;
 
     struct Release;
     impl AsyncCleanup<u32> for Release {
@@ -376,9 +347,7 @@ fn resource_scope_reservations_commit_values_and_preserve_unreserved_owner() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let mut handle = manager
         .try_submit(OperationOptions::default(), move |scope| {
-            let resources = scope
-                .resource_scope(ResourceScopeOptions { capacity: 2 })
-                .unwrap();
+            let resources = scope.resource_scope(ResourceScopeOptions { capacity: 2 }).unwrap();
             let first = resources
                 .reserve_resource()
                 .unwrap()
@@ -422,9 +391,7 @@ fn group_binding_rejects_another_manager_and_does_not_mutate_original_view() {
     ));
     let _bound = manager.with_group(&group).unwrap();
     group.close_admission();
-    let mut unbound_operation = manager
-        .try_submit(Default::default(), |_| Ok::<_, ()>(()))
-        .unwrap();
+    let mut unbound_operation = manager.try_submit(Default::default(), |_| Ok::<_, ()>(())).unwrap();
     let _ = unbound_operation.wait_outcome().unwrap();
     unbound_operation.wait_settlement().unwrap();
 }

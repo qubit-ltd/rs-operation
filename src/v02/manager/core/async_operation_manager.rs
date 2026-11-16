@@ -69,7 +69,6 @@ pub struct AsyncOperationManager {
 }
 impl AsyncOperationManager {
     /// Attempts to submit a prepared external operation.
-    ///
     pub fn try_submit_external<T, E, P>(
         &self,
         options: OperationOptions,
@@ -81,10 +80,8 @@ impl AsyncOperationManager {
         P: crate::v02::adapter::PreparedExternalOperation<T, E>,
     {
         let bind_result: ExternalBindResult = Arc::new(Mutex::new(None));
-        let managed_control: Arc<Mutex<Option<Arc<ManagedOperationControl>>>> =
-            Arc::new(Mutex::new(None));
-        let execution_context: Arc<Mutex<Option<Arc<ExternalExecutionContext>>>> =
-            Arc::new(Mutex::new(None));
+        let managed_control: Arc<Mutex<Option<Arc<ManagedOperationControl>>>> = Arc::new(Mutex::new(None));
+        let execution_context: Arc<Mutex<Option<Arc<ExternalExecutionContext>>>> = Arc::new(Mutex::new(None));
         let outcome_publisher: ExternalOutcomePublisher<T, E> = Arc::new(Mutex::new(None));
         let activation_permitted = Arc::new(AtomicBool::new(false));
         let state_for_preflight = Arc::clone(&bind_result);
@@ -198,24 +195,18 @@ impl AsyncOperationManager {
                 body(scope)
             };
             async move {
-                let result =
-                    ExecutionContextFuture::new(body_future, manager_core, operation_id, groups)
-                        .await;
+                let result = ExecutionContextFuture::new(body_future, manager_core, operation_id, groups).await;
                 if let Some(context) = lock(&execution_for_runner).as_ref() {
                     context.finish();
                 }
                 if !early_published_for_runner.load(std::sync::atomic::Ordering::Acquire) {
                     scope_core.on_outcomes_ready(move || {
                         let outcome = match result {
-                            Ok(()) => OperationOutcome::ExecutionFailed(
-                                crate::v02::report::ExecutionFailure {
-                                    operation_id,
-                                    summary: DiagnosticSummary::new(
-                                        "async external driver ended without an outcome",
-                                    ),
-                                    source: None,
-                                },
-                            ),
+                            Ok(()) => OperationOutcome::ExecutionFailed(crate::v02::report::ExecutionFailure {
+                                operation_id,
+                                summary: DiagnosticSummary::new("async external driver ended without an outcome"),
+                                source: None,
+                            }),
                             Err(payload) => OperationOutcome::Panicked(PanicSummary {
                                 operation_id,
                                 phase: ExecutionPhase::Running,
@@ -247,9 +238,7 @@ impl AsyncOperationManager {
                 drop(runner);
                 return Err((
                     reason,
-                    lock(&body_cell)
-                        .take()
-                        .expect("rejected async body is retained"),
+                    lock(&body_cell).take().expect("rejected async body is retained"),
                 ));
             }
         };
@@ -306,10 +295,7 @@ impl AsyncOperationManager {
         let start_permitted = scope.commit_and_activate_start().is_ok();
         activation_permitted.store(start_permitted, Ordering::Release);
         let execution = reservation.execution;
-        let future = runner(OperationScope::new(
-            Arc::clone(&scope),
-            Arc::clone(&self.core),
-        ));
+        let future = runner(OperationScope::new(Arc::clone(&scope), Arc::clone(&self.core)));
         execution.dispatch(OperationJob::Async(Box::pin(future)));
         Ok(handle)
     }
@@ -330,9 +316,7 @@ impl AsyncOperationManager {
     /// Returns [`ManagerCreateError`](crate::v02::report::ManagerCreateError)
     /// when a configured executor, adapter, or cleanup resource cannot be
     /// initialized.
-    pub fn new(
-        options: crate::v02::report::ManagerOptions,
-    ) -> Result<Self, crate::v02::report::ManagerCreateError> {
+    pub fn new(options: crate::v02::report::ManagerOptions) -> Result<Self, crate::v02::report::ManagerCreateError> {
         crate::v02::manager::production::new_async(options)
     }
 
@@ -458,11 +442,7 @@ impl AsyncOperationManager {
                     }
                     if let Err(reason) = self
                         .core
-                        .wait_for_retry_capacity(
-                            &self.target,
-                            ExecutionKind::Async,
-                            options.clone(),
-                        )
+                        .wait_for_retry_capacity(&self.target, ExecutionKind::Async, options.clone())
                         .await
                     {
                         return Err(SubmitError::new(reason, original));
@@ -513,9 +493,7 @@ impl AsyncOperationManager {
         let parts: Arc<Mutex<Option<RunnerParts<T, E>>>> = Arc::new(Mutex::new(None));
         let parts_for_job = Arc::clone(&parts);
         let runner = move |scope: OperationScope| {
-            let body = lock(&body_for_job)
-                .take()
-                .expect("accepted async body is present");
+            let body = lock(&body_for_job).take().expect("accepted async body is present");
             let (operation, slot, lease, parent, control) = lock(&parts_for_job)
                 .take()
                 .expect("accepted async runner capsule is present");
@@ -524,20 +502,15 @@ impl AsyncOperationManager {
             async move {
                 let frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
                 operation.set_execution(ExecutionPhase::Running);
-                let manager_core = scope_core
-                    .manager()
-                    .upgrade()
-                    .expect("active scope manager exists");
+                let manager_core = scope_core.manager().upgrade().expect("active scope manager exists");
                 let groups = scope_core.groups().to_vec();
                 let construction = {
-                    let _context =
-                        ExecutionContextGuard::enter(&manager_core, operation_id, &groups);
+                    let _context = ExecutionContextGuard::enter(&manager_core, operation_id, &groups);
                     catch_unwind(AssertUnwindSafe(|| body(scope)))
                 };
                 let result = match construction {
                     Ok(user_future) => {
-                        ExecutionContextFuture::new(user_future, manager_core, operation_id, groups)
-                            .await
+                        ExecutionContextFuture::new(user_future, manager_core, operation_id, groups).await
                     }
                     Err(payload) => Err(payload),
                 };
@@ -580,9 +553,7 @@ impl AsyncOperationManager {
                 Ok(result) => result,
                 Err(error) => {
                     let (reason, _runner) = error.into_parts();
-                    let body = lock(&body_cell)
-                        .take()
-                        .expect("rejected async body is retained");
+                    let body = lock(&body_cell).take().expect("rejected async body is retained");
                     return Err(SubmitError::new(reason, body));
                 }
             };
@@ -614,10 +585,7 @@ impl AsyncOperationManager {
             Arc::clone(&slot),
             Arc::clone(&control) as Arc<dyn StopControl>,
         );
-        let future = runner(OperationScope::new(
-            Arc::clone(&scope),
-            Arc::clone(&self.core),
-        ));
+        let future = runner(OperationScope::new(Arc::clone(&scope), Arc::clone(&self.core)));
         let abandon_scope = Arc::clone(&scope);
         let abandon_operation = Arc::clone(&operation);
         let abandon_slot = Arc::clone(&slot);
@@ -736,10 +704,7 @@ impl AsyncOperationManager {
             .await
             .map_err(crate::v02::report::RunError::Outcome)?;
         let settlement = operation.wait_settlement().await;
-        Ok(crate::v02::report::OperationCompletion {
-            outcome,
-            settlement,
-        })
+        Ok(crate::v02::report::OperationCompletion { outcome, settlement })
     }
 
     /// Submits an async unit-returning body through the test execution port.
