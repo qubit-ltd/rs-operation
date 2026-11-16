@@ -17,6 +17,12 @@
 
 业务结果可用后，框架仍会保留操作记录。provider 报告 `Stopped` 并不能证明 worker 已归还输入。应让每个 `ResourceRef` 一直存活到外部使用者确实停止访问，并独立报告结果与资源释放事实。参见 [provider_read.rs](examples-0.3.0/provider_read.rs)。
 
+### 同步管理器驱动外部工作的容量
+
+`OperationManager::try_submit_external` 会在管理器的 `async_executor` 容量和工作线程上运行适配器驱动器，避免 provider 轮询与子任务在同一同步线程池中形成阻塞闭环。适配器回调（`bind`、`activate`、`request_stop` 和各 poll 方法）应短且非阻塞；回调负责发布事实并唤醒驱动器，provider 工作由独立执行路径完成。普通同步 `try_submit` 任务仍使用同步 worker pool。参见[完整模拟 provider 示例](examples-0.3.0/provider_read.rs)，其中分别演示 stop、typed outcome、输入释放和领域结算。
+
+示例按完整顺序推进：激活时保存管理器提供的 scope 和输入 `ResourceRef`；应用通过 handle 请求停止；模拟 provider 在继续持有输入时发布 `Stopped` summary 和 typed outcome；调用方消费结果并观察到结算仍为 Pending；只有模拟输入使用结束后，provider 才释放自己的引用并发布 `ChildRelease` 与领域报告。管理器最终报告保留该领域报告，随后 demo 关闭管理器。输入只是标记值，因此示例演示的是生命周期所有权，不执行真实 I/O。
+
 ## 2. 结果、停止与结算
 
 `OperationHandle::request_stop` 及异步版本返回 `StopRequestStatus`，不再是 `bool`。对三个状态分别处理：`Accepted` 表示本次请求新发起停止；`AlreadyRequested` 表示停止已登记；`AlreadyFinished` 表示操作已结束。`OperationScope::request_stop` 返回相同枚举。请更新所有穷尽匹配。
@@ -39,6 +45,6 @@
 
 ## 5. 能力边界与示例
 
-本库协调生命周期，不实现 provider 协议、文件或命令适配器、业务重试、补偿或分布式恢复。应用仍须负责共享资源内容的同步，并保证适配器报告的停止和释放事实准确。仓内三个 0.3 示例由 Cargo 作为 library target 编译：provider 停止、资源型结果及租用的临时资源。
+本库协调生命周期，不实现 provider 协议、文件或命令适配器、业务重试、补偿或分布式恢复。应用仍须负责共享资源内容的同步，并保证适配器报告的停止和释放事实准确。完整 provider 生命周期见 [provider_read.rs](examples-0.3.0/provider_read.rs)；[leased_temp.rs](examples-0.3.0/leased_temp.rs) 只是简短的停止/结算辅助片段。两者都使用模拟 provider 边界，不是真实文件或推理适配器。资源型结果示例见 [inference.rs](examples-0.3.0/inference.rs)。Cargo 会把这些示例作为 library target 编译。
 
 源码迁移变化见[0.2 迁移指南](migration-0.2-to-0.3.zh_CN.md)。

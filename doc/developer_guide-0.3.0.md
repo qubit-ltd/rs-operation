@@ -17,6 +17,12 @@ Submit through `OperationManager::try_submit_external` or `AsyncOperationManager
 
 The framework keeps the operation record alive after the business result is available. A provider reporting `Stopped` does not prove that its worker has released input. Keep each `ResourceRef` until the external user has actually stopped accessing it, and report release independently from outcome. See [provider_read.rs](examples-0.3.0/provider_read.rs).
 
+### Synchronous manager capacity for external work
+
+`OperationManager::try_submit_external` runs the adapter driver on the manager's `async_executor` capacity and worker threads. This keeps provider polling and child work from forming a same-pool blocking cycle. Keep adapter callbacks (`bind`, `activate`, `request_stop`, and poll methods) short and non-blocking; use them to publish facts and wake the driver, while the provider does its work independently. Ordinary synchronous `try_submit` jobs continue to use the synchronous worker pool. The guide's [complete simulated provider](examples-0.3.0/provider_read.rs) shows the separation between stop, typed outcome, input release, and domain settlement.
+
+The example walks through the full sequence: activation stores the manager-provided scope and an input `ResourceRef`; the application requests stop through the handle; the simulated provider publishes a `Stopped` summary and typed outcome while retaining the input; the caller consumes that outcome and observes settlement still pending; only after simulated input use ends does the provider drop its reference and publish `ChildRelease` plus a domain report. The manager's final report retains that domain report, after which the demo shuts down the manager. The input is a marker value, so the example demonstrates lifecycle ownership rather than real I/O.
+
 ## 2. Outcome, stop, and settlement
 
 `OperationHandle::request_stop` and its async counterpart return `StopRequestStatus`, not `bool`. Match all three states: `Accepted` means this request newly initiated stopping; `AlreadyRequested` means stopping was already recorded; `AlreadyFinished` means the operation had ended. `OperationScope::request_stop` returns the same enum. Update exhaustive matches accordingly.
@@ -39,6 +45,6 @@ Settlement may report resources requiring recovery. Keep the recovery owner reac
 
 ## 5. Limits and examples
 
-The crate coordinates lifecycles; it does not implement provider protocols, file or command adapters, business retries, compensation, or distributed recovery. Applications remain responsible for synchronizing shared resource contents and for making their adapter's stop/release facts truthful. The included 0.3 examples are library targets compiled by Cargo: provider stop, a resource-valued result, and a leased temporary resource.
+The crate coordinates lifecycles; it does not implement provider protocols, file or command adapters, business retries, compensation, or distributed recovery. Applications remain responsible for synchronizing shared resource contents and for making their adapter's stop/release facts truthful. The complete provider lifecycle is in [provider_read.rs](examples-0.3.0/provider_read.rs); [leased_temp.rs](examples-0.3.0/leased_temp.rs) is only a short stop/settlement helper excerpt. Both examples use a simulated provider boundary, not a real file or inference adapter. The resource-valued result example is in [inference.rs](examples-0.3.0/inference.rs). Cargo compiles these as library targets.
 
 See [Migration from 0.2](migration-0.2-to-0.3.md) for source changes.

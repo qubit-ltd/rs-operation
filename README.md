@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 For real pipelines, each background or asynchronous user must hold its `ResourceRef` until it stops accessing the resource. `scope.manager()` submits children under the current operation, so their results and settlement remain part of the parent lifecycle.
 
-The crate does not detect MIME types, provide file or command adapters, or implement business retries, compensation, and distributed recovery. External adapters implement `PreparedExternalOperation` and report their typed outcome separately from task release; the manager retains resource owners until users return their references. Shared resource access is not exclusive: synchronization belongs to the resource type or application. See the [0.3.0 developer guide](doc/developer_guide-0.3.0.md) for adapter, ownership, capacity, failure, and shutdown details.
+The crate does not detect MIME types, provide file or command adapters, or implement business retries, compensation, and distributed recovery. External adapters implement `PreparedExternalOperation` and report typed outcome separately from task release; the manager retains resource owners until users return their references. For synchronous managers, external adapters use `async_executor` capacity and worker threads, while ordinary synchronous `try_submit` jobs continue to use the synchronous pool. Keep adapter callbacks short and non-blocking. The complete [simulated provider lifecycle](doc/examples-0.3.0/provider_read.rs) demonstrates these responsibilities; [leased_temp.rs](doc/examples-0.3.0/leased_temp.rs) is a helper excerpt. See the [0.3.0 developer guide](doc/developer_guide-0.3.0.md) for adapter, ownership, capacity, failure, and shutdown details.
 
 ## Learn More
 
@@ -61,7 +61,7 @@ The crate does not detect MIME types, provide file or command adapters, or imple
 - Historical 0.1 user guides (describe the incompatible 0.1 API): [English](doc/user_guide.md) · [中文](doc/user_guide.zh_CN.md)
 - [API reference](https://docs.rs/qubit-operation)
 - Runnable 0.2 examples: [file detection](examples/detect_file.rs), [inference](examples/inference.rs), [parent and capacity](examples/family_and_capacity.rs), [submission context](examples/submission_context.rs)
-- 0.3 adapter lifecycle examples: [provider read](doc/examples-0.3.0/provider_read.rs), [resource-valued outcome](doc/examples-0.3.0/inference.rs), [leased temporary resource](doc/examples-0.3.0/leased_temp.rs)
+- 0.3 adapter lifecycle examples: [complete simulated provider lifecycle](doc/examples-0.3.0/provider_read.rs), [resource-valued outcome](doc/examples-0.3.0/inference.rs), [stop/settlement helper excerpt](doc/examples-0.3.0/leased_temp.rs)
 - [中文 README](README.zh_CN.md)
 
 ## Testing

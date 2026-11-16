@@ -6,8 +6,12 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
-//! A worker retains its lease until it has actually stopped using the temp
+//! Stop and settlement helper excerpt for a worker that uses a leased temp
 //! file.
+//!
+//! This file contains no file-system adapter or real lease implementation.
+//! For the complete simulated provider, ownership, outcome, release, domain
+//! settlement, and shutdown lifecycle, see [`provider_read.rs`].
 use std::sync::Arc;
 
 use qubit_operation::OperationControl;
@@ -16,7 +20,7 @@ use qubit_operation::SettlementReport;
 use qubit_operation::StopReason;
 
 /// Ask the worker to stop. Its release poll must remain pending until the temp
-/// is unused.
+/// is unused; this helper does not itself establish release.
 pub fn request_worker_stop(control: &impl OperationControl) {
     control.request_stop(StopReason::UserCancelled);
 }

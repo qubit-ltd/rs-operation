@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 真实集成中，后台或异步使用者必须持有自己的 `ResourceRef`，直到不再访问资源。通过 `scope.manager()` 提交的子操作归属于当前操作，其结果和收尾会纳入父级生命周期。
 
-本库不识别 MIME、不提供文件或命令适配器，也不实现业务重试、补偿或分布式恢复。外部适配器实现 `PreparedExternalOperation`，并分别报告 typed outcome 与任务释放；管理器会在资源使用者归还引用前保留资源所有者。共享资源访问不具备独占性；同步机制由资源类型或应用提供。适配器、所有权、容量、失败处理和关闭细节见[0.3.0 开发者手册](doc/developer_guide-0.3.0.zh_CN.md)。
+本库不识别 MIME、不提供文件或命令适配器，也不实现业务重试、补偿或分布式恢复。外部适配器实现 `PreparedExternalOperation`，并分别报告 typed outcome 与任务释放；管理器会在资源使用者归还引用前保留资源所有者。同步管理器的外部适配器使用 `async_executor` 容量和工作线程，普通同步 `try_submit` 任务仍走同步池。适配器回调应短且非阻塞。[完整模拟 provider 生命周期](doc/examples-0.3.0/provider_read.rs)展示这些责任；[leased_temp.rs](doc/examples-0.3.0/leased_temp.rs)只是辅助片段。适配器、所有权、容量、失败处理和关闭细节见[0.3.0 开发者手册](doc/developer_guide-0.3.0.zh_CN.md)。
 
 ## 延伸阅读
 
@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - 历史版 0.1 用户指南（介绍不兼容的 0.1 API）：[中文](doc/user_guide.zh_CN.md) · [English](doc/user_guide.md)
 - [API 文档](https://docs.rs/qubit-operation)
 - 0.2 可运行示例：[文件检测](examples/detect_file.rs)、[推理](examples/inference.rs)、[父子操作与容量](examples/family_and_capacity.rs)、[提交上下文](examples/submission_context.rs)
-- 0.3 adapter 生命周期示例：[provider 读取](doc/examples-0.3.0/provider_read.rs)、[资源型结果](doc/examples-0.3.0/inference.rs)、[租用临时资源](doc/examples-0.3.0/leased_temp.rs)
+- 0.3 adapter 生命周期示例：[完整模拟 provider 生命周期](doc/examples-0.3.0/provider_read.rs)、[资源型结果](doc/examples-0.3.0/inference.rs)、[停止/结算辅助片段](doc/examples-0.3.0/leased_temp.rs)
 - [English README](README.md)
 
 ## 测试
