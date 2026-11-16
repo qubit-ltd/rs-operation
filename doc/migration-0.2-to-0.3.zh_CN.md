@@ -24,7 +24,11 @@ match handle.request_stop(StopReason::UserCancelled) {
 
 ## 含资源的 outcome
 
-outcome 可以包含 `ResourceRef<T>`。使用 `wait_outcome` 取出唯一结果，完成对返回引用的使用并 drop 它们；如果结算需要等待这些引用归还，之后再等待 settlement。尚未消费的结果中仍持有资源引用时等待结算，可能一直等待调用方自己的引用。Outcome 与 settlement 彼此独立：提前得到业务结果或停止结果，不代表后台工作已归还输入。
+`T` 或 `E` 都可能直接或通过其他对象持有 `ResourceRef<T>`。使用 `wait_outcome` 取出唯一结果，完成对返回引用的使用并 drop 它们；如果结算需要等待这些引用归还，之后再等待 settlement。尚未消费的结果中仍持有资源引用时等待结算，可能一直等待调用方自己的引用。同步和异步 `run_and_settle` 也有相同限制；资源型结果应使用 `submit`/`try_submit`、`wait_outcome`，drop 结果后再调用 `wait_settlement`。普通 owned 值仍可使用 `run_and_settle`。参见[含资源结果示例](examples-0.3.0/inference.rs)。
+
+`SettlementReport` 新增 `external_settlement: Option<Arc<SettlementReport>>`。手写叶报告字面量时设为 `None`；管理器生成的外层报告在适用时填入该字段。外层计数和明细数组仍表示本地 scope，`status` 综合 scope 与领域状态，`all_released()` 同时检查两者。应先检查 status 和 `all_released()`，再从领域报告读取恢复句柄与 effects；外层 `recovery_count` 为零不能排除领域恢复责任。同一资源出现在两层时不要重复清理。
+
+Outcome 与 settlement 彼此独立：提前得到业务结果或停止结果，不代表后台工作已归还输入。
 
 ## 组上限与错误
 

@@ -21,7 +21,9 @@
 
 `OperationHandle::request_stop` 及异步版本返回 `StopRequestStatus`，不再是 `bool`。对三个状态分别处理：`Accepted` 表示本次请求新发起停止；`AlreadyRequested` 表示停止已登记；`AlreadyFinished` 表示操作已结束。`OperationScope::request_stop` 返回相同枚举。请更新所有穷尽匹配。
 
-业务结果和结算仍是两种独立观察。`wait_outcome` 消费唯一 typed 结果；`wait_settlement` 观察资源和子任务报告。如果 `T` 中包含结算正等待释放的 `ResourceRef`，必须先取出并 drop 结果及其派生引用，再等待结算。持有该资源时等待结算可能形成对自身引用的等待。参见 [inference.rs](examples-0.3.0/inference.rs)。
+业务结果和结算仍是两种独立观察。`wait_outcome` 消费唯一 typed 结果；`wait_settlement` 观察资源和子任务报告。如果 `T` 或 `E`（包括二者间接持有的对象）中包含结算正等待归还的 `ResourceRef`，必须先取出并 drop 结果及其派生引用，再等待结算。持有该资源时等待结算可能形成对自身引用的等待。同步和异步 `run_and_settle` 也有相同限制；若返回的 `T` 或 `E` 保留此类引用，可能一直等待。参见[含资源结果示例](examples-0.3.0/inference.rs)。
+
+`SettlementReport` 的计数和明细数组表示管理器本地 scope 的事实。管理器驱动外部任务时，`external_settlement` 保留适配器的领域报告，包括恢复句柄和 effects；外层 `status` 综合两个来源（`RecoveryRequired` 优先于 `Transferred`，再优先于 `Released`），`all_released()` 也检查领域报告。应先检查 status 与 `all_released()`，再读取 `external_settlement` 判断恢复责任。外层 `recovery_count` 为零不表示没有恢复责任；两份报告若记录同一资源，也不应当作两个清理任务。手写 `SettlementReport` 字面量时，叶报告需增加 `external_settlement: None`。
 
 ## 3. Scope 资源与组
 

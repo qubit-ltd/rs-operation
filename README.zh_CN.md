@@ -47,7 +47,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`wait_outcome` 回答业务执行结果，`wait_settlement` 报告资源清理和恢复状态；二者不能互相推断。真实集成中，后台或异步使用者必须持有自己的 `ResourceRef`，直到不再访问资源。通过 `scope.manager()` 提交的子操作归属于当前操作，其结果和收尾会纳入父级生命周期。
+`wait_outcome` 回答业务执行结果，`wait_settlement` 报告资源清理和恢复状态；二者不能互相推断。如果 `T` 或 `E`（包括间接持有的对象）含有结算正等待归还的 `ResourceRef`，应使用分步 handle API：先消费并 drop 结果，再等待结算。`run_and_settle` 仅适用于结果不持有此类引用的情况。结算报告计数表示本地 scope 事实；应检查综合 `status` 和 `all_released()`，再从 `external_settlement` 读取外部恢复句柄与 effects。若两层记录了同一资源，不要安排重复清理。参见[含资源结果示例](doc/examples-0.3.0/inference.rs)和[0.2 到 0.3 迁移指南](doc/migration-0.2-to-0.3.zh_CN.md)中的报告字面量迁移说明。
+
+真实集成中，后台或异步使用者必须持有自己的 `ResourceRef`，直到不再访问资源。通过 `scope.manager()` 提交的子操作归属于当前操作，其结果和收尾会纳入父级生命周期。
 
 本库不识别 MIME、不提供文件或命令适配器，也不实现业务重试、补偿或分布式恢复。外部适配器实现 `PreparedExternalOperation`，并分别报告 typed outcome 与任务释放；管理器会在资源使用者归还引用前保留资源所有者。共享资源访问不具备独占性；同步机制由资源类型或应用提供。适配器、所有权、容量、失败处理和关闭细节见[0.3.0 开发者手册](doc/developer_guide-0.3.0.zh_CN.md)。
 

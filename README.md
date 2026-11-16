@@ -47,7 +47,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`wait_outcome` reports the business result; `wait_settlement` reports cleanup and recovery state. Neither fact implies the other. For real pipelines, each background or asynchronous user must hold its `ResourceRef` until it stops accessing the resource. `scope.manager()` submits children under the current operation, so their results and settlement remain part of the parent lifecycle.
+`wait_outcome` reports the business result; `wait_settlement` reports cleanup and recovery state. Neither fact implies the other. If either `T` or `E` (including an indirectly held object) contains a `ResourceRef` that settlement awaits, use the two-step handle API: consume and drop the result before waiting for settlement. The `run_and_settle` convenience method is for outcomes that do not retain such references. Settlement report counts describe the local scope; check its combined `status` and `all_released()`, then inspect `external_settlement` for external recovery handles and effects. Do not schedule duplicate cleanup for resources recorded at both levels. See the [resource-valued result example](doc/examples-0.3.0/inference.rs) and [0.2 to 0.3 migration guide](doc/migration-0.2-to-0.3.md) for report struct-literal changes.
+
+For real pipelines, each background or asynchronous user must hold its `ResourceRef` until it stops accessing the resource. `scope.manager()` submits children under the current operation, so their results and settlement remain part of the parent lifecycle.
 
 The crate does not detect MIME types, provide file or command adapters, or implement business retries, compensation, and distributed recovery. External adapters implement `PreparedExternalOperation` and report their typed outcome separately from task release; the manager retains resource owners until users return their references. Shared resource access is not exclusive: synchronization belongs to the resource type or application. See the [0.3.0 developer guide](doc/developer_guide-0.3.0.md) for adapter, ownership, capacity, failure, and shutdown details.
 

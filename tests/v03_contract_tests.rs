@@ -6,9 +6,13 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
 
 use qubit_operation::OperationControl;
 use qubit_operation::OperationId;
@@ -165,4 +169,144 @@ fn test_scope_contract_signatures_are_publicly_frozen() {
 fn test_scope_and_resource_reference_restrictions_are_compile_time_contracts() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/ui/v03/*.rs");
+}
+struct ThreadWake(std::thread::Thread);
+impl Wake for ThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+fn is_pending<F: Future>(future: Pin<&mut F>) -> bool {
+    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    future.poll(&mut context).is_pending()
+}
+
+#[test]
+fn test_sync_success_resource_result_is_dropped_before_settlement() {
+    let manager =
+        qubit_operation::OperationManager::new(qubit_operation::ManagerOptions::default()).unwrap();
+    let mut handle = manager
+        .try_submit(Default::default(), |scope| {
+            Ok::<_, ()>(scope.manage(String::from("kept")).unwrap())
+        })
+        .unwrap();
+    let outcome = handle.wait_outcome().unwrap();
+    assert!(matches!(
+        handle
+            .wait_settlement_for(std::time::Duration::ZERO)
+            .unwrap(),
+        qubit_operation::SettlementWait::Pending(_)
+    ));
+    drop(outcome);
+    assert!(handle.wait_settlement().unwrap().all_released());
+}
+
+#[test]
+fn test_sync_error_resource_result_is_dropped_before_settlement() {
+    let manager =
+        qubit_operation::OperationManager::new(qubit_operation::ManagerOptions::default()).unwrap();
+    let mut handle = manager
+        .try_submit(Default::default(), |scope| {
+            Err::<(), _>(scope.manage(String::from("kept")).unwrap())
+        })
+        .unwrap();
+    let outcome = handle.wait_outcome().unwrap();
+    assert!(matches!(
+        handle
+            .wait_settlement_for(std::time::Duration::ZERO)
+            .unwrap(),
+        qubit_operation::SettlementWait::Pending(_)
+    ));
+    drop(outcome);
+    assert!(handle.wait_settlement().unwrap().all_released());
+}
+
+#[test]
+fn test_async_success_resource_result_is_dropped_before_settlement() {
+    let manager =
+        qubit_operation::AsyncOperationManager::new(qubit_operation::ManagerOptions::default())
+            .unwrap();
+    let mut handle = manager
+        .try_submit(Default::default(), |scope| async move {
+            Ok::<_, ()>(scope.manage(String::from("kept")).unwrap())
+        })
+        .unwrap();
+    let outcome = block_on(handle.wait_outcome()).unwrap();
+    let mut settlement = Box::pin(handle.wait_settlement());
+    assert!(is_pending(settlement.as_mut()));
+    drop(outcome);
+    assert!(block_on(settlement).all_released());
+}
+
+#[test]
+fn test_async_error_resource_result_is_dropped_before_settlement() {
+    let manager =
+        qubit_operation::AsyncOperationManager::new(qubit_operation::ManagerOptions::default())
+            .unwrap();
+    let mut handle = manager
+        .try_submit(Default::default(), |scope| async move {
+            Err::<(), _>(scope.manage(String::from("kept")).unwrap())
+        })
+        .unwrap();
+    let outcome = block_on(handle.wait_outcome()).unwrap();
+    let mut settlement = Box::pin(handle.wait_settlement());
+    assert!(is_pending(settlement.as_mut()));
+    drop(outcome);
+    assert!(block_on(settlement).all_released());
+}
+
+#[test]
+fn test_run_and_settle_remains_suitable_for_owned_values() {
+    let sync =
+        qubit_operation::OperationManager::new(qubit_operation::ManagerOptions::default()).unwrap();
+    assert!(matches!(
+        sync.run_and_settle(Default::default(), |_| Ok::<_, String>(42usize))
+            .unwrap()
+            .outcome,
+        qubit_operation::OperationOutcome::Succeeded(42)
+    ));
+    assert!(matches!(
+        sync.run_and_settle(Default::default(), |_| Err::<usize, _>(String::from(
+            "failed"
+        )))
+        .unwrap()
+        .outcome,
+        qubit_operation::OperationOutcome::Failed(_)
+    ));
+    let asynchronous =
+        qubit_operation::AsyncOperationManager::new(qubit_operation::ManagerOptions::default())
+            .unwrap();
+    assert!(matches!(
+        block_on(
+            asynchronous.run_and_settle(Default::default(), |_| async { Ok::<_, String>(42usize) })
+        )
+        .unwrap()
+        .outcome,
+        qubit_operation::OperationOutcome::Succeeded(42)
+    ));
+    assert!(matches!(
+        block_on(asynchronous.run_and_settle(Default::default(), |_| async {
+            Err::<usize, _>(String::from("failed"))
+        }))
+        .unwrap()
+        .outcome,
+        qubit_operation::OperationOutcome::Failed(_)
+    ));
 }

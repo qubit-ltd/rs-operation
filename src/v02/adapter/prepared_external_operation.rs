@@ -22,6 +22,11 @@ use crate::v02::scope::OperationScope;
 /// A prepared external task that the manager can bind and drive.
 ///
 /// Implementations must keep binding one-shot across manager instances.
+/// The typed outcome is delivered once. Its identity and outcome kind must
+/// agree with the summary exposed by [`OperationControl`], while diagnostic
+/// text may carry arbitrary domain information. Every `Pending` poll must
+/// register the supplied waker. Typed outcome delivery, input release, and
+/// settlement are independent; none implies another.
 ///
 /// # Type Parameters
 ///

@@ -21,6 +21,12 @@ use super::super::report::StopReason;
 /// Operation managers provide this port to child adapters. It exposes outcome,
 /// release, and settlement as separate facts rather than retaining or returning
 /// a typed result.
+/// The outcome summary must describe the same operation identity and outcome
+/// kind as the typed result from `PreparedExternalOperation`; its diagnostic
+/// text may contain domain-specific information and is not part of that
+/// consistency check. A `Pending` poll must register the supplied waker.
+/// Outcome, input release, and settlement are independent facts: publishing
+/// one does not imply either of the others.
 ///
 /// # Examples
 ///

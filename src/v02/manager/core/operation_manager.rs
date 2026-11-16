@@ -837,6 +837,17 @@ impl OperationManager {
     ///
     /// The outcome and settlement report after both are observable.
     ///
+    /// # Resource-valued outcomes
+    ///
+    /// The returned outcome's `T` or `E`, including objects indirectly held
+    /// by either value, must not retain a `ResourceRef` whose release this
+    /// operation's settlement waits for. Otherwise this method waits for the
+    /// outcome and settlement in sequence while retaining the outcome, and
+    /// can wait indefinitely on its own result. The manager cannot detect
+    /// such references in arbitrary values. For resource-valued outcomes,
+    /// use [`submit`](Self::submit), consume and drop the outcome and any
+    /// derived references, then call `wait_settlement`.
+    ///
     /// # Errors
     ///
     /// Returns submission, outcome-observation, or settlement-observation

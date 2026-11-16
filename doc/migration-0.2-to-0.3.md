@@ -24,7 +24,11 @@ Update exhaustive matches to handle all three variants. If the caller only needs
 
 ## Resource-valued outcomes
 
-An outcome may contain a `ResourceRef<T>`. Take the unique result with `wait_outcome`, finish using and drop the returned references, and only then wait for settlement if settlement depends on those references being returned. Waiting for settlement while retaining a reference contained in the not-yet-consumed result can wait indefinitely on the caller's own reference. Outcome and settlement remain separate: an early business result or stop does not mean background work has released its inputs.
+Either `T` or `E` may contain a `ResourceRef<T>`, directly or through another object. Take the unique result with `wait_outcome`, finish using and drop the returned references, and only then wait for settlement if settlement depends on those references being returned. Waiting for settlement while retaining a reference contained in the not-yet-consumed result can wait indefinitely on the caller's own reference. The same restriction applies to sync and async `run_and_settle`; use `submit`/`try_submit`, `wait_outcome`, drop the result, then `wait_settlement` for resource-valued results. Owned values remain suitable for `run_and_settle`. See the [resource-valued result example](examples-0.3.0/inference.rs).
+
+`SettlementReport` adds `external_settlement: Option<Arc<SettlementReport>>`. Set it to `None` in hand-written leaf report literals; manager-generated outer reports populate it when applicable. Outer counts and detail arrays remain local-scope counts, while `status` combines scope and domain status and `all_released()` checks both. Check status and `all_released()` before reading the domain report for recovery handles and effects; a zero outer `recovery_count` does not rule out domain recovery. Do not clean the same resource twice because it appears in both layers.
+
+Outcome and settlement remain separate: an early business result or stop does not mean background work has released its inputs.
 
 ## Group limits and errors
 
