@@ -134,6 +134,8 @@ mod tests {
             resources: Arc::from([ResourceId::new(crate::v02::report::ManagerId::from_raw(1), 2, 3)]),
             attempts,
             last_failures: Arc::from([]),
+            failures_total: 0,
+            failures_truncated: false,
         }
     }
 

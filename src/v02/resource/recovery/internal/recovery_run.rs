@@ -83,6 +83,8 @@ impl RecoveryRun {
         let mut released_payload = None;
         let mut released_action = None;
         let mut old_failures = Vec::new();
+        let mut evicted_failure = None;
+        let resolved;
         {
             let mut state = lock(&self.core.state);
             if state.phase != RecoveryPhase::Running || state.generation != self.generation {
@@ -93,14 +95,17 @@ impl RecoveryRun {
                 Ok(()) => {
                     state.phase = RecoveryPhase::Resolved;
                     old_failures = std::mem::take(&mut state.failures);
+                    state.failures_total = 0;
+                    state.failures_truncated = false;
                     released_action = state.action.take();
                     released_payload = state.payload.take();
                 }
                 Err(failure) => {
                     state.phase = RecoveryPhase::Pending;
-                    state.failures.push(failure);
+                    evicted_failure = state.append_failure(failure);
                 }
             }
+            resolved = state.phase == RecoveryPhase::Resolved;
         }
         self.completed = true;
         self.payload.take();
@@ -108,7 +113,8 @@ impl RecoveryRun {
         drop(released_payload);
         drop(released_action);
         drop(old_failures);
-        if self.core.snapshot().phase == RecoveryPhase::Resolved {
+        drop(evicted_failure);
+        if resolved {
             self.core.notify_terminal(false);
         }
     }

@@ -40,6 +40,10 @@ pub struct RecoverySnapshot {
     pub resources: Arc<[ResourceId]>,
     /// Number of cleanup attempts started for this record.
     pub attempts: usize,
+    /// Total failures since the last confirmed cleanup, saturating at `usize::MAX`.
+    pub failures_total: usize,
+    /// Whether `last_failures` omits older failures.
+    pub failures_truncated: bool,
     /// Failures accumulated from unsuccessful attempts while cleanup is
     /// unresolved.
     pub last_failures: Arc<[CleanupFailure]>,
