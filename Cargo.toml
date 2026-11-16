@@ -1,6 +1,6 @@
 [package]
 name = "qubit-operation"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.94"
 authors = ["Haixing Hu <starfish.hu@gmail.com>"]
@@ -80,6 +80,21 @@ crate-type = ["lib"]
 [[example]]
 name = "guide_submission_context"
 path = "doc/examples-0.2.0/submission_context.rs"
+crate-type = ["lib"]
+
+[[example]]
+name = "guide_provider_read"
+path = "doc/examples-0.3.0/provider_read.rs"
+crate-type = ["lib"]
+
+[[example]]
+name = "guide_inference_0_3"
+path = "doc/examples-0.3.0/inference.rs"
+crate-type = ["lib"]
+
+[[example]]
+name = "guide_leased_temp"
+path = "doc/examples-0.3.0/leased_temp.rs"
 crate-type = ["lib"]
 
 [features]

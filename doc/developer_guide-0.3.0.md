@@ -1,0 +1,42 @@
+# rs-operation 0.3.0 Developer Guide
+
+[中文开发者手册](developer_guide-0.3.0.zh_CN.md) · [README](../README.md) · [Migration from 0.2](migration-0.2-to-0.3.md)
+
+This guide describes the 0.3 API for coordinating managed operations with application-owned executors and providers. The manager owns admission, operation scope, stop propagation, outcome delivery, and settlement. Your adapter owns the actual external task and must report when it has stopped using its inputs.
+
+## 1. External operation adapter
+
+Implement `PreparedExternalOperation<T, E>` for a prepared task. `T` and `E` must be `Send + 'static`; the adapter type must be `Sized`, `OperationControl + 'static`. The trait has four lifecycle methods:
+
+- `bind(&self, id)` claims this prepared operation exactly once. Return `ExternalBindError::AlreadyBound` if another submission claimed it. A `Failed(ExecutionFailure)` is an accepted operation whose adapter setup failed.
+- `activate(self: Arc<Self>, scope)` starts external work with its manager-owned `OperationScope`.
+- `poll_take_outcome` transfers the unique typed `OperationOutcome<T, E>` to the manager when ready. It must not clone or publish the result twice.
+- `abandon(self: Arc<Self>)` releases a binding that was claimed but never activated.
+
+Submit through `OperationManager::try_submit_external` or `AsyncOperationManager::try_submit_external`. Both return a normal typed handle on admission, or `SubmitError<Arc<P>>` with the original prepared adapter on rejection. `AdmissionError::AlreadyBound` is a new exhaustive-match case: handle it explicitly wherever you match admission errors.
+
+The framework keeps the operation record alive after the business result is available. A provider reporting `Stopped` does not prove that its worker has released input. Keep each `ResourceRef` until the external user has actually stopped accessing it, and report release independently from outcome. See [provider_read.rs](examples-0.3.0/provider_read.rs).
+
+## 2. Outcome, stop, and settlement
+
+`OperationHandle::request_stop` and its async counterpart return `StopRequestStatus`, not `bool`. Match all three states: `Accepted` means this request newly initiated stopping; `AlreadyRequested` means stopping was already recorded; `AlreadyFinished` means the operation had ended. `OperationScope::request_stop` returns the same enum. Update exhaustive matches accordingly.
+
+Outcome and settlement remain separate observations. `wait_outcome` consumes the unique typed result. `wait_settlement` observes the resource and child-work report. If `T` contains a `ResourceRef` that settlement is waiting to release, first take and drop that result (and any references derived from it), then wait for settlement. Waiting for settlement while holding the returned resource can wait on your own reference. See [inference.rs](examples-0.3.0/inference.rs).
+
+## 3. Scope resources and groups
+
+Use `OperationScope::reserve_resource` when capacity and cleanup responsibility must be secured before creating a resource. A failed reservation does not create the resource. Commit it only after creation succeeds, and retain the returned `ResourceRef` for every user. Service resource scopes and ordinary operation scopes share the manager's bounded cleanup and capacity rules.
+
+`OperationManager::with_group` creates a manager view constrained by a service group while retaining its root or parent target. Distinct groups bound to one operation are limited by `ManagerOptions::max_groups_per_operation`, which defaults to 16. Configure the limit explicitly when the application has a different known topology. Exceeding it returns `GroupBindingError::CapacityExceeded`; other variants identify wrong manager, closed group, or ended parent scope. Duplicate binding of the same group does not consume another slot.
+
+## 4. Effects, recovery, and shutdown
+
+`OperationScope::record_effect` records an application-reported fact; it does not prove rollback, cleanup, or remote release. The inherited effect budget is bounded. When full, recording returns `EffectRecordError`, preserves existing records, and increases the report's overflow count. Stop and completion also reject later effect records.
+
+Settlement may report resources requiring recovery. Keep the recovery owner reachable and follow the report; a diagnostic capacity limit can truncate summaries but does not discard the resource owner held by the recovery store. Manager shutdown can remain pending while external workers retain resources or cleanup/recovery remains outstanding. Preserve the shutdown handle and observe it again when the worker or recovery path makes progress.
+
+## 5. Limits and examples
+
+The crate coordinates lifecycles; it does not implement provider protocols, file or command adapters, business retries, compensation, or distributed recovery. Applications remain responsible for synchronizing shared resource contents and for making their adapter's stop/release facts truthful. The included 0.3 examples are library targets compiled by Cargo: provider stop, a resource-valued result, and a leased temporary resource.
+
+See [Migration from 0.2](migration-0.2-to-0.3.md) for source changes.

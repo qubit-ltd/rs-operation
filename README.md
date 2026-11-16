@@ -13,14 +13,14 @@
 
 A service can register uploaded bytes with an operation scope, inspect a PDF signature, then observe the business result separately from resource settlement. The application still owns file staging, MIME policy, external commands, and recovery decisions.
 
-Until `qubit-operation` 0.2 is published, point your application at the local `rs-operation` checkout. Replace the placeholder with its actual path:
+Add `qubit-operation` 0.3 to the application:
 
 ```toml
 [dependencies]
-qubit-operation = { path = "<path-to-rs-operation>", version = "^0.2" }
+qubit-operation = "^0.3"
 ```
 
-After the crate is published, you can use `qubit-operation = "^0.2"` from crates.io. Its own dependencies are declared in the local crate manifest.
+The crate declares its own dependencies in its manifest.
 
 This small runnable path checks a memory buffer. Save it as `src/main.rs` and run `cargo run`:
 
@@ -49,16 +49,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 `wait_outcome` reports the business result; `wait_settlement` reports cleanup and recovery state. Neither fact implies the other. For real pipelines, each background or asynchronous user must hold its `ResourceRef` until it stops accessing the resource. `scope.manager()` submits children under the current operation, so their results and settlement remain part of the parent lifecycle.
 
-The crate does not detect MIME types, provide file or command adapters, or implement business retries, compensation, and distributed recovery. Shared resource access is not exclusive: synchronization belongs to the resource type or application. See the developer guide for ownership, capacity, failure, and shutdown details.
+The crate does not detect MIME types, provide file or command adapters, or implement business retries, compensation, and distributed recovery. External adapters implement `PreparedExternalOperation` and report their typed outcome separately from task release; the manager retains resource owners until users return their references. Shared resource access is not exclusive: synchronization belongs to the resource type or application. See the [0.3.0 developer guide](doc/developer_guide-0.3.0.md) for adapter, ownership, capacity, failure, and shutdown details.
 
 ## Learn More
 
-- [0.2.0 Developer Guide](doc/developer_guide-0.2.0.md) · [中文开发者手册](doc/developer_guide-0.2.0.zh_CN.md) · [0.2 API 设计](doc/design-0.2.0.zh_CN.md)
-- Migration: [0.1 to 0.2 (English)](doc/migration-0.1-to-0.2.md) · [中文迁移指南](doc/migration-0.1-to-0.2.zh_CN.md)
+- [0.3.0 Developer Guide](doc/developer_guide-0.3.0.md) · [中文开发者手册](doc/developer_guide-0.3.0.zh_CN.md) · [0.2 API 设计](doc/design-0.2.0.zh_CN.md)
+- Migration: [0.2 to 0.3 (English)](doc/migration-0.2-to-0.3.md) · [中文迁移指南](doc/migration-0.2-to-0.3.zh_CN.md)
 - [0.2 adapter integration guide (Chinese)](doc/adapter-guide.zh_CN.md)
 - Historical 0.1 user guides (describe the incompatible 0.1 API): [English](doc/user_guide.md) · [中文](doc/user_guide.zh_CN.md)
 - [API reference](https://docs.rs/qubit-operation)
 - Runnable 0.2 examples: [file detection](examples/detect_file.rs), [inference](examples/inference.rs), [parent and capacity](examples/family_and_capacity.rs), [submission context](examples/submission_context.rs)
+- 0.3 adapter lifecycle examples: [provider read](doc/examples-0.3.0/provider_read.rs), [resource-valued outcome](doc/examples-0.3.0/inference.rs), [leased temporary resource](doc/examples-0.3.0/leased_temp.rs)
 - [中文 README](README.zh_CN.md)
 
 ## Testing
