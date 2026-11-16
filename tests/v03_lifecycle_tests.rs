@@ -212,7 +212,7 @@ impl PreparedExternalOperation<usize, ()> for External {
 }
 
 #[test]
-fn stopped_early_outcome_waits_for_input_release_and_domain_settlement() {
+fn test_stopped_early_outcome_waits_for_input_release_and_domain_settlement() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let external = External::held();
     let owner_drops = Arc::new(AtomicUsize::new(0));
@@ -284,7 +284,7 @@ fn stopped_early_outcome_waits_for_input_release_and_domain_settlement() {
 }
 
 #[test]
-fn queue_capacity_does_not_block_stop_for_an_accepted_external_operation() {
+fn test_queue_capacity_does_not_block_stop_for_an_accepted_external_operation() {
     use std::sync::mpsc;
     let mut options = ManagerOptions::default();
     options.sync_executor = ThreadPoolExecutorOptions {
@@ -393,7 +393,7 @@ impl PreparedExternalOperation<ResourceRef<DropProbe>, ()> for ResourceExternal 
 }
 
 #[test]
-fn resource_valued_typed_outcome_must_be_dropped_before_settlement() {
+fn test_resource_valued_typed_outcome_must_be_dropped_before_settlement() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let control = External::held();
     let (polled_tx, polled_rx) = std::sync::mpsc::channel();
@@ -448,7 +448,7 @@ impl AsyncCleanup<DropProbe> for FailingTempCleanup {
 }
 
 #[test]
-fn failed_temp_cleanup_leaves_an_owner_in_the_recovery_store() {
+fn test_failed_temp_cleanup_leaves_an_owner_in_the_recovery_store() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let id_slot = Arc::new(Mutex::new(None));
     let id_for_body = Arc::clone(&id_slot);
@@ -482,7 +482,7 @@ fn failed_temp_cleanup_leaves_an_owner_in_the_recovery_store() {
 }
 
 #[test]
-fn shutdown_timeout_keeps_external_owner_observable_until_release() {
+fn test_shutdown_timeout_keeps_external_owner_observable_until_release() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let external = External::held();
     let mut handle = manager

@@ -48,7 +48,7 @@ impl PreparedExternalOperation<(), ()> for Adapter {
 }
 
 #[test]
-fn public_contract_symbols_are_importable_from_crate_root() {
+fn test_public_contract_symbols_are_importable_from_crate_root() {
     fn assert_sized<T: PreparedExternalOperation<(), ()>>() {}
     assert_sized::<Adapter>();
 }
@@ -90,7 +90,7 @@ impl PreparedExternalOperation<NoCloneNoDebug, NoCloneNoDebug> for AdapterTyped 
 }
 
 #[test]
-fn external_trait_is_object_safe_and_keeps_result_types_unconstrained() {
+fn test_external_trait_is_object_safe_and_keeps_result_types_unconstrained() {
     fn takes_object(_: &dyn PreparedExternalOperation<NoCloneNoDebug, NoCloneNoDebug>) {}
     takes_object(&AdapterTyped);
     #[allow(dead_code)]
@@ -132,7 +132,7 @@ fn external_trait_is_object_safe_and_keeps_result_types_unconstrained() {
 }
 
 #[test]
-fn manager_group_limit_has_the_frozen_default() {
+fn test_manager_group_limit_has_the_frozen_default() {
     assert_eq!(
         qubit_operation::ManagerOptions::default().max_groups_per_operation,
         16
@@ -140,7 +140,7 @@ fn manager_group_limit_has_the_frozen_default() {
 }
 
 #[test]
-fn adapter_error_and_already_bound_admission_are_public() {
+fn test_adapter_error_and_already_bound_admission_are_public() {
     let _: Option<qubit_operation::ExternalBindError> = None;
     assert_eq!(
         qubit_operation::AdmissionError::AlreadyBound,
@@ -149,7 +149,7 @@ fn adapter_error_and_already_bound_admission_are_public() {
 }
 
 #[test]
-fn scope_contract_signatures_are_publicly_frozen() {
+fn test_scope_contract_signatures_are_publicly_frozen() {
     fn scope_methods(
         scope: &OperationScope,
         record: qubit_operation::EffectRecord,
@@ -175,7 +175,7 @@ fn scope_contract_signatures_are_publicly_frozen() {
 }
 
 #[test]
-fn scope_and_resource_reference_restrictions_are_compile_time_contracts() {
+fn test_scope_and_resource_reference_restrictions_are_compile_time_contracts() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/ui/v03/*.rs");
 }

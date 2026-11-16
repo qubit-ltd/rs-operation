@@ -286,7 +286,7 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
 }
 
 #[test]
-fn accepted_external_task_is_bound_activated_and_delivers_its_unique_outcome() {
+fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcome() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Arc::new(Prepared {
         activated: std::sync::atomic::AtomicUsize::new(0),
@@ -395,7 +395,7 @@ fn accepted_external_task_is_bound_activated_and_delivers_its_unique_outcome() {
 }
 
 #[test]
-fn post_claim_bind_failure_is_accepted_and_abandoned_once() {
+fn test_post_claim_bind_failure_is_accepted_and_abandoned_once() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Arc::new(Prepared {
         activated: std::sync::atomic::AtomicUsize::new(0),
@@ -443,7 +443,7 @@ fn post_claim_bind_failure_is_accepted_and_abandoned_once() {
 }
 
 #[test]
-fn stop_during_bind_wins_before_commit_and_abandons_without_activation() {
+fn test_stop_during_bind_wins_before_commit_and_abandons_without_activation() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let proceed = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -508,7 +508,7 @@ fn stop_during_bind_wins_before_commit_and_abandons_without_activation() {
 }
 
 #[test]
-fn parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
+fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let (child_manager_tx, child_manager_rx) = std::sync::mpsc::channel();
     let (close_parent_tx, close_parent_rx) = std::sync::mpsc::channel();
@@ -587,7 +587,7 @@ fn parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
 }
 
 #[test]
-fn already_bound_claim_rolls_back_provisional_parent_child_link() {
+fn test_already_bound_claim_rolls_back_provisional_parent_child_link() {
     let first_manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let second_manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Arc::new(Prepared {
@@ -646,7 +646,7 @@ fn already_bound_claim_rolls_back_provisional_parent_child_link() {
 }
 
 #[test]
-fn dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
+fn test_dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Arc::new(Prepared {
         activated: std::sync::atomic::AtomicUsize::new(0),
@@ -691,7 +691,7 @@ fn dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
 }
 
 #[test]
-fn callback_panics_are_captured_and_activation_panic_is_not_abandoned() {
+fn test_callback_panics_are_captured_and_activation_panic_is_not_abandoned() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let snapshot_panics = Prepared::ready_fixture();
     snapshot_panics
@@ -770,7 +770,7 @@ fn callback_panics_are_captured_and_activation_panic_is_not_abandoned() {
 }
 
 #[test]
-fn request_stop_and_outcome_poll_panics_are_captured() {
+fn test_request_stop_and_outcome_poll_panics_are_captured() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let stop_panics = Prepared::ready_fixture();
     stop_panics
@@ -806,7 +806,7 @@ fn request_stop_and_outcome_poll_panics_are_captured() {
 }
 
 #[test]
-fn release_and_settlement_poll_panics_keep_scope_pending_without_fabricating_facts() {
+fn test_release_and_settlement_poll_panics_keep_scope_pending_without_fabricating_facts() {
     for panic_bit in [4, 8] {
         let manager = OperationManager::new(ManagerOptions {
             sync_executor: ThreadPoolExecutorOptions {
@@ -853,7 +853,7 @@ fn release_and_settlement_poll_panics_keep_scope_pending_without_fabricating_fac
 }
 
 #[test]
-fn typed_result_waits_for_matching_summary_when_facts_arrive_out_of_order() {
+fn test_typed_result_waits_for_matching_summary_when_facts_arrive_out_of_order() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Prepared::ready_fixture();
     prepared
@@ -890,7 +890,7 @@ fn typed_result_waits_for_matching_summary_when_facts_arrive_out_of_order() {
 }
 
 #[test]
-fn external_frame_ends_at_typed_outcome_while_release_is_still_pending() {
+fn test_external_frame_ends_at_typed_outcome_while_release_is_still_pending() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Prepared::ready_fixture();
     prepared
@@ -939,7 +939,7 @@ fn external_frame_ends_at_typed_outcome_while_release_is_still_pending() {
 }
 
 #[test]
-fn typed_outcome_precedes_settlement_and_ready_settlement_is_not_repolled() {
+fn test_typed_outcome_precedes_settlement_and_ready_settlement_is_not_repolled() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Prepared::ready_fixture();
     prepared
@@ -983,7 +983,7 @@ fn typed_outcome_precedes_settlement_and_ready_settlement_is_not_repolled() {
 }
 
 #[test]
-fn concurrent_managers_claim_one_shared_arc_once() {
+fn test_concurrent_managers_claim_one_shared_arc_once() {
     let first_manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let second_manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -1045,7 +1045,7 @@ fn concurrent_managers_claim_one_shared_arc_once() {
 }
 
 #[test]
-fn full_manager_rejects_before_calling_bind() {
+fn test_full_manager_rejects_before_calling_bind() {
     let manager = OperationManager::new(ManagerOptions {
         limits: ManagerLimits {
             active_operations: 1,
@@ -1105,7 +1105,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 #[test]
-fn async_manager_drives_external_activation_on_portable_executor() {
+fn test_async_manager_drives_external_activation_on_portable_executor() {
     let manager = AsyncOperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Arc::new(Prepared {
         activated: std::sync::atomic::AtomicUsize::new(0),

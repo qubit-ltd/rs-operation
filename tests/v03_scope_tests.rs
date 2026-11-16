@@ -11,7 +11,7 @@ use qubit_operation::{
 };
 
 #[test]
-fn with_group_returns_same_constraint_view_and_deduplicates() {
+fn test_with_group_returns_same_constraint_view_and_deduplicates() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
     let bound = manager.with_group(&group).unwrap();
@@ -28,7 +28,7 @@ fn with_group_returns_same_constraint_view_and_deduplicates() {
 }
 
 #[test]
-fn distinct_groups_both_track_a_bound_operation() {
+fn test_distinct_groups_both_track_a_bound_operation() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let first = manager.group(GroupOptions { capacity: 2 }).unwrap();
     let second = manager.group(GroupOptions { capacity: 2 }).unwrap();
@@ -47,7 +47,7 @@ fn distinct_groups_both_track_a_bound_operation() {
 }
 
 #[test]
-fn group_binding_limit_uses_manager_configuration() {
+fn test_group_binding_limit_uses_manager_configuration() {
     let mut options = ManagerOptions::default();
     options.max_groups_per_operation = 1;
     let manager = OperationManager::new(options).unwrap();
@@ -61,7 +61,7 @@ fn group_binding_limit_uses_manager_configuration() {
 }
 
 #[test]
-fn zero_group_binding_limit_is_rejected() {
+fn test_zero_group_binding_limit_is_rejected() {
     let mut options = ManagerOptions::default();
     options.max_groups_per_operation = 0;
     assert!(matches!(
@@ -73,7 +73,7 @@ fn zero_group_binding_limit_is_rejected() {
 }
 
 #[test]
-fn closing_any_bound_group_rejects_new_submission() {
+fn test_closing_any_bound_group_rejects_new_submission() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let first = manager.group(GroupOptions { capacity: 2 }).unwrap();
     let second = manager.group(GroupOptions { capacity: 2 }).unwrap();
@@ -90,7 +90,7 @@ fn closing_any_bound_group_rejects_new_submission() {
 }
 
 #[test]
-fn parent_bound_view_inherits_and_adds_group_constraints() {
+fn test_parent_bound_view_inherits_and_adds_group_constraints() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let first = manager.group(GroupOptions { capacity: 4 }).unwrap();
     let second = manager.group(GroupOptions { capacity: 4 }).unwrap();
@@ -116,7 +116,7 @@ fn parent_bound_view_inherits_and_adds_group_constraints() {
 }
 
 #[test]
-fn default_group_limit_accepts_sixteen_and_deduplicates_before_rejecting_seventeen() {
+fn test_default_group_limit_accepts_sixteen_and_deduplicates_before_rejecting_seventeen() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let groups: Vec<_> = (0..17)
         .map(|_| manager.group(GroupOptions { capacity: 2 }).unwrap())
@@ -132,7 +132,7 @@ fn default_group_limit_accepts_sixteen_and_deduplicates_before_rejecting_sevente
 }
 
 #[test]
-fn every_bound_group_capacity_participates_in_admission() {
+fn test_every_bound_group_capacity_participates_in_admission() {
     use std::sync::mpsc;
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let first = manager.group(GroupOptions { capacity: 1 }).unwrap();
@@ -162,7 +162,7 @@ fn every_bound_group_capacity_participates_in_admission() {
 }
 
 #[test]
-fn closing_any_group_stops_an_already_admitted_operation() {
+fn test_closing_any_group_stops_an_already_admitted_operation() {
     use qubit_operation::{OperationOutcome, ShutdownMode};
     use std::sync::mpsc;
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
@@ -193,7 +193,7 @@ fn closing_any_group_stops_an_already_admitted_operation() {
 }
 
 #[test]
-fn effect_records_obey_inherited_quota_and_report_overflow() {
+fn test_effect_records_obey_inherited_quota_and_report_overflow() {
     use qubit_operation::{DiagnosticSummary, EffectFact, EffectRecord, EffectRecordError};
     let mut options = ManagerOptions::default();
     options.scope_limits.effect_records = 1;
@@ -222,7 +222,7 @@ fn effect_records_obey_inherited_quota_and_report_overflow() {
 }
 
 #[test]
-fn stopped_scope_rejects_effects_and_stop_status_distinguishes_finished() {
+fn test_stopped_scope_rejects_effects_and_stop_status_distinguishes_finished() {
     use qubit_operation::{
         DiagnosticSummary, EffectFact, EffectRecord, EffectRecordError, StopReason,
         StopRequestStatus,
@@ -268,7 +268,7 @@ fn stopped_scope_rejects_effects_and_stop_status_distinguishes_finished() {
 }
 
 #[test]
-fn parent_stop_reaches_operation_submitted_through_additional_group_view() {
+fn test_parent_stop_reaches_operation_submitted_through_additional_group_view() {
     use qubit_operation::{OperationOutcome, StopReason, StopRequestStatus};
     use std::sync::mpsc;
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
@@ -309,7 +309,7 @@ fn parent_stop_reaches_operation_submitted_through_additional_group_view() {
 }
 
 #[test]
-fn service_scope_registered_with_every_inherited_group() {
+fn test_service_scope_registered_with_every_inherited_group() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let first = manager.group(GroupOptions { capacity: 3 }).unwrap();
     let second = manager.group(GroupOptions { capacity: 3 }).unwrap();
@@ -329,7 +329,7 @@ fn service_scope_registered_with_every_inherited_group() {
 }
 
 #[test]
-fn execution_context_detects_every_bound_group_for_deadlock_checks() {
+fn test_execution_context_detects_every_bound_group_for_deadlock_checks() {
     use qubit_operation::ObservationError;
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let first = manager.group(GroupOptions { capacity: 2 }).unwrap();
@@ -355,7 +355,7 @@ fn execution_context_detects_every_bound_group_for_deadlock_checks() {
 }
 
 #[test]
-fn resource_scope_reservations_commit_values_and_preserve_unreserved_owner() {
+fn test_resource_scope_reservations_commit_values_and_preserve_unreserved_owner() {
     use qubit_operation::{
         AsyncCleanup, CleanupContext, CleanupFuture, CleanupOutcome, OperationOptions,
         ResourceScopeOptions,
@@ -420,7 +420,7 @@ fn resource_scope_reservations_commit_values_and_preserve_unreserved_owner() {
 }
 
 #[test]
-fn group_binding_rejects_another_manager_and_does_not_mutate_original_view() {
+fn test_group_binding_rejects_another_manager_and_does_not_mutate_original_view() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let other_manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let group = manager.group(GroupOptions { capacity: 2 }).unwrap();
@@ -438,7 +438,7 @@ fn group_binding_rejects_another_manager_and_does_not_mutate_original_view() {
 }
 
 #[test]
-fn inherited_parent_group_counts_toward_group_binding_limit() {
+fn test_inherited_parent_group_counts_toward_group_binding_limit() {
     let mut options = ManagerOptions::default();
     options.max_groups_per_operation = 1;
     let manager = OperationManager::new(options).unwrap();
