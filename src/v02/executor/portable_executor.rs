@@ -22,6 +22,7 @@ use super::PollSlot;
 use super::PortableInner;
 use super::PortablePermit;
 use super::PortableState;
+use super::PortableTask;
 use super::lock;
 use super::notify_capacity;
 use crate::v02::report::PortableExecutorOptions;
@@ -30,7 +31,9 @@ use crate::v02::report::PortableExecutorOptions;
 ///
 /// The owner of this executor calls `poll_once` from its own scheduling loop;
 /// no hidden thread is created. A task is only polled again after its waker is
-/// invoked. Reservations account for queued and currently-polled tasks.
+/// invoked. Submitted tasks remain owned until they complete; dropping a waker
+/// does not cancel a pending task. Reservations account for queued and
+/// currently-polled tasks.
 #[derive(Clone)]
 pub(crate) struct PortableExecutor {
     /// Shared queue and polling state held across executor clones.
@@ -61,6 +64,7 @@ impl PortableExecutor {
                 state: Mutex::new(PortableState {
                     accepting: true,
                     tasks: 0,
+                    active: Vec::new(),
                     ready: VecDeque::new(),
                 }),
                 ready_available: Condvar::new(),
@@ -210,16 +214,10 @@ impl PortableExecutor {
                 poll
             };
             if poll.is_ready() {
+                let mut completion = CompletionGuard::new(&self.inner, &task);
                 let future = lock(&task.future).take();
                 drop(future);
-                if let Some(inner) = task.executor.upgrade() {
-                    let mut state = lock(&inner.state);
-                    state.ready.retain(|queued| !Arc::ptr_eq(queued, &task));
-                    state.tasks -= 1;
-                    drop(state);
-                    inner.ready_available.notify_all();
-                    notify_capacity(&inner.capacity_callback);
-                }
+                completion.finish();
             }
             return true;
         }
@@ -243,5 +241,62 @@ impl PortableExecutor {
     /// * `callback` is invoked after a task releases its reserved capacity.
     pub(crate) fn set_capacity_callback(&self, callback: Arc<dyn Fn() + Send + Sync + 'static>) {
         *lock(&self.inner.capacity_callback) = Some(callback);
+    }
+}
+
+/// Removes a completed task from the registry even if dropping its future
+/// unwinds.
+struct CompletionGuard<'a> {
+    inner: &'a PortableInner,
+    task: &'a PortableTask,
+    finished: bool,
+}
+
+impl<'a> CompletionGuard<'a> {
+    fn new(inner: &'a PortableInner, task: &'a PortableTask) -> Self {
+        Self {
+            inner,
+            task,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.finished = true;
+        self.cleanup(true);
+    }
+
+    fn cleanup(&self, notify_callback: bool) {
+        let removed = {
+            let mut state = lock(&self.inner.state);
+            let active_index = state
+                .active
+                .iter()
+                .position(|active| std::ptr::eq(active.as_ref(), self.task));
+            active_index.and_then(|index| {
+                let removed = state.active.swap_remove(index);
+                state
+                    .ready
+                    .retain(|queued| !std::ptr::eq(queued.as_ref(), self.task));
+                state.tasks -= 1;
+                Some(removed)
+            })
+        };
+        let removed_active = removed.is_some();
+        drop(removed);
+        if removed_active {
+            self.inner.ready_available.notify_all();
+            if notify_callback {
+                notify_capacity(&self.inner.capacity_callback);
+            }
+        }
+    }
+}
+
+impl Drop for CompletionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cleanup(!std::thread::panicking());
+        }
     }
 }

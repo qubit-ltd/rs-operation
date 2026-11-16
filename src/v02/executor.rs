@@ -67,6 +67,7 @@ mod tests {
     use super::CleanupExecutor;
     use super::ExecutorCreateError;
     use super::ExecutorError;
+    use super::lock;
     use super::PortableExecutor;
     use super::ShutdownError;
     use super::ThreadPoolExecutor;
@@ -156,11 +157,126 @@ mod tests {
 
         assert_eq!(executor.poll_turn(), 1);
         assert_eq!(polls.load(Ordering::SeqCst), 1);
-        assert!(!executor.poll_once(), "a pending future must not be busy-polled");
-        saved.0.lock().unwrap().take().unwrap().wake();
+        assert!(
+            !executor.poll_once(),
+            "a pending future must not be busy-polled"
+        );
+        let late_waker = saved.0.lock().unwrap().take().unwrap();
+        late_waker.clone().wake();
         assert!(executor.poll_once());
         assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(lock(&executor.inner.state).tasks, 0);
+        late_waker.wake();
         assert!(!executor.poll_once());
+        assert_eq!(lock(&executor.inner.state).tasks, 0);
+        assert!(executor.reserve().is_ok());
+    }
+
+    struct PendingWithoutWaker {
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Future for PendingWithoutWaker {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingWithoutWaker {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct PendingWithSavedWaker {
+        saved: Arc<SavedWaker>,
+        polls: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Future for PendingWithSavedWaker {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let poll = self.polls.fetch_add(1, Ordering::SeqCst);
+            if poll == 0 {
+                *self.saved.0.lock().unwrap() = Some(cx.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }
+    }
+
+    impl Drop for PendingWithSavedWaker {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_pending_task_without_waker_is_retained() {
+        let executor = PortableExecutor::new(PortableExecutorOptions {
+            worker_count: 1,
+            task_capacity: 1,
+            polls_per_turn: 8,
+        })
+        .unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        executor.reserve().unwrap().spawn(PendingWithoutWaker {
+            polls: Arc::clone(&polls),
+            drops: Arc::clone(&drops),
+        });
+
+        assert!(executor.poll_once());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let state = lock(&executor.inner.state);
+        assert_eq!(state.tasks, 1);
+        assert_eq!(state.active.len(), 1);
+        assert!(state.ready.is_empty());
+        drop(state);
+        assert!(
+            !executor.poll_once(),
+            "pending task must not be busy-polled"
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_pending_task_survives_dropped_external_waker() {
+        let executor = PortableExecutor::new(PortableExecutorOptions {
+            worker_count: 1,
+            task_capacity: 1,
+            polls_per_turn: 8,
+        })
+        .unwrap();
+        let saved = Arc::new(SavedWaker::default());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        executor.reserve().unwrap().spawn(PendingWithSavedWaker {
+            saved: Arc::clone(&saved),
+            polls: Arc::clone(&polls),
+            drops: Arc::clone(&drops),
+        });
+
+        assert!(executor.poll_once());
+        drop(saved.0.lock().unwrap().take().unwrap());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        let state = lock(&executor.inner.state);
+        assert_eq!(state.tasks, 1);
+        assert_eq!(state.active.len(), 1);
+        assert!(state.ready.is_empty());
+        drop(state);
+        assert!(!executor.poll_once());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
     }
 
     struct WakeWhilePolling {
@@ -197,7 +313,147 @@ mod tests {
         assert_eq!(polls.load(Ordering::SeqCst), 1);
         assert!(executor.poll_once());
         assert_eq!(polls.load(Ordering::SeqCst), 2);
+        let state = lock(&executor.inner.state);
+        assert_eq!(state.tasks, 0);
+        assert!(state.active.is_empty());
+        assert!(state.ready.is_empty());
+        drop(state);
         assert!(!executor.poll_once());
+    }
+
+    struct WakeTwiceAndFinish {
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl Future for WakeTwiceAndFinish {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            cx.waker().wake_by_ref();
+            cx.waker().wake_by_ref();
+            Poll::Ready(())
+        }
+    }
+
+    #[test]
+    fn test_ready_task_releases_capacity_once_despite_wakes() {
+        let executor = PortableExecutor::new(PortableExecutorOptions {
+            worker_count: 2,
+            task_capacity: 1,
+            polls_per_turn: 8,
+        })
+        .unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        executor.reserve().unwrap().spawn(WakeTwiceAndFinish {
+            polls: Arc::clone(&polls),
+        });
+
+        assert!(executor.poll_once());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        let state = lock(&executor.inner.state);
+        assert_eq!(state.tasks, 0);
+        assert!(state.active.is_empty());
+        assert!(state.ready.is_empty());
+        drop(state);
+        assert!(!executor.poll_once());
+        assert!(executor.reserve().is_ok());
+    }
+
+    #[test]
+    fn test_dropped_portable_permit_releases_capacity() {
+        let executor = PortableExecutor::new(PortableExecutorOptions {
+            worker_count: 1,
+            task_capacity: 1,
+            polls_per_turn: 1,
+        })
+        .unwrap();
+        let permit = executor.reserve().unwrap();
+        assert_eq!(lock(&executor.inner.state).tasks, 1);
+
+        drop(permit);
+
+        let state = lock(&executor.inner.state);
+        assert_eq!(state.tasks, 0);
+        assert!(state.active.is_empty());
+        assert!(state.ready.is_empty());
+        drop(state);
+        assert!(executor.reserve().is_ok());
+    }
+
+    struct CompetingPolls {
+        gate: Arc<Gate>,
+        saved: Arc<SavedWaker>,
+        polls: Arc<AtomicUsize>,
+        concurrent: Arc<AtomicUsize>,
+        max_concurrent: Arc<AtomicUsize>,
+    }
+
+    impl Future for CompetingPolls {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let concurrent = self.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_concurrent.fetch_max(concurrent, Ordering::SeqCst);
+            let poll = self.polls.fetch_add(1, Ordering::SeqCst);
+            let result = if poll == 0 {
+                *self.saved.0.lock().unwrap() = Some(cx.waker().clone());
+                self.gate.enter_and_wait();
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            };
+            self.concurrent.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+    }
+
+    #[test]
+    fn test_competing_workers_serialize_polls_and_complete_once() {
+        let executor = PortableExecutor::new(PortableExecutorOptions {
+            worker_count: 2,
+            task_capacity: 1,
+            polls_per_turn: 8,
+        })
+        .unwrap();
+        let gate = Arc::new(Gate::new());
+        let saved = Arc::new(SavedWaker::default());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        executor.reserve().unwrap().spawn(CompetingPolls {
+            gate: Arc::clone(&gate),
+            saved: Arc::clone(&saved),
+            polls: Arc::clone(&polls),
+            concurrent: Arc::clone(&concurrent),
+            max_concurrent: Arc::clone(&max_concurrent),
+        });
+
+        let first_executor = executor.clone();
+        let first = thread::spawn(move || first_executor.poll_once());
+        gate.wait_started();
+        saved.0.lock().unwrap().take().unwrap().wake();
+
+        let second_executor = executor.clone();
+        let second = thread::spawn(move || second_executor.poll_once());
+        loop {
+            let pollers = *lock(&executor.inner.pollers);
+            let ready_empty = lock(&executor.inner.state).ready.is_empty();
+            if pollers == 2 && ready_empty {
+                break;
+            }
+            thread::yield_now();
+        }
+        gate.release();
+
+        assert!(first.join().unwrap());
+        assert!(second.join().unwrap());
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(max_concurrent.load(Ordering::SeqCst), 1);
+        let state = lock(&executor.inner.state);
+        assert_eq!(state.tasks, 0);
+        assert!(state.active.is_empty());
+        assert!(state.ready.is_empty());
     }
 
     #[test]

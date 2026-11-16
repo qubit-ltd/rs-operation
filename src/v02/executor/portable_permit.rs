@@ -49,6 +49,7 @@ impl PortablePermit {
             queued: AtomicBool::new(true),
             completed: AtomicBool::new(false),
         });
+        state.active.push(Arc::clone(&task));
         state.ready.push_back(Arc::clone(&task));
         self.active = false;
         drop(state);
