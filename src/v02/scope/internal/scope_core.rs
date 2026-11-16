@@ -166,6 +166,7 @@ impl ScopeCore {
                 transfers: Vec::new(),
                 transfers_total: 0,
                 transfers_truncated: false,
+                external_settlement: None,
                 settlement_callback: None,
                 body_finished: false,
                 outcome_callback: None,
@@ -636,11 +637,18 @@ impl ScopeCore {
         state.pending_resource_scopes = state.pending_resource_scopes.saturating_add(1);
     }
 
-    /// Releases the external-driver settlement reservation after all required
-    /// control facts have been observed.
-    pub(crate) fn finish_external_driver_settlement(&self) {
+    /// Returns the external adapter's immutable settlement report, if present.
+    #[must_use]
+    pub(crate) fn external_settlement(&self) -> Option<Arc<SettlementReport>> {
+        lock(&self.state).external_settlement.clone()
+    }
+
+    /// Stores the domain report and releases the external-driver settlement
+    /// reservation after all required control facts have been observed.
+    pub(crate) fn finish_external_driver_settlement(&self, report: Arc<SettlementReport>) {
         let callback = {
             let mut state = lock(&self.state);
+            state.external_settlement = Some(report);
             state.pending_resource_scopes = state.pending_resource_scopes.saturating_sub(1);
             Self::take_settlement_callback(&mut state)
         };
@@ -1490,6 +1498,7 @@ mod lifecycle_tests {
             effects: Arc::from([]),
             effects_total: 0,
             effect_overflow: 0,
+            external_settlement: None,
         }
     }
 

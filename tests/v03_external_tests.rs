@@ -163,6 +163,7 @@ impl OperationControl for Prepared {
             effects: Arc::from([]),
             effects_total: 0,
             effect_overflow: 0,
+            external_settlement: None,
         }))
     }
 }

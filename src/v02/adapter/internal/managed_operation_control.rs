@@ -416,6 +416,7 @@ mod tests {
             effects: Arc::<[EffectRecord]>::from([]),
             effects_total: 0,
             effect_overflow: 0,
+            external_settlement: None,
         }
     }
 

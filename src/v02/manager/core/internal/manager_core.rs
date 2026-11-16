@@ -525,12 +525,20 @@ impl ManagerCore {
             transfers_total,
             transfers_truncated,
         ) = scope.resource_reports();
-        let status = if cleanup_failures_total != 0 || recoveries_total != 0 {
+        let external_settlement = scope.external_settlement();
+        let local_status = if cleanup_failures_total != 0 || recoveries_total != 0 {
             SettlementStatus::RecoveryRequired
         } else if transfers_total != 0 {
             SettlementStatus::Transferred
         } else {
             SettlementStatus::Released
+        };
+        let status = match (local_status, external_settlement.as_deref().map(|report| report.status)) {
+            (SettlementStatus::RecoveryRequired, _) | (_, Some(SettlementStatus::RecoveryRequired)) => {
+                SettlementStatus::RecoveryRequired
+            }
+            (SettlementStatus::Transferred, _) | (_, Some(SettlementStatus::Transferred)) => SettlementStatus::Transferred,
+            _ => SettlementStatus::Released,
         };
         let (effects, effects_total, effect_overflow) = scope.effect_records();
         SettlementReport {
@@ -557,6 +565,7 @@ impl ManagerCore {
             effects: Arc::from(effects),
             effects_total,
             effect_overflow,
+            external_settlement,
         }
     }
 }

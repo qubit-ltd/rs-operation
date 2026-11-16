@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use super::ScopeResourceOwner;
 use super::child_record::ChildRecord;
@@ -20,6 +21,7 @@ use crate::v02::report::EffectRecord;
 use crate::v02::report::OperationId;
 use crate::v02::report::RecoveryHandle;
 use crate::v02::report::ResourceCleanupReport;
+use crate::v02::report::SettlementReport;
 use crate::v02::report::TransferReceipt;
 
 /// Mutable lifecycle and bounded diagnostic state guarded by `ScopeCore`.
@@ -76,6 +78,8 @@ pub(super) struct ScopeState {
     pub(super) transfers_total: usize,
     /// Whether transfer details exceeded the cap.
     pub(super) transfers_truncated: bool,
+    /// Original settlement evidence returned by the external domain adapter.
+    pub(super) external_settlement: Option<Arc<SettlementReport>>,
     /// Callback fired when resource and child settlement are both complete.
     pub(super) settlement_callback: Option<Box<dyn FnOnce() + Send + 'static>>,
     /// Whether the operation body frame has returned or unwound.

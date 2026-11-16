@@ -18,6 +18,10 @@ use crate::v02::report::SettlementStatus;
 use crate::v02::report::TransferReceipt;
 
 /// Resource settlement summary with bounded detail arrays and total counts.
+/// For manager-driven external operations, `external_settlement` retains the
+/// adapter's domain report. Counts and detail arrays on this report describe
+/// the manager scope only; `status` reflects the more severe disposition from
+/// either source.
 ///
 /// The detail arrays may be truncated to respect configured memory limits;
 /// their corresponding total fields retain the observed counts.
@@ -84,6 +88,10 @@ pub struct SettlementReport {
     pub effects_total: usize,
     /// Effect records that could not be retained because capacity was full.
     pub effect_overflow: usize,
+    /// Original domain settlement report supplied by an external adapter.
+    /// Scope counts and details remain separate; inspect this report for the
+    /// external operation's recovery handles, effects, and other evidence.
+    pub external_settlement: Option<Arc<SettlementReport>>,
 }
 
 impl SettlementReport {
@@ -92,11 +100,14 @@ impl SettlementReport {
     ///
     /// # Returns
     ///
-    /// `true` when the overall status is `Released` and neither transfer nor
-    /// recovery counts are nonzero.
+    /// `true` when both this scope and any external domain report confirm all
+    /// resources released without transfer or recovery.
     #[must_use]
     #[inline]
     pub fn all_released(&self) -> bool {
-        self.status == SettlementStatus::Released && self.transferred_count == 0 && self.recovery_count == 0
+        self.status == SettlementStatus::Released
+            && self.transferred_count == 0
+            && self.recovery_count == 0
+            && self.external_settlement.as_ref().is_none_or(|report| report.all_released())
     }
 }

@@ -65,6 +65,7 @@ fn settlement(operation_id: OperationId, status: SettlementStatus) -> Settlement
         effects: Arc::from([]),
         effects_total: 0,
         effect_overflow: 0,
+            external_settlement: None,
     }
 }
 
