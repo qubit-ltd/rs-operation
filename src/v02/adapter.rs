@@ -8,6 +8,7 @@
 
 //! Admission and lifecycle ports for externally executed child operations.
 
+mod external_bind_error;
 mod external_operation;
 
 mod internal;
@@ -15,7 +16,7 @@ mod internal;
 #[cfg(test)]
 mod tests;
 
-pub use external_operation::ExternalBindError;
+pub use external_bind_error::ExternalBindError;
 pub use external_operation::PreparedExternalOperation;
 pub(crate) use internal::AdapterErrorKind;
 pub(crate) use internal::AdapterReservation;

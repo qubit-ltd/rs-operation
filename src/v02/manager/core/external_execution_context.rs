@@ -21,14 +21,27 @@ use crate::v02::scope::ScopeCore;
 
 /// Tracks execution resources for a manager-driven external operation.
 pub struct ExternalExecutionContext {
+    /// Operation lifecycle state updated when external execution completes.
     operation: Arc<OperationCore>,
+    /// Submission lease released when execution is finalized.
     lease: Arc<dyn super::SubmissionLease>,
+    /// Scope whose body completion is recorded during finalization.
     scope: Arc<ScopeCore>,
+    /// Execution frame retained until the external body finishes.
     frame: Mutex<Option<ExecutionFrameGuard>>,
+    /// Ensures finalization effects run only once.
     finalized: AtomicBool,
 }
 
 impl ExternalExecutionContext {
+    /// Creates lifecycle state for a manager-driven external operation.
+    ///
+    /// # Parameters
+    ///
+    /// - `operation`: Operation whose execution state is tracked.
+    /// - `lease`: Submission lease held until execution finishes.
+    /// - `scope`: Scope whose body completion is recorded.
+    /// - `frame`: Optional execution frame retained during the external body.
     pub(super) fn new(
         operation: Arc<OperationCore>,
         lease: Arc<dyn super::SubmissionLease>,
@@ -44,6 +57,7 @@ impl ExternalExecutionContext {
         }
     }
 
+    /// Marks external execution finished and releases its retained resources.
     pub(super) fn finish(&self) {
         if self.finalized.swap(true, Ordering::AcqRel) {
             return;

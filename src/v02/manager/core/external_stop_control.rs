@@ -15,6 +15,7 @@ use super::StopControl;
 
 /// Routes manager stop requests to an externally driven operation.
 pub struct ExternalStopControl {
+    /// Manager control that receives stop requests for the external operation.
     pub(super) managed: Arc<ManagedOperationControl>,
 }
 

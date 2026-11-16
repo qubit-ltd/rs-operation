@@ -12,20 +12,12 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 
+use super::external_bind_error::ExternalBindError;
 use crate::v02::protocol::OperationControl;
 use crate::v02::report::ExecutionFailure;
 use crate::v02::report::OperationId;
 use crate::v02::report::OperationOutcome;
 use crate::v02::scope::OperationScope;
-
-/// Error returned when an external operation cannot claim its binding.
-#[derive(Clone, Debug)]
-pub enum ExternalBindError {
-    /// This prepared operation has already been bound to another submission.
-    AlreadyBound,
-    /// Binding failed after the adapter claimed this operation.
-    Failed(ExecutionFailure),
-}
 
 /// A prepared external task that the manager can bind and drive.
 ///
