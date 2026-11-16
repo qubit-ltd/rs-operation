@@ -32,8 +32,8 @@ pub(crate) struct ExecutionContextFuture<F> {
     manager: Arc<ManagerCore>,
     /// Operation identity exposed during each future poll.
     operation: OperationId,
-    /// Optional group identity exposed during each future poll.
-    group: Option<Arc<GroupCore>>,
+    /// Group identities exposed during each future poll.
+    groups: Vec<Arc<GroupCore>>,
 }
 
 impl<F> ExecutionContextFuture<F> {
@@ -44,7 +44,7 @@ impl<F> ExecutionContextFuture<F> {
     /// - `future`: User future to poll.
     /// - `manager`: Manager that owns the operation.
     /// - `operation`: Operation currently being executed.
-    /// - `group`: Optional group that contains the operation.
+    /// - `groups`: Groups that contain the operation.
     ///
     /// # Returns
     ///
@@ -53,13 +53,13 @@ impl<F> ExecutionContextFuture<F> {
         future: F,
         manager: Arc<ManagerCore>,
         operation: OperationId,
-        group: Option<Arc<GroupCore>>,
+        groups: Vec<Arc<GroupCore>>,
     ) -> Self {
         Self {
             future: CatchUnwindFuture::new(future),
             manager,
             operation,
-            group,
+            groups,
         }
     }
 }
@@ -82,7 +82,7 @@ impl<F: Future> Future for ExecutionContextFuture<F> {
         // The boxed future is pinned independently, so the wrapper remains
         // movable and can stay Send when F is Send.
         let this = self.as_mut().get_mut();
-        let _context = ExecutionContextGuard::enter(&this.manager, this.operation, this.group.as_ref());
+        let _context = ExecutionContextGuard::enter(&this.manager, this.operation, &this.groups);
         match this.future.poll(cx) {
             Err(poll_panic) => {
                 if let Err(drop_panic) = this.future.drop_inner() {
@@ -108,7 +108,7 @@ impl<F: Future> Future for ExecutionContextFuture<F> {
 impl<F> Drop for ExecutionContextFuture<F> {
     /// Drops the owned future with its execution context installed.
     fn drop(&mut self) {
-        let _context = ExecutionContextGuard::enter(&self.manager, self.operation, self.group.as_ref());
+        let _context = ExecutionContextGuard::enter(&self.manager, self.operation, &self.groups);
         if let Err(payload) = self.future.drop_inner() {
             dispose_panic_payload(payload);
         }

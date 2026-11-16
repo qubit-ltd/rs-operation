@@ -282,14 +282,14 @@ impl AsyncOperationManager {
                 let frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
                 operation.set_execution(ExecutionPhase::Running);
                 let manager_core = scope_core.manager().upgrade().expect("active scope manager exists");
-                let group = scope_core.group().cloned();
+                let groups = scope_core.groups().to_vec();
                 let construction = {
-                    let _context = ExecutionContextGuard::enter(&manager_core, operation_id, group.as_ref());
+                    let _context = ExecutionContextGuard::enter(&manager_core, operation_id, &groups);
                     catch_unwind(AssertUnwindSafe(|| body(scope)))
                 };
                 let result = match construction {
                     Ok(user_future) => {
-                        ExecutionContextFuture::new(user_future, manager_core, operation_id, group).await
+                        ExecutionContextFuture::new(user_future, manager_core, operation_id, groups).await
                     }
                     Err(payload) => Err(payload),
                 };

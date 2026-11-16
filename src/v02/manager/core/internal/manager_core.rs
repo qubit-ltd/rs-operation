@@ -272,7 +272,6 @@ impl ManagerCore {
                 Err(reason) => return Err(SubmitError::new(reason, body)),
             }
         }
-        let group = groups.first();
         if options.limits == ScopeLimits::default() {
             options.limits = self.scope_limits;
         }
@@ -298,7 +297,7 @@ impl ManagerCore {
             Ok(permit) => permit,
             Err(reason) => return Err(SubmitError::new(reason, body)),
         };
-        self.track_resource_recoveries(&permit.resource_scope, group.cloned());
+        self.track_resource_recoveries(&permit.resource_scope, groups.clone());
         let scope_core = ScopeCore::new(ScopeCoreInit {
             id,
             manager: Arc::downgrade(self),
@@ -376,8 +375,8 @@ impl ManagerCore {
             let scope = OperationScope::new(Arc::clone(&scope_core), core);
             let _frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
             let manager = scope_core.manager().upgrade().expect("active scope manager exists");
-            let group = scope_core.group().cloned();
-            let _context = ExecutionContextGuard::enter(&manager, id, group.as_ref());
+            let groups = scope_core.groups().to_vec();
+            let _context = ExecutionContextGuard::enter(&manager, id, &groups);
             body(scope);
         })));
         Ok(id)
@@ -400,12 +399,12 @@ impl ManagerCore {
         let future = async move {
             let _frame = ExecutionFrameGuard::new(scope_core);
             let manager = scope.core.manager().upgrade().expect("active scope manager exists");
-            let group = scope.core.group().cloned();
+            let groups = scope.core.groups().to_vec();
             let user_future = {
-                let _context = ExecutionContextGuard::enter(&manager, id, group.as_ref());
+                let _context = ExecutionContextGuard::enter(&manager, id, &groups);
                 body(scope)
             };
-            if let Err(payload) = ExecutionContextFuture::new(user_future, manager, id, group).await {
+            if let Err(payload) = ExecutionContextFuture::new(user_future, manager, id, groups).await {
                 dispose_panic_payload(payload);
             }
         };
@@ -449,6 +448,7 @@ impl ManagerCore {
         } else {
             SettlementStatus::Released
         };
+        let (effects, effects_total, effect_overflow) = scope.effect_records();
         SettlementReport {
             operation_id: scope.id(),
             status,
@@ -470,9 +470,9 @@ impl ManagerCore {
             recoveries: Arc::from(recoveries),
             recoveries_total,
             recoveries_truncated,
-            effects: Arc::from([]),
-            effects_total: 0,
-            effect_overflow: 0,
+            effects: Arc::from(effects),
+            effects_total,
+            effect_overflow,
         }
     }
 }
@@ -774,13 +774,13 @@ impl ManagerCore {
     pub(crate) fn service_resource_scope(
         self: &Arc<Self>,
         capacity: usize,
-        group: Option<Arc<crate::v02::manager::group::GroupCore>>,
+        groups: Vec<Arc<crate::v02::manager::group::GroupCore>>,
     ) -> Result<ResourceScope, crate::v02::report::ResourceScopeError> {
         let scope = self.port.service_resource_scope(capacity)?;
-        self.track_resource_recoveries(&scope, group.clone());
+        self.track_resource_recoveries(&scope, groups.clone());
         let id = scope.id();
         let manager = Arc::downgrade(self);
-        let group_callback = group.clone();
+        let group_callbacks = groups.iter().map(Arc::downgrade).collect::<Vec<_>>();
         scope.set_settlement_callback(Box::new(move |_| {
             let removed = if let Some(manager) = manager.upgrade() {
                 let removed = lock(&manager.state).service_scopes.remove(&id);
@@ -790,7 +790,7 @@ impl ManagerCore {
             } else {
                 None
             };
-            if let Some(group) = group_callback {
+            for group in group_callbacks.iter().filter_map(Weak::upgrade) {
                 group.service_finished(id);
             }
             drop(removed);
@@ -804,11 +804,16 @@ impl ManagerCore {
             }
             state.service_scopes.insert(id, scope.internal_clone());
         }
-        if let Some(group) = group
-            && !group.register_service(scope.internal_clone())
-        {
-            scope.end();
-            return Err(crate::v02::report::ResourceScopeError::ScopeEnded);
+        let mut registered_groups: Vec<&Arc<crate::v02::manager::group::GroupCore>> = Vec::new();
+        for group in &groups {
+            if !group.register_service(scope.internal_clone()) {
+                for registered in registered_groups {
+                    registered.service_finished(id);
+                }
+                scope.end();
+                return Err(crate::v02::report::ResourceScopeError::ScopeEnded);
+            }
+            registered_groups.push(group);
         }
         Ok(scope)
     }
@@ -847,7 +852,7 @@ impl ManagerCore {
         let id = crate::v02::report::ResourceScopeId::new_unique();
         let capacity = Arc::new(owner.capacity().resource_scope_for(id, options.capacity));
         let resource_scope = self.port.operation_resource_scope(id, capacity)?;
-        self.track_resource_recoveries(&resource_scope, owner.group().cloned());
+        self.track_resource_recoveries(&resource_scope, owner.groups().to_vec());
         match owner.attach_resource_scope_with_permit(resource_scope.internal_clone(), scope_permit) {
             Ok(()) => Ok(resource_scope),
             Err(resource_scope) => {
@@ -1055,13 +1060,13 @@ impl ManagerCore {
     fn track_resource_recoveries(
         self: &Arc<Self>,
         scope: &ResourceScope,
-        group: Option<Arc<crate::v02::manager::group::GroupCore>>,
+        groups: Vec<Arc<crate::v02::manager::group::GroupCore>>,
     ) {
         let manager = Arc::downgrade(self);
-        let group_callback = group.as_ref().map(Arc::downgrade);
+        let group_callbacks = groups.iter().map(Arc::downgrade).collect::<Vec<_>>();
         scope.set_recovery_callback(Arc::new(
             move |handle: crate::v02::resource::RecoveryHandle, active: bool| {
-                if let Some(group) = group_callback.as_ref().and_then(Weak::upgrade) {
+                for group in group_callbacks.iter().filter_map(Weak::upgrade) {
                     group.recovery_changed(handle.clone(), active);
                 }
                 let Some(manager) = manager.upgrade() else {

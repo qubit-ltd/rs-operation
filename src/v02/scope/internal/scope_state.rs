@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use super::ScopeResourceOwner;
 use super::child_record::ChildRecord;
 use super::start_state::StartState;
+use crate::v02::manager::capacity::PermitBundle;
+use crate::v02::report::EffectRecord;
 use crate::v02::report::ChildFailureSummary;
 use crate::v02::report::ChildSettlement;
 use crate::v02::report::CleanupFailure;
@@ -59,6 +61,12 @@ pub(super) struct ScopeState {
     pub(super) recoveries_total: usize,
     /// Whether recovery details exceeded the cap.
     pub(super) recoveries_truncated: bool,
+    /// Bounded effect records retained while their inherited permits are held.
+    pub(super) effects: Vec<EffectRecord>,
+    /// Permits retaining effect-record quota across all ancestors.
+    pub(super) effect_permits: Vec<PermitBundle>,
+    /// Number of effect records rejected due to exhausted quota.
+    pub(super) effect_overflow: usize,
     /// Bounded retained transfer receipts.
     pub(super) transfers: Vec<TransferReceipt>,
     /// Total transfers observed before truncation.

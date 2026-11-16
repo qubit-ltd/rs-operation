@@ -25,17 +25,17 @@ impl ExecutionContextGuard {
     ///
     /// - `manager`: Manager that owns the operation.
     /// - `operation`: Operation currently being executed.
-    /// - `group`: Optional group that contains the operation.
+    /// - `groups`: Groups that contain the operation.
     ///
     /// # Returns
     ///
     /// A guard that pops this context when dropped.
-    pub(crate) fn enter(manager: &Arc<ManagerCore>, operation: OperationId, group: Option<&Arc<GroupCore>>) -> Self {
+    pub(crate) fn enter(manager: &Arc<ManagerCore>, operation: OperationId, groups: &[Arc<GroupCore>]) -> Self {
         EXECUTION_CONTEXTS.with(|contexts| {
             contexts.borrow_mut().push(ExecutionContext {
                 manager: Arc::as_ptr(manager) as usize,
                 operation,
-                group: group.map(|group| Arc::as_ptr(group) as usize),
+                groups: groups.iter().map(|group| Arc::as_ptr(group) as usize).collect(),
             });
         });
         Self

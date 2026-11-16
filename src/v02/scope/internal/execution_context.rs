@@ -19,14 +19,14 @@ thread_local! {
 }
 
 /// Identifies one managed operation while its body is being executed.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct ExecutionContext {
     /// Address identity of the manager coordinator.
     pub(super) manager: usize,
     /// Operation whose completion depends on the current body.
     pub(super) operation: OperationId,
-    /// Address identity of the operation group, if it belongs to a group.
-    pub(super) group: Option<usize>,
+    /// Address identities of every operation group containing this operation.
+    pub(super) groups: Vec<usize>,
 }
 
 /// Reports whether the active operation belongs to the given manager.
@@ -65,7 +65,7 @@ pub(crate) fn is_waiting_on_group(manager: &Arc<ManagerCore>, group: &Arc<GroupC
     EXECUTION_CONTEXTS.with(|contexts| {
         contexts.borrow().iter().any(|context| {
             context.manager == manager_ptr
-                && context.group == Some(group_ptr)
+                && context.groups.contains(&group_ptr)
                 && manager.has_active_scope(context.operation)
         })
     })

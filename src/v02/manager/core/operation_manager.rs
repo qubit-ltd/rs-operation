@@ -266,7 +266,7 @@ impl OperationManager {
             .service_resource_scope(
                 capacity,
                 match &self.target {
-                    SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => groups.first().cloned(),
+                    SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => groups.clone(),
                 },
             )
             .map(crate::v02::resource::service::ServiceResourceScope::new)
@@ -412,9 +412,9 @@ impl OperationManager {
             let frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
             operation.set_execution(ExecutionPhase::Running);
             let manager_core = scope_core.manager().upgrade().expect("active scope manager exists");
-            let group = scope_core.group().cloned();
+            let groups = scope_core.groups().to_vec();
             let result = {
-                let _context = ExecutionContextGuard::enter(&manager_core, operation_id, group.as_ref());
+                let _context = ExecutionContextGuard::enter(&manager_core, operation_id, &groups);
                 panic::catch_unwind(AssertUnwindSafe(|| body(scope)))
             };
             operation.set_execution(ExecutionPhase::Finished);

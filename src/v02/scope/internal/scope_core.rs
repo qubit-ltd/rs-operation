@@ -31,6 +31,9 @@ use crate::v02::manager::group::GroupCore;
 use crate::v02::operation::OperationCore;
 use crate::v02::report::AdmissionError;
 use crate::v02::report::ChildFailurePolicy;
+use crate::v02::report::EffectRecord;
+use crate::v02::report::EffectRecordError;
+use crate::v02::report::StopRequestStatus;
 use crate::v02::report::ChildFailureSummary;
 use crate::v02::report::ChildOutcomeKind;
 use crate::v02::report::ChildOutcomeSummary;
@@ -145,6 +148,9 @@ impl ScopeCore {
                 children_total: 0,
                 children_truncated: false,
                 required_failure: None,
+                effects: Vec::new(),
+                effect_permits: Vec::new(),
+                effect_overflow: 0,
                 resources: Vec::new(),
                 pending_resource_scopes: 0,
                 resource_reports: Vec::new(),
@@ -188,6 +194,59 @@ impl ScopeCore {
     #[inline]
     pub(crate) fn id(&self) -> OperationId {
         self.id
+    }
+
+    pub(crate) fn record_effect(&self, record: EffectRecord) -> Result<(), EffectRecordError> {
+        self.with_lifecycle_gate(|| {
+            let mut state = lock(&self.state);
+            if !state.open {
+                return Err(EffectRecordError::ScopeEnded);
+            }
+            if state.stopping {
+                return Err(EffectRecordError::Stopped);
+            }
+            let permit = match self.capacity.effect_record_permits() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    state.effect_overflow = state.effect_overflow.saturating_add(1);
+                    return Err(EffectRecordError::CapacityExceeded);
+                }
+            };
+            state.effects.push(record);
+            state.effect_permits.push(permit);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn effect_records(&self) -> (Vec<EffectRecord>, usize, usize) {
+        let mut state = lock(&self.state);
+        let records = state.effects.clone();
+        let overflow = state.effect_overflow;
+        state.effect_permits.clear();
+        let total = records.len().saturating_add(overflow);
+        (records, total, overflow)
+    }
+
+    pub(crate) fn request_stop_status(&self, reason: StopReason) -> StopRequestStatus {
+        {
+            let state = lock(&self.state);
+            if !state.open || state.body_finished {
+                return StopRequestStatus::AlreadyFinished;
+            }
+            if state.stopping {
+                return StopRequestStatus::AlreadyRequested;
+            }
+        }
+        if self.request_stop(reason) {
+            StopRequestStatus::Accepted
+        } else {
+            let state = lock(&self.state);
+            if state.open && state.stopping {
+                StopRequestStatus::AlreadyRequested
+            } else {
+                StopRequestStatus::AlreadyFinished
+            }
+        }
     }
 
     /// Reports whether new children or resources can still be attached.
@@ -254,17 +313,6 @@ impl ScopeCore {
     #[inline]
     pub(crate) fn cleanup_in_flight(&self) -> usize {
         self.resource_scope.cleanup_in_flight()
-    }
-
-    /// Borrows the optional operation group tracking this scope.
-    ///
-    /// # Returns
-    ///
-    /// `Some` with the group when this scope belongs to one, or `None`
-    /// otherwise.
-    #[inline]
-    pub(crate) fn group(&self) -> Option<&Arc<GroupCore>> {
-        self.groups.first()
     }
 
     pub(crate) fn groups(&self) -> &[Arc<GroupCore>] {
@@ -611,7 +659,7 @@ impl ScopeCore {
     pub(crate) fn request_stop(&self, reason: StopReason) -> bool {
         let (accepted, descendants) = self.with_lifecycle_gate(|| {
             let mut state = lock(&self.state);
-            if state.stopping {
+            if !state.open || state.body_finished || state.stopping {
                 return (false, Vec::new());
             }
             state.stopping = true;
