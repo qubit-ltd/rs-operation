@@ -86,6 +86,27 @@ fn external_trait_is_object_safe_and_keeps_result_types_unconstrained() {
     fn takes_object(_: &dyn PreparedExternalOperation<NoCloneNoDebug, NoCloneNoDebug>) {}
     takes_object(&AdapterTyped);
     #[allow(dead_code)]
+    fn invoke_object_callbacks(
+        adapter: Arc<dyn PreparedExternalOperation<NoCloneNoDebug, NoCloneNoDebug>>,
+        id: OperationId,
+        scope: OperationScope,
+        cx: &mut Context<'_>,
+    ) {
+        let _ = adapter.bind(id);
+        let _ = adapter.clone().activate(scope);
+        adapter.clone().abandon();
+        let _ = adapter.poll_take_outcome(cx);
+        adapter.request_stop(qubit_operation::StopReason::UserCancelled);
+        let _ = adapter.snapshot();
+        let _ = adapter.poll_outcome(cx);
+        let _ = adapter.poll_release(cx);
+        let _ = adapter.poll_settlement(cx);
+    }
+    let _ = invoke_object_callbacks;
+    let adapter: Arc<dyn PreparedExternalOperation<NoCloneNoDebug, NoCloneNoDebug>> =
+        Arc::new(AdapterTyped);
+    assert_eq!(Arc::strong_count(&adapter), 1);
+    #[allow(dead_code)]
     fn manager_entry_points_compile(
         sync: &qubit_operation::OperationManager,
         asynchronous: &qubit_operation::AsyncOperationManager,
