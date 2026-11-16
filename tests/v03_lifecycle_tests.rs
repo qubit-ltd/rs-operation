@@ -6,7 +6,7 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
-//! Cross-protocol lifecycle tests using public crate-root APIs only.
+//! Cross-protocol lifecycle tests, including the guide's compiled example.
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
@@ -67,6 +67,7 @@ struct External {
     typed_outcome_ready: AtomicBool,
     typed_outcome_waker: Mutex<Option<Waker>>,
     typed_poll_pending: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    typed_poll_ready: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     worker_owner: Mutex<Option<Arc<DropProbe>>>,
     stops: AtomicUsize,
     polls: AtomicUsize,
@@ -89,6 +90,7 @@ impl External {
             typed_outcome_ready: AtomicBool::new(true),
             typed_outcome_waker: Mutex::new(None),
             typed_poll_pending: Mutex::new(None),
+            typed_poll_ready: Mutex::new(None),
             worker_owner: Mutex::new(None),
             stops: AtomicUsize::new(0),
             polls: AtomicUsize::new(0),
@@ -235,6 +237,9 @@ impl PreparedExternalOperation<usize, ()> for External {
             return Poll::Pending;
         }
         drop(waker);
+        if let Some(signal) = self.typed_poll_ready.lock().unwrap().take() {
+            let _ = signal.send(());
+        }
         self.outcome_published.store(true, Ordering::SeqCst);
         self.phase.store(2, Ordering::SeqCst);
         Poll::Ready(OperationOutcome::Succeeded(42))
@@ -250,6 +255,8 @@ fn test_stopped_early_outcome_waits_for_input_release_and_domain_settlement() {
     external.typed_outcome_ready.store(false, Ordering::SeqCst);
     let (typed_pending_tx, typed_pending_rx) = std::sync::mpsc::channel();
     *external.typed_poll_pending.lock().unwrap() = Some(typed_pending_tx);
+    let (typed_ready_tx, typed_ready_rx) = std::sync::mpsc::channel();
+    *external.typed_poll_ready.lock().unwrap() = Some(typed_ready_tx);
     let (activated_tx, activated_rx) = std::sync::mpsc::channel();
     *external.activated.lock().unwrap() = Some(activated_tx);
     let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
@@ -268,6 +275,9 @@ fn test_stopped_early_outcome_waits_for_input_release_and_domain_settlement() {
     assert_eq!(stopped_rx.recv().unwrap(), StopReason::UserCancelled);
     external.release_typed_outcome();
     assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
+    typed_ready_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("driver consumes the adapter's typed outcome before summary inspection");
     let domain_summary = match external.poll_outcome(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(summary) => summary,
         Poll::Pending => panic!("domain completion summary is ready"),
@@ -329,12 +339,21 @@ fn test_queue_capacity_does_not_block_stop_for_an_accepted_external_operation() 
         })
         .unwrap();
     started_rx.recv().unwrap();
+    let mut sync_queued = manager
+        .try_submit(OperationOptions::default(), |_| Ok::<_, ()>(()))
+        .unwrap();
     let external = External::held();
+    external.typed_outcome_ready.store(false, Ordering::SeqCst);
     let (stopped_tx, stopped_rx) = mpsc::channel();
     *external.stop_forwarded.lock().unwrap() = Some(stopped_tx);
-    let mut queued = manager
+    let (activated_tx, activated_rx) = mpsc::channel();
+    *external.activated.lock().unwrap() = Some(activated_tx);
+    let mut external_handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&external))
         .unwrap();
+    activated_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("accepted external operation should activate despite a full sync queue");
 
     let (body_started_tx, body_started_rx) = mpsc::channel();
     let rejected = match manager.try_submit(OperationOptions::default(), move |_| {
@@ -353,16 +372,30 @@ fn test_queue_capacity_does_not_block_stop_for_an_accepted_external_operation() 
     );
 
     assert_eq!(
-        queued.request_stop(StopReason::UserCancelled),
+        external_handle.request_stop(StopReason::UserCancelled),
         StopRequestStatus::Accepted
     );
     release_tx.send(()).unwrap();
-    assert_eq!(stopped_rx.recv().unwrap(), StopReason::UserCancelled);
-    assert!(matches!(queued.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
+    assert_eq!(
+        stopped_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("stop request should reach the activated external operation"),
+        StopReason::UserCancelled
+    );
+    external.release_typed_outcome();
+    assert!(matches!(
+        external_handle.wait_outcome().unwrap(),
+        OperationOutcome::Stopped(_)
+    ));
     external.release_input();
     external.release_settlement();
-    queued.wait_settlement().unwrap();
+    external_handle.wait_settlement().unwrap();
     let _ = running.wait_outcome().unwrap();
+    assert!(matches!(
+        sync_queued.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    sync_queued.wait_settlement().unwrap();
     running.wait_settlement().unwrap();
 }
 

@@ -21,7 +21,6 @@ use super::ExecutionFrameGuard;
 use super::ExecutionKind;
 use super::ExecutionPhase;
 use super::ExternalExecutionContext;
-use super::ExternalOutcomePublisher;
 use super::ExternalStopControl;
 use super::ExternalSubmissionState;
 use super::ManagedOperationControl;
@@ -42,10 +41,8 @@ use super::SubmissionTarget;
 use super::SubmitError;
 use super::block_on;
 use super::child_outcome_summary;
-use super::drive_external;
 use super::lock;
 use super::panic_message;
-use crate::v02::protocol::OperationControl;
 use crate::v02::scope::ExecutionContextGuard;
 
 /// A synchronous submission view over a shared manager coordinator.
@@ -126,7 +123,13 @@ impl OperationManager {
     /// # Parameters
     ///
     /// - `options`: Admission and resource settings for the operation.
-    /// - `prepared`: Task that the manager binds and drives synchronously.
+    /// - `prepared`: Task that the manager binds and drives on its async
+    ///   executor.
+    ///
+    /// External tasks submitted through this synchronous view consume the
+    /// async executor's bounded task capacity. Ordinary synchronous operations
+    /// continue to use the sync executor. Adapter callbacks should return
+    /// promptly and must not block waiting for work submitted to the sync pool.
     ///
     /// # Returns
     ///
@@ -145,78 +148,9 @@ impl OperationManager {
         E: Send + 'static,
         P: crate::v02::adapter::PreparedExternalOperation<T, E>,
     {
-        let bind_result: Arc<Mutex<Option<Result<(), crate::v02::report::ExecutionFailure>>>> =
-            Arc::new(Mutex::new(None));
-        let managed_control: Arc<Mutex<Option<Arc<ManagedOperationControl>>>> = Arc::new(Mutex::new(None));
-        let execution_context: Arc<Mutex<Option<Arc<ExternalExecutionContext>>>> = Arc::new(Mutex::new(None));
-        let outcome_publisher: ExternalOutcomePublisher<T, E> = Arc::new(Mutex::new(None));
-        let activation_permitted = Arc::new(AtomicBool::new(false));
-        let state_for_preflight = Arc::clone(&bind_result);
-        let adapter_for_preflight = Arc::clone(&prepared);
-        let preflight = move |id| {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| adapter_for_preflight.bind(id)));
-            match result {
-                Ok(Ok(())) => *lock(&state_for_preflight) = Some(Ok(())),
-                Ok(Err(crate::v02::adapter::ExternalBindError::AlreadyBound)) => {
-                    return Err(AdmissionError::AlreadyBound);
-                }
-                Ok(Err(crate::v02::adapter::ExternalBindError::Failed(failure))) => {
-                    *lock(&state_for_preflight) = Some(Err(failure));
-                }
-                Err(payload) => {
-                    *lock(&state_for_preflight) = Some(Err(crate::v02::report::ExecutionFailure {
-                        operation_id: id,
-                        summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
-                        source: None,
-                    }));
-                }
-            }
-            Ok(())
-        };
-        let state_for_runner = Arc::clone(&bind_result);
-        let managed_for_runner = Arc::clone(&managed_control);
-        let execution_for_runner = Arc::clone(&execution_context);
-        let publisher_for_runner = Arc::clone(&outcome_publisher);
-        let activation_for_runner = Arc::clone(&activation_permitted);
-        let adapter_for_runner = Arc::clone(&prepared);
-        let runner = move |scope: OperationScope| {
-            block_on(drive_external(
-                scope,
-                adapter_for_runner,
-                state_for_runner,
-                managed_for_runner,
-                execution_for_runner,
-                publisher_for_runner,
-                activation_for_runner.load(Ordering::Acquire),
-            ));
-            None
-        };
-        let domain: Arc<dyn OperationControl> = Arc::clone(&prepared) as Arc<dyn OperationControl>;
-        let adapter_for_abandon = Arc::clone(&prepared);
-        let abandon = Box::new(move || {
-            let _ = panic::catch_unwind(AssertUnwindSafe(|| adapter_for_abandon.abandon()));
-        });
-        match self.try_submit_raw_with_preflight(
-            options,
-            runner,
-            preflight,
-            ExternalSubmissionState {
-                external_control: Some(domain),
-                confirm_input_release: false,
-                on_abandon: Some(abandon),
-                external_managed: Some(Arc::clone(&managed_control)),
-                external_execution: Some(Arc::clone(&execution_context)),
-                early_publisher: Some(Arc::clone(&outcome_publisher)),
-                activation_permitted: Some(Arc::clone(&activation_permitted)),
-            },
-        ) {
-            Ok(handle) => Ok(handle),
-            Err(error) => {
-                let (reason, rejected_runner) = error.into_parts();
-                drop(rejected_runner);
-                Err(SubmitError::new(reason, prepared))
-            }
-        }
+        self.as_async()
+            .try_submit_external(options, prepared)
+            .map(|handle| handle.into_sync())
     }
     /// Constructs a manager with real bounded executors and resource cleanup.
     ///

@@ -412,6 +412,7 @@ impl OperationCore {
             deadline,
             notification: None,
             timer: None,
+            registered_waker: None,
         }
     }
 }

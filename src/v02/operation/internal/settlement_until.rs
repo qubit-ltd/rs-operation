@@ -10,6 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Waker;
 
 use super::operation_core::OperationCore;
 use crate::v02::internal::notify::Notified;
@@ -28,6 +29,8 @@ pub(in crate::v02::operation) struct SettlementUntil<'a> {
     pub(in crate::v02::operation::internal) notification: Option<Notified>,
     /// Clock registration used to wake polling when the deadline is reached.
     pub(in crate::v02::operation::internal) timer: Option<Box<dyn TimerRegistration>>,
+    /// Waker currently associated with the clock registration.
+    pub(in crate::v02::operation::internal) registered_waker: Option<Waker>,
 }
 
 impl Future for SettlementUntil<'_> {
@@ -73,7 +76,13 @@ impl Future for SettlementUntil<'_> {
                 }
                 self.notification = Some(self.core.changed.notified_since(generation));
             }
-            if self.timer.is_none() {
+            let waker_changed = self
+                .registered_waker
+                .as_ref()
+                .is_none_or(|registered| !registered.will_wake(context.waker()));
+            if waker_changed {
+                self.cancel_timer();
+                self.registered_waker = Some(context.waker().clone());
                 self.timer = Some(clock.register_deadline(self.deadline.time_point(), context.waker().clone()));
                 // Registration may race the clock reaching its deadline.
                 let now = clock.now();
@@ -108,6 +117,7 @@ impl SettlementUntil<'_> {
         if let Some(timer) = self.timer.take() {
             timer.cancel();
         }
+        self.registered_waker = None;
     }
 }
 

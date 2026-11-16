@@ -70,6 +70,10 @@ struct Prepared {
     settlement_polls: std::sync::atomic::AtomicUsize,
     domain_settlement_status: std::sync::Mutex<Option<SettlementStatus>>,
     captured_manager: std::sync::Mutex<Option<OperationManager>>,
+    child_started_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    child_accepted_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    driver_waiting_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    child_handle: std::sync::Mutex<Option<qubit_operation::OperationHandle<usize, ()>>>,
 }
 
 struct BindGate {
@@ -242,6 +246,10 @@ impl Prepared {
             settlement_polls: std::sync::atomic::AtomicUsize::new(0),
             domain_settlement_status: std::sync::Mutex::new(None),
             captured_manager: std::sync::Mutex::new(None),
+            child_started_tx: std::sync::Mutex::new(None),
+            child_accepted_tx: std::sync::Mutex::new(None),
+            driver_waiting_tx: std::sync::Mutex::new(None),
+            child_handle: std::sync::Mutex::new(None),
         })
     }
 
@@ -299,6 +307,28 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
         }
         *self.activation_thread.lock().unwrap() = std::thread::current().name().map(str::to_owned);
         *self.captured_manager.lock().unwrap() = Some(scope.manager());
+        if let Some(started) = self.child_started_tx.lock().unwrap().take() {
+            let parent = Arc::clone(&self);
+            let child = scope
+                .manager()
+                .try_submit(OperationOptions::default(), move |_| {
+                    let _ = started.send(());
+                    parent.release_outcome();
+                    parent.release_inputs();
+                    parent.release_summary();
+                    parent.release_settlement();
+                    Ok::<usize, ()>(41)
+                })
+                .map_err(|_| ExecutionFailure {
+                    operation_id: self.id.lock().unwrap().expect("bound before activation"),
+                    summary: DiagnosticSummary::new("probe child admission failed"),
+                    source: None,
+                })?;
+            *self.child_handle.lock().unwrap() = Some(child);
+            if let Some(accepted) = self.child_accepted_tx.lock().unwrap().take() {
+                let _ = accepted.send(());
+            }
+        }
         Ok(())
     }
     fn abandon(self: Arc<Self>) {
@@ -313,6 +343,9 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
         self.outcome_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if !self.outcome_ready.load(std::sync::atomic::Ordering::SeqCst) {
             *self.outcome_waker.lock().unwrap() = Some(cx.waker().clone());
+            if let Some(sender) = self.driver_waiting_tx.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
             return Poll::Pending;
         }
         Poll::Ready(
@@ -356,6 +389,10 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
         domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
+        child_started_tx: std::sync::Mutex::new(None),
+        child_accepted_tx: std::sync::Mutex::new(None),
+        driver_waiting_tx: std::sync::Mutex::new(None),
+        child_handle: std::sync::Mutex::new(None),
     });
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
@@ -445,6 +482,10 @@ fn test_post_claim_bind_failure_is_accepted_and_abandoned_once() {
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
         domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
+        child_started_tx: std::sync::Mutex::new(None),
+        child_accepted_tx: std::sync::Mutex::new(None),
+        driver_waiting_tx: std::sync::Mutex::new(None),
+        child_handle: std::sync::Mutex::new(None),
     });
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
@@ -494,6 +535,10 @@ fn test_stop_during_bind_wins_before_commit_and_abandons_without_activation() {
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
         domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
+        child_started_tx: std::sync::Mutex::new(None),
+        child_accepted_tx: std::sync::Mutex::new(None),
+        driver_waiting_tx: std::sync::Mutex::new(None),
+        child_handle: std::sync::Mutex::new(None),
     });
     let submit_manager = manager.clone();
     let submit_prepared = Arc::clone(&prepared);
@@ -520,7 +565,7 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let (child_manager_tx, child_manager_rx) = std::sync::mpsc::channel();
     let (close_parent_tx, close_parent_rx) = std::sync::mpsc::channel();
-    let parent = manager
+    let mut parent = manager
         .submit(OperationOptions::default(), move |scope| {
             child_manager_tx.send(scope.manager()).unwrap();
             close_parent_rx.recv().unwrap();
@@ -562,6 +607,10 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
         domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
+        child_started_tx: std::sync::Mutex::new(None),
+        child_accepted_tx: std::sync::Mutex::new(None),
+        driver_waiting_tx: std::sync::Mutex::new(None),
+        child_handle: std::sync::Mutex::new(None),
     });
     let submit = std::thread::spawn({
         let prepared = Arc::clone(&prepared);
@@ -569,6 +618,10 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
     });
     entered_rx.recv().expect("child bind reached final preflight");
     close_parent_tx.send(()).unwrap();
+    assert_eq!(
+        parent.request_stop(StopReason::UserCancelled),
+        StopRequestStatus::Accepted
+    );
     let (ready, changed) = &*proceed;
     *ready.lock().unwrap() = true;
     changed.notify_all();
@@ -580,6 +633,7 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
     assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(prepared.abandon_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     child.wait_settlement().unwrap();
+    assert!(matches!(parent.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
     parent.wait_settlement().unwrap();
 }
 
@@ -615,6 +669,10 @@ fn test_already_bound_claim_rolls_back_provisional_parent_child_link() {
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
         domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
+        child_started_tx: std::sync::Mutex::new(None),
+        child_accepted_tx: std::sync::Mutex::new(None),
+        driver_waiting_tx: std::sync::Mutex::new(None),
+        child_handle: std::sync::Mutex::new(None),
     });
     let mut first = first_manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
@@ -674,6 +732,10 @@ fn test_dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
         domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
+        child_started_tx: std::sync::Mutex::new(None),
+        child_accepted_tx: std::sync::Mutex::new(None),
+        driver_waiting_tx: std::sync::Mutex::new(None),
+        child_handle: std::sync::Mutex::new(None),
     });
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
@@ -1128,6 +1190,172 @@ fn block_on<F: Future>(future: F) -> F::Output {
 }
 
 #[test]
+fn test_sync_external_child_can_progress_without_releasing_driver() {
+    let options = ManagerOptions {
+        sync_executor: ThreadPoolExecutorOptions {
+            worker_count: 1,
+            queue_capacity: 1,
+        },
+        ..ManagerOptions::default()
+    };
+    let manager = OperationManager::new(options).unwrap();
+    let probe = Prepared::ready_fixture();
+    probe.release_ready.store(false, std::sync::atomic::Ordering::SeqCst);
+    probe.outcome_ready.store(false, std::sync::atomic::Ordering::SeqCst);
+    probe.summary_ready.store(false, std::sync::atomic::Ordering::SeqCst);
+    probe.settlement_ready.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    *probe.child_started_tx.lock().unwrap() = Some(started_tx);
+    *probe.child_accepted_tx.lock().unwrap() = Some(accepted_tx);
+    *probe.driver_waiting_tx.lock().unwrap() = Some(waiting_tx);
+    let mut parent = manager
+        .try_submit_external(OperationOptions::default(), Arc::clone(&probe))
+        .unwrap();
+
+    let accepted = accepted_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+    let driver_waiting = waiting_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+    let started_without_escape = started_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+
+    // Keep the independent escape for failure cleanup; a correct async driver
+    // lets the accepted sync child provide the facts without it.
+    if !started_without_escape {
+        probe.release_outcome();
+        probe.release_inputs();
+        probe.release_summary();
+        probe.release_settlement();
+    }
+    let outcome = parent.wait_outcome();
+    let settlement = parent.wait_settlement();
+    let child_result = probe
+        .child_handle
+        .lock()
+        .unwrap()
+        .take()
+        .map(|mut child| child.wait_outcome());
+    let started_after_cleanup =
+        started_without_escape || started_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+
+    assert!(accepted, "child was accepted by the parent scope");
+    assert!(
+        driver_waiting || started_without_escape,
+        "driver either registered Pending or the accepted child completed first"
+    );
+    assert!(
+        started_without_escape,
+        "child progresses while the external driver is waiting"
+    );
+    assert!(started_after_cleanup, "child was observed before cleanup completed");
+    assert!(matches!(outcome.unwrap(), OperationOutcome::Succeeded(7)));
+    settlement.unwrap();
+    assert!(matches!(
+        child_result.unwrap().unwrap(),
+        OperationOutcome::Succeeded(41)
+    ));
+}
+
+#[test]
+fn test_sync_external_rejects_when_async_capacity_is_full_without_claiming_arc() {
+    let options = ManagerOptions {
+        async_executor: qubit_operation::PortableExecutorOptions {
+            worker_count: 1,
+            task_capacity: 1,
+            polls_per_turn: 1,
+        },
+        ..ManagerOptions::default()
+    };
+    let manager = OperationManager::new(options).unwrap();
+    let async_manager = manager.as_async();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut blocker = async_manager
+        .try_submit(OperationOptions::default(), move |_| async move {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+    started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+
+    let prepared = Prepared::ready_fixture();
+    let result = manager.try_submit_external(OperationOptions::default(), Arc::clone(&prepared));
+    let rejection = match result {
+        Err(error) => Some(error.into_parts()),
+        Ok(mut accepted) => {
+            let _ = accepted.wait_outcome();
+            let _ = accepted.wait_settlement();
+            None
+        }
+    };
+
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        block_on(blocker.wait_outcome()).unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    block_on(blocker.wait_settlement());
+
+    assert!(rejection.is_some(), "full async executor rejects external driver");
+    let (reason, returned) = rejection.unwrap();
+    assert_eq!(reason, AdmissionError::Busy);
+    assert!(Arc::ptr_eq(&returned, &prepared));
+    assert!(prepared.id.lock().unwrap().is_none(), "rejection occurs before bind");
+    assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn test_sync_external_uses_async_capacity_when_sync_pool_is_busy() {
+    let options = ManagerOptions {
+        sync_executor: ThreadPoolExecutorOptions {
+            worker_count: 1,
+            queue_capacity: 1,
+        },
+        ..ManagerOptions::default()
+    };
+    let manager = OperationManager::new(options).unwrap();
+    let (running_tx, running_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut running = manager
+        .try_submit(OperationOptions::default(), move |_| {
+            let _ = running_tx.send(());
+            let _ = release_rx.recv();
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+    running_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    let mut queued = manager
+        .try_submit(OperationOptions::default(), |_| Ok::<(), ()>(()))
+        .unwrap();
+
+    let prepared = Prepared::ready_fixture();
+    let submitted = manager.try_submit_external(OperationOptions::default(), Arc::clone(&prepared));
+    assert!(
+        submitted.is_ok(),
+        "external driver is admitted independently of busy sync workers"
+    );
+    let mut external = submitted.unwrap();
+    assert!(matches!(
+        external.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(7)
+    ));
+    external.wait_settlement().unwrap();
+    assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    release_tx.send(()).unwrap();
+    assert!(matches!(
+        running.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    assert!(matches!(
+        queued.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    running.wait_settlement().unwrap();
+    queued.wait_settlement().unwrap();
+}
+
+#[test]
 fn test_async_manager_drives_external_activation_on_portable_executor() {
     let manager = AsyncOperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Arc::new(Prepared {
@@ -1158,6 +1386,10 @@ fn test_async_manager_drives_external_activation_on_portable_executor() {
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
         domain_settlement_status: std::sync::Mutex::new(None),
         captured_manager: std::sync::Mutex::new(None),
+        child_started_tx: std::sync::Mutex::new(None),
+        child_accepted_tx: std::sync::Mutex::new(None),
+        driver_waiting_tx: std::sync::Mutex::new(None),
+        child_handle: std::sync::Mutex::new(None),
     });
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))

@@ -80,7 +80,11 @@ impl AsyncOperationManager {
     /// # Parameters
     ///
     /// - `options`: Admission and resource settings for the operation.
-    /// - `prepared`: Task that the manager binds and drives asynchronously.
+    /// - `prepared`: Task that the manager binds and drives on its bounded
+    ///   async executor.
+    ///
+    /// Adapter callbacks should return promptly. Do not block a portable
+    /// executor worker while waiting for child work scheduled on that executor.
     ///
     /// # Returns
     ///
