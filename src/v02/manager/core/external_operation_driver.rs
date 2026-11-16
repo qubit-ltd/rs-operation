@@ -216,14 +216,10 @@ pub async fn drive_external<T, E, P>(
             if activated {
                 let expected = typed.as_ref().map(|value| child_outcome_summary(operation_id, value));
                 if summary_poll_failed
-                    || summary
-                        .as_ref()
-                        .is_none_or(|value| {
-                            value.operation_id != operation_id
-                                || expected
-                                    .as_ref()
-                                    .is_none_or(|expected| value.kind != expected.kind)
-                        })
+                    || summary.as_ref().is_none_or(|value| {
+                        value.operation_id != operation_id
+                            || expected.as_ref().is_none_or(|expected| value.kind != expected.kind)
+                    })
                 {
                     typed = Some(OperationOutcome::ExecutionFailed(
                         crate::v02::report::ExecutionFailure {

@@ -123,7 +123,11 @@ impl OperationControl for Prepared {
             3 => (ChildOutcomeKind::Failed, "failure classification mismatch"),
             _ => (ChildOutcomeKind::Succeeded, "inference completed"),
         };
-        Poll::Ready(ChildOutcomeSummary { operation_id, kind, summary: DiagnosticSummary::new(summary) })
+        Poll::Ready(ChildOutcomeSummary {
+            operation_id,
+            kind,
+            summary: DiagnosticSummary::new(summary),
+        })
     }
     fn poll_release(&self, cx: &mut Context<'_>) -> Poll<ChildRelease> {
         assert_eq!(
@@ -153,7 +157,11 @@ impl OperationControl for Prepared {
             return Poll::Pending;
         }
         let operation_id = self.id.lock().unwrap().expect("bound before polling");
-        let status = self.domain_settlement_status.lock().unwrap().unwrap_or(SettlementStatus::Released);
+        let status = self
+            .domain_settlement_status
+            .lock()
+            .unwrap()
+            .unwrap_or(SettlementStatus::Released);
         let recovery = status == SettlementStatus::RecoveryRequired;
         let transferred = status == SettlementStatus::Transferred;
         Poll::Ready(Arc::new(SettlementReport {
@@ -307,7 +315,13 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
             *self.outcome_waker.lock().unwrap() = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        Poll::Ready(self.typed_outcome.lock().unwrap().take().unwrap_or(OperationOutcome::Succeeded(7)))
+        Poll::Ready(
+            self.typed_outcome
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(OperationOutcome::Succeeded(7)),
+        )
     }
 }
 
@@ -334,9 +348,9 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
-            summary_kind: std::sync::atomic::AtomicUsize::new(0),
-            summary_id: std::sync::Mutex::new(None),
-            typed_outcome: std::sync::Mutex::new(None),
+        summary_kind: std::sync::atomic::AtomicUsize::new(0),
+        summary_id: std::sync::Mutex::new(None),
+        typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -371,7 +385,10 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
     );
     prepared.release_inputs();
     let report = handle.wait_settlement().unwrap();
-    let external = report.external_settlement.as_ref().expect("domain report must be retained");
+    let external = report
+        .external_settlement
+        .as_ref()
+        .expect("domain report must be retained");
     assert_eq!(external.operation_id, report.operation_id);
     assert_eq!(external.effects.len(), 1);
     assert_eq!(external.effects_total, 2);
@@ -420,9 +437,9 @@ fn test_post_claim_bind_failure_is_accepted_and_abandoned_once() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
-            summary_kind: std::sync::atomic::AtomicUsize::new(0),
-            summary_id: std::sync::Mutex::new(None),
-            typed_outcome: std::sync::Mutex::new(None),
+        summary_kind: std::sync::atomic::AtomicUsize::new(0),
+        summary_id: std::sync::Mutex::new(None),
+        typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -469,9 +486,9 @@ fn test_stop_during_bind_wins_before_commit_and_abandons_without_activation() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
-            summary_kind: std::sync::atomic::AtomicUsize::new(0),
-            summary_id: std::sync::Mutex::new(None),
-            typed_outcome: std::sync::Mutex::new(None),
+        summary_kind: std::sync::atomic::AtomicUsize::new(0),
+        summary_id: std::sync::Mutex::new(None),
+        typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -537,9 +554,9 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
-            summary_kind: std::sync::atomic::AtomicUsize::new(0),
-            summary_id: std::sync::Mutex::new(None),
-            typed_outcome: std::sync::Mutex::new(None),
+        summary_kind: std::sync::atomic::AtomicUsize::new(0),
+        summary_id: std::sync::Mutex::new(None),
+        typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -590,9 +607,9 @@ fn test_already_bound_claim_rolls_back_provisional_parent_child_link() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
-            summary_kind: std::sync::atomic::AtomicUsize::new(0),
-            summary_id: std::sync::Mutex::new(None),
-            typed_outcome: std::sync::Mutex::new(None),
+        summary_kind: std::sync::atomic::AtomicUsize::new(0),
+        summary_id: std::sync::Mutex::new(None),
+        typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -649,9 +666,9 @@ fn test_dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
-            summary_kind: std::sync::atomic::AtomicUsize::new(0),
-            summary_id: std::sync::Mutex::new(None),
-            typed_outcome: std::sync::Mutex::new(None),
+        summary_kind: std::sync::atomic::AtomicUsize::new(0),
+        summary_id: std::sync::Mutex::new(None),
+        typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),
@@ -833,10 +850,13 @@ fn test_typed_result_waits_for_matching_summary_when_facts_arrive_out_of_order()
 fn test_external_summary_diagnostics_are_free_for_failed_and_stopped_outcomes() {
     for (kind, outcome) in [
         (1, OperationOutcome::Failed(())),
-        (2, OperationOutcome::Stopped(qubit_operation::StopReport {
-            reason: StopReason::UserCancelled,
-            accepted_at: None,
-        })),
+        (
+            2,
+            OperationOutcome::Stopped(qubit_operation::StopReport {
+                reason: StopReason::UserCancelled,
+                accepted_at: None,
+            }),
+        ),
     ] {
         let manager = OperationManager::new(ManagerOptions::default()).unwrap();
         let prepared = Prepared::ready_fixture();
@@ -869,7 +889,10 @@ fn test_domain_settlement_is_retained_and_drives_overall_status() {
 
         assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
         let report = handle.wait_settlement().unwrap();
-        let external = report.external_settlement.as_ref().expect("domain evidence must be retained");
+        let external = report
+            .external_settlement
+            .as_ref()
+            .expect("domain evidence must be retained");
         assert_eq!(external.status, domain_status);
         assert_eq!(report.status, expected_status);
         assert_eq!(external.effects.len(), 1);
@@ -898,7 +921,10 @@ fn test_external_summary_rejects_wrong_classification_and_identity() {
         .unwrap();
     let foreign_id = first.id.lock().unwrap().expect("first operation is bound");
     let mut first_handle = first_handle;
-    assert!(matches!(first_handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
+    assert!(matches!(
+        first_handle.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(7)
+    ));
     first_handle.wait_settlement().unwrap();
 
     let wrong_kind = Prepared::ready_fixture();
@@ -906,7 +932,10 @@ fn test_external_summary_rejects_wrong_classification_and_identity() {
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&wrong_kind))
         .unwrap();
-    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::ExecutionFailed(_)));
+    assert!(matches!(
+        handle.wait_outcome().unwrap(),
+        OperationOutcome::ExecutionFailed(_)
+    ));
     handle.wait_settlement().unwrap();
 
     let wrong_id = Prepared::ready_fixture();
@@ -914,7 +943,10 @@ fn test_external_summary_rejects_wrong_classification_and_identity() {
     let mut handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&wrong_id))
         .unwrap();
-    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::ExecutionFailed(_)));
+    assert!(matches!(
+        handle.wait_outcome().unwrap(),
+        OperationOutcome::ExecutionFailed(_)
+    ));
     handle.wait_settlement().unwrap();
 }
 
@@ -1118,9 +1150,9 @@ fn test_async_manager_drives_external_activation_on_portable_executor() {
         summary_ready: std::sync::atomic::AtomicBool::new(true),
         summary_waker: std::sync::Mutex::new(None),
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
-            summary_kind: std::sync::atomic::AtomicUsize::new(0),
-            summary_id: std::sync::Mutex::new(None),
-            typed_outcome: std::sync::Mutex::new(None),
+        summary_kind: std::sync::atomic::AtomicUsize::new(0),
+        summary_id: std::sync::Mutex::new(None),
+        typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
         settlement_polls: std::sync::atomic::AtomicUsize::new(0),

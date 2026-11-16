@@ -7,13 +7,14 @@
 // =============================================================================
 
 //! Resource-valued results must be consumed and dropped before settlement.
+use std::sync::Arc;
+
 use qubit_operation::ObservationError;
 use qubit_operation::OperationHandle;
 use qubit_operation::OperationOutcome;
 use qubit_operation::OutcomeError;
 use qubit_operation::ResourceRef;
 use qubit_operation::SettlementReport;
-use std::sync::Arc;
 
 /// Process either resource-valued result, release it, and then observe cleanup.
 pub fn consume_and_settle(

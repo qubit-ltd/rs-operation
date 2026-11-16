@@ -108,6 +108,9 @@ impl SettlementReport {
         self.status == SettlementStatus::Released
             && self.transferred_count == 0
             && self.recovery_count == 0
-            && self.external_settlement.as_ref().is_none_or(|report| report.all_released())
+            && self
+                .external_settlement
+                .as_ref()
+                .is_none_or(|report| report.all_released())
     }
 }

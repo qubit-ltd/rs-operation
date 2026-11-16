@@ -200,8 +200,7 @@ fn is_pending<F: Future>(future: Pin<&mut F>) -> bool {
 
 #[test]
 fn test_sync_success_resource_result_is_dropped_before_settlement() {
-    let manager =
-        qubit_operation::OperationManager::new(qubit_operation::ManagerOptions::default()).unwrap();
+    let manager = qubit_operation::OperationManager::new(qubit_operation::ManagerOptions::default()).unwrap();
     let mut handle = manager
         .try_submit(Default::default(), |scope| {
             Ok::<_, ()>(scope.manage(String::from("kept")).unwrap())
@@ -209,9 +208,7 @@ fn test_sync_success_resource_result_is_dropped_before_settlement() {
         .unwrap();
     let outcome = handle.wait_outcome().unwrap();
     assert!(matches!(
-        handle
-            .wait_settlement_for(std::time::Duration::ZERO)
-            .unwrap(),
+        handle.wait_settlement_for(std::time::Duration::ZERO).unwrap(),
         qubit_operation::SettlementWait::Pending(_)
     ));
     drop(outcome);
@@ -220,8 +217,7 @@ fn test_sync_success_resource_result_is_dropped_before_settlement() {
 
 #[test]
 fn test_sync_error_resource_result_is_dropped_before_settlement() {
-    let manager =
-        qubit_operation::OperationManager::new(qubit_operation::ManagerOptions::default()).unwrap();
+    let manager = qubit_operation::OperationManager::new(qubit_operation::ManagerOptions::default()).unwrap();
     let mut handle = manager
         .try_submit(Default::default(), |scope| {
             Err::<(), _>(scope.manage(String::from("kept")).unwrap())
@@ -229,9 +225,7 @@ fn test_sync_error_resource_result_is_dropped_before_settlement() {
         .unwrap();
     let outcome = handle.wait_outcome().unwrap();
     assert!(matches!(
-        handle
-            .wait_settlement_for(std::time::Duration::ZERO)
-            .unwrap(),
+        handle.wait_settlement_for(std::time::Duration::ZERO).unwrap(),
         qubit_operation::SettlementWait::Pending(_)
     ));
     drop(outcome);
@@ -240,9 +234,7 @@ fn test_sync_error_resource_result_is_dropped_before_settlement() {
 
 #[test]
 fn test_async_success_resource_result_is_dropped_before_settlement() {
-    let manager =
-        qubit_operation::AsyncOperationManager::new(qubit_operation::ManagerOptions::default())
-            .unwrap();
+    let manager = qubit_operation::AsyncOperationManager::new(qubit_operation::ManagerOptions::default()).unwrap();
     let mut handle = manager
         .try_submit(Default::default(), |scope| async move {
             Ok::<_, ()>(scope.manage(String::from("kept")).unwrap())
@@ -257,9 +249,7 @@ fn test_async_success_resource_result_is_dropped_before_settlement() {
 
 #[test]
 fn test_async_error_resource_result_is_dropped_before_settlement() {
-    let manager =
-        qubit_operation::AsyncOperationManager::new(qubit_operation::ManagerOptions::default())
-            .unwrap();
+    let manager = qubit_operation::AsyncOperationManager::new(qubit_operation::ManagerOptions::default()).unwrap();
     let mut handle = manager
         .try_submit(Default::default(), |scope| async move {
             Err::<(), _>(scope.manage(String::from("kept")).unwrap())
@@ -274,8 +264,7 @@ fn test_async_error_resource_result_is_dropped_before_settlement() {
 
 #[test]
 fn test_run_and_settle_remains_suitable_for_owned_values() {
-    let sync =
-        qubit_operation::OperationManager::new(qubit_operation::ManagerOptions::default()).unwrap();
+    let sync = qubit_operation::OperationManager::new(qubit_operation::ManagerOptions::default()).unwrap();
     assert!(matches!(
         sync.run_and_settle(Default::default(), |_| Ok::<_, String>(42usize))
             .unwrap()
@@ -283,22 +272,16 @@ fn test_run_and_settle_remains_suitable_for_owned_values() {
         qubit_operation::OperationOutcome::Succeeded(42)
     ));
     assert!(matches!(
-        sync.run_and_settle(Default::default(), |_| Err::<usize, _>(String::from(
-            "failed"
-        )))
-        .unwrap()
-        .outcome,
+        sync.run_and_settle(Default::default(), |_| Err::<usize, _>(String::from("failed")))
+            .unwrap()
+            .outcome,
         qubit_operation::OperationOutcome::Failed(_)
     ));
-    let asynchronous =
-        qubit_operation::AsyncOperationManager::new(qubit_operation::ManagerOptions::default())
-            .unwrap();
+    let asynchronous = qubit_operation::AsyncOperationManager::new(qubit_operation::ManagerOptions::default()).unwrap();
     assert!(matches!(
-        block_on(
-            asynchronous.run_and_settle(Default::default(), |_| async { Ok::<_, String>(42usize) })
-        )
-        .unwrap()
-        .outcome,
+        block_on(asynchronous.run_and_settle(Default::default(), |_| async { Ok::<_, String>(42usize) }))
+            .unwrap()
+            .outcome,
         qubit_operation::OperationOutcome::Succeeded(42)
     ));
     assert!(matches!(

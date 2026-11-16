@@ -537,7 +537,9 @@ impl ManagerCore {
             (SettlementStatus::RecoveryRequired, _) | (_, Some(SettlementStatus::RecoveryRequired)) => {
                 SettlementStatus::RecoveryRequired
             }
-            (SettlementStatus::Transferred, _) | (_, Some(SettlementStatus::Transferred)) => SettlementStatus::Transferred,
+            (SettlementStatus::Transferred, _) | (_, Some(SettlementStatus::Transferred)) => {
+                SettlementStatus::Transferred
+            }
             _ => SettlementStatus::Released,
         };
         let (effects, effects_total, effect_overflow) = scope.effect_records();

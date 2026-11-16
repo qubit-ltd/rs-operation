@@ -645,6 +645,11 @@ impl ScopeCore {
 
     /// Stores the domain report and releases the external-driver settlement
     /// reservation after all required control facts have been observed.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Scope receiving the domain report.
+    /// - `report`: Immutable settlement evidence returned by the adapter.
     pub(crate) fn finish_external_driver_settlement(&self, report: Arc<SettlementReport>) {
         let callback = {
             let mut state = lock(&self.state);
