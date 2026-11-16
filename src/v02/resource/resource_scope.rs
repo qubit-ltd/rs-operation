@@ -62,6 +62,10 @@ pub struct ResourceScope {
     state: Arc<ScopeState>,
 }
 impl ResourceScope {
+    /// Reserves resource and cleanup capacity before creating a resource.
+    pub fn reserve_resource(&self) -> Result<ResourceReservation, ResourceCapacityError> {
+        self.reserve()
+    }
     /// Creates a scope with manager identity, capacity accounting, and cleanup
     /// dispatch.
     ///

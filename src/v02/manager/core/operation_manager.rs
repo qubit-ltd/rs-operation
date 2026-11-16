@@ -64,6 +64,32 @@ pub struct OperationManager {
     pub(super) target: SubmissionTarget,
 }
 impl OperationManager {
+    /// Returns a view constrained by the supplied service group.
+    ///
+    /// Group membership admission is implemented by the follow-up scope task.
+    pub fn with_group(
+        &self,
+        _group: &crate::v02::manager::group::OperationGroup,
+    ) -> Result<Self, crate::v02::report::GroupBindingError> {
+        Err(crate::v02::report::GroupBindingError::Closed)
+    }
+
+    /// Attempts to submit a prepared external operation.
+    ///
+    /// This interface is declared in 0.3; this version's adapter driver is not
+    /// yet available, so the prepared owner is returned unchanged.
+    pub fn try_submit_external<T, E, P>(
+        &self,
+        _options: OperationOptions,
+        prepared: Arc<P>,
+    ) -> Result<OperationHandle<T, E>, SubmitError<Arc<P>>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        P: crate::v02::adapter::PreparedExternalOperation<T, E>,
+    {
+        Err(SubmitError::new(AdmissionError::ExecutorUnavailable, prepared))
+    }
     /// Constructs a manager with real bounded executors and resource cleanup.
     ///
     /// # Parameters
@@ -242,7 +268,7 @@ impl OperationManager {
     ///
     /// This manager view with its target updated to use `group`.
     #[inline]
-    pub(crate) fn with_group(mut self, group: Arc<crate::v02::manager::group::GroupCore>) -> Self {
+    pub(crate) fn with_group_core(mut self, group: Arc<crate::v02::manager::group::GroupCore>) -> Self {
         match &mut self.target {
             SubmissionTarget::Root { group: target_group } => *target_group = Some(group),
             SubmissionTarget::Parent {

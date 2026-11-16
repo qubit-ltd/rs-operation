@@ -93,3 +93,19 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
 [dev-dependencies]
 trybuild = "^1.0"
+
+[[test]]
+name = "v03_contract"
+path = "tests/v03_contract_tests.rs"
+
+[[test]]
+name = "v03_external"
+path = "tests/v03_external_tests.rs"
+
+[[test]]
+name = "v03_scope"
+path = "tests/v03_scope_tests.rs"
+
+[[test]]
+name = "v03_lifecycle"
+path = "tests/v03_lifecycle_tests.rs"

@@ -232,11 +232,28 @@ impl OperationScope {
     ///
     /// # Returns
     ///
-    /// Returns whether this call accepted the request; a repeated request
-    /// returns `false`.
+    /// Returns [`StopRequestStatus::Accepted`](crate::v02::report::StopRequestStatus::Accepted)
+    /// for a new request or [`StopRequestStatus::AlreadyRequested`](crate::v02::report::StopRequestStatus::AlreadyRequested)
+    /// when a stop request already exists. The 0.3 interface distinguishes
+    /// these outcomes instead of returning a boolean.
     #[must_use]
-    pub fn request_stop(&self, reason: StopReason) -> bool {
-        self.core.request_stop(reason)
+    pub fn request_stop(&self, reason: StopReason) -> crate::v02::report::StopRequestStatus {
+        if self.core.request_stop(reason) {
+            crate::v02::report::StopRequestStatus::Accepted
+        } else {
+            crate::v02::report::StopRequestStatus::AlreadyRequested
+        }
+    }
+
+    /// Records an application-reported effect within the inherited effect
+    /// record budget. Capacity exhaustion must preserve prior records and
+    /// increment the visible overflow count. This interface is frozen for 0.3;
+    /// effect storage is implemented by the subsequent scope task.
+    pub fn record_effect(
+        &self,
+        _record: crate::v02::report::EffectRecord,
+    ) -> Result<(), crate::v02::report::EffectRecordError> {
+        Err(crate::v02::report::EffectRecordError::ScopeEnded)
     }
 
     /// Resolves the body result against required-child failures and stop state.

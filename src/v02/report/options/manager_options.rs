@@ -51,6 +51,8 @@ pub struct ManagerOptions {
     pub cleanup_executor: ThreadPoolExecutorOptions,
     /// Optional manager clock; operation context may override it.
     pub clock: Option<Arc<dyn ClockSource>>,
+    /// Maximum distinct service groups that can bind one operation.
+    pub max_groups_per_operation: usize,
 }
 
 impl Default for ManagerOptions {
@@ -63,6 +65,7 @@ impl Default for ManagerOptions {
             sync_executor: ThreadPoolExecutorOptions::default(),
             cleanup_executor: ThreadPoolExecutorOptions::default(),
             clock: None,
+            max_groups_per_operation: 16,
         }
     }
 }

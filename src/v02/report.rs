@@ -43,6 +43,7 @@ pub use effect::EffectFact;
 pub use effect::EffectRecord;
 pub use effect::EffectRecordError;
 pub use group::GroupSnapshot;
+pub use group::GroupBindingError;
 pub use identity::GroupId;
 pub use identity::ManagerId;
 pub use identity::OperationId;

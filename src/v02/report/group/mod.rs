@@ -7,4 +7,6 @@
 // =============================================================================
 
 mod group_snapshot;
+mod group_binding_error;
 pub use group_snapshot::GroupSnapshot;
+pub use group_binding_error::GroupBindingError;

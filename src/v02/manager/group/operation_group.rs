@@ -73,7 +73,7 @@ impl OperationGroup {
             });
         }
         let core = GroupCore::new(options.capacity);
-        let manager = manager.with_group(Arc::clone(&core));
+        let manager = manager.with_group_core(Arc::clone(&core));
         Ok(Self {
             manager,
             core,

@@ -50,6 +50,8 @@ pub enum AdmissionError {
     CapacityExceeded,
     /// The selected executor cannot accept the operation.
     ExecutorUnavailable,
+    /// The prepared external operation is already bound elsewhere.
+    AlreadyBound,
     /// Blocking for admission would deadlock the current executor.
     WouldDeadlock,
 }

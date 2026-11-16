@@ -62,6 +62,22 @@ pub struct AsyncOperationManager {
     target: SubmissionTarget,
 }
 impl AsyncOperationManager {
+    /// Attempts to submit a prepared external operation.
+    ///
+    /// This interface is declared in 0.3; this version's adapter driver is not
+    /// yet available, so the prepared owner is returned unchanged.
+    pub fn try_submit_external<T, E, P>(
+        &self,
+        _options: OperationOptions,
+        prepared: Arc<P>,
+    ) -> Result<AsyncOperationHandle<T, E>, SubmitError<Arc<P>>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        P: crate::v02::adapter::PreparedExternalOperation<T, E>,
+    {
+        Err(SubmitError::new(AdmissionError::ExecutorUnavailable, prepared))
+    }
     /// Constructs an async view with real bounded executors and cleanup.
     ///
     /// # Parameters

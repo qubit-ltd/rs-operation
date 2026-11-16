@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `OperationScope` in the current scope
+ --> tests/ui/v03/scope_clone.rs:4:23
+  |
+4 |     let _copy = scope.clone();
+  |                       ^^^^^ method not found in `OperationScope`
