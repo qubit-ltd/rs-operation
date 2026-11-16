@@ -108,7 +108,7 @@ impl OperationControl for Prepared {
         Poll::Ready(ChildOutcomeSummary {
             operation_id: self.id.lock().unwrap().expect("bound before polling"),
             kind: ChildOutcomeKind::Succeeded,
-            summary: DiagnosticSummary::new("child succeeded"),
+            summary: DiagnosticSummary::new("inference completed"),
         })
     }
     fn poll_release(&self, cx: &mut Context<'_>) -> Poll<ChildRelease> {
