@@ -241,4 +241,19 @@ impl PortableExecutor {
     pub(crate) fn set_capacity_callback(&self, callback: Arc<dyn Fn() + Send + Sync + 'static>) {
         *lock(&self.inner.capacity_callback) = Some(callback);
     }
+
+    /// Returns a waker for one idle retained task in internal lifecycle tests.
+    #[cfg(test)]
+    pub(crate) fn test_active_task_waker(&self) -> Option<std::task::Waker> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while *lock(&self.inner.pollers) != 0 {
+            assert!(std::time::Instant::now() < deadline, "portable poll should finish");
+            thread::yield_now();
+        }
+        lock(&self.inner.state)
+            .active
+            .first()
+            .cloned()
+            .map(std::task::Waker::from)
+    }
 }

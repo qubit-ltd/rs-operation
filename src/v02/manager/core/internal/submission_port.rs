@@ -77,6 +77,13 @@ pub(crate) trait SubmissionPort: Send + Sync + 'static {
     ///
     /// - `_phase`: The manager phase to propagate to executor admission.
     fn phase_changed(&self, _phase: ManagerPhase) {}
+
+    /// Wakes a retained async task for an internal lifecycle test.
+    #[cfg(test)]
+    fn test_active_async_task_waker(&self) -> Option<std::task::Waker> {
+        None
+    }
+
     /// Stops executor workers after all manager-owned state has drained.
     ///
     /// # Parameters

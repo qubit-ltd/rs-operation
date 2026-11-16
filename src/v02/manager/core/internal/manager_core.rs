@@ -1169,6 +1169,11 @@ impl ManagerCore {
 
 impl ManagerCore {
     #[cfg(test)]
+    pub(crate) fn test_active_async_task_waker(&self) -> Option<std::task::Waker> {
+        self.port.test_active_async_task_waker()
+    }
+
+    #[cfg(test)]
     pub(crate) fn record_test_value(&self, value: usize) {
         lock(&self.state).values.push(value);
     }

@@ -491,3 +491,88 @@ impl AsyncOperationManager {
             .submit_async_scope(&self.target, OperationOptions::default(), body)
     }
 }
+
+#[cfg(test)]
+mod production_pending_tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use super::AsyncOperationManager;
+    use crate::v02::report::ManagerOptions;
+    use crate::v02::report::OperationOptions;
+    use crate::v02::report::OperationOutcome;
+    use crate::v02::report::ShutdownMode;
+    use crate::v02::report::ShutdownWait;
+
+    struct PendingWithoutSavedWaker {
+        first_poll: Option<mpsc::Sender<()>>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Future for PendingWithoutSavedWaker {
+        type Output = Result<(), ()>;
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            if let Some(first_poll) = self.get_mut().first_poll.take() {
+                first_poll.send(()).unwrap();
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    impl Drop for PendingWithoutSavedWaker {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_production_manager_retains_pending_operation_without_saved_waker() {
+        let manager = AsyncOperationManager::new(ManagerOptions::default()).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (first_poll, polled) = mpsc::channel();
+        let mut operation = manager
+            .try_submit(OperationOptions::default(), {
+                let drops = Arc::clone(&drops);
+                move |_| PendingWithoutSavedWaker {
+                    first_poll: Some(first_poll),
+                    drops,
+                }
+            })
+            .unwrap()
+            .into_sync();
+
+        polled
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the production manager should poll the async operation");
+        let task_waker = manager.core.test_active_async_task_waker();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        task_waker
+            .expect("the production executor should retain the pending task")
+            .wake();
+
+        assert!(matches!(
+            operation.wait_outcome().unwrap(),
+            OperationOutcome::Succeeded(())
+        ));
+        assert!(operation.wait_settlement().unwrap().all_released());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            manager
+                .as_sync()
+                .request_shutdown(ShutdownMode::Drain)
+                .wait_for(Duration::from_secs(3))
+                .unwrap(),
+            ShutdownWait::Completed(_)
+        ));
+    }
+}

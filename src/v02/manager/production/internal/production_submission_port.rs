@@ -347,6 +347,12 @@ impl SubmissionPort for ProductionSubmissionPort {
         })
     }
 
+    /// Wakes one retained async task for an internal lifecycle test.
+    #[cfg(test)]
+    fn test_active_async_task_waker(&self) -> Option<std::task::Waker> {
+        self.asynchronous.test_active_task_waker()
+    }
+
     /// Waits asynchronously until the root or child admission pools can be
     /// acquired.
     ///
