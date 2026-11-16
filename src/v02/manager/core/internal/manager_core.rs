@@ -175,7 +175,10 @@ impl ManagerCore {
     #[must_use]
     #[inline]
     pub(crate) fn adapter_start_allowed(&self) -> bool {
-        matches!(lock(&self.state).phase, ManagerPhase::Open | ManagerPhase::Draining)
+        matches!(
+            lock(&self.state).phase,
+            ManagerPhase::Open | ManagerPhase::Draining
+        )
     }
 
     /// Creates the root sync view sharing this coordinator.
@@ -188,7 +191,10 @@ impl ManagerCore {
     ///
     /// - `self`: coordinator shared by the returned root view.
     pub(crate) fn root_view(self: &Arc<Self>) -> OperationManager {
-        OperationManager::from_parts(Arc::clone(self), SubmissionTarget::Root { groups: Vec::new() })
+        OperationManager::from_parts(
+            Arc::clone(self),
+            SubmissionTarget::Root { groups: Vec::new() },
+        )
     }
 
     /// Creates a child-targeted view that becomes invalid when `scope` ends.
@@ -250,7 +256,7 @@ impl ManagerCore {
     where
         F: Send + 'static,
     {
-        self.reserve_scope_with_preflight(target, options, execution, body, |_| Ok(()))
+        self.reserve_scope_with_preflight(target, options, execution, body, |_| Ok(()), false)
     }
 
     /// Reserves a scope while running a one-shot identity claim after
@@ -262,6 +268,7 @@ impl ManagerCore {
         execution: ExecutionKind,
         body: F,
         preflight: C,
+        allow_claimed_after_close: bool,
     ) -> Result<(F, OperationId, Arc<ScopeCore>, SubmissionReservation), SubmitError<F>>
     where
         F: Send + 'static,
@@ -282,10 +289,11 @@ impl ManagerCore {
                 (Some((*id, scope)), groups)
             }
         };
-        let group_permits = match crate::v02::manager::group::GroupCore::reserve_many(groups, parent.is_some()) {
-            Ok(permits) => permits,
-            Err(reason) => return Err(SubmitError::new(reason, body)),
-        };
+        let group_permits =
+            match crate::v02::manager::group::GroupCore::reserve_many(groups, parent.is_some()) {
+                Ok(permits) => permits,
+                Err(reason) => return Err(SubmitError::new(reason, body)),
+            };
         if options.limits == ScopeLimits::default() {
             options.limits = self.scope_limits;
         }
@@ -311,12 +319,6 @@ impl ManagerCore {
             Ok(permit) => permit,
             Err(reason) => return Err(SubmitError::new(reason, body)),
         };
-        // Invoke foreign code after reversible admission and outside internal
-        // locks, but before registering the operation with its parent/groups.
-        if let Err(reason) = preflight(id) {
-            return Err(SubmitError::new(reason, body));
-        }
-        self.track_resource_recoveries(&permit.resource_scope, groups.clone());
         let scope_core = ScopeCore::new(ScopeCoreInit {
             id,
             manager: Arc::downgrade(self),
@@ -328,14 +330,46 @@ impl ManagerCore {
             resource_scope: permit.resource_scope.internal_clone(),
             groups: groups.clone(),
         });
+        // Reserve the parent relationship before bind, while keeping foreign
+        // code outside locks. This lets parent shutdown see pending work.
+        let provisional_parent = allow_claimed_after_close
+            && parent.as_ref().is_some_and(|(_, parent_scope)| {
+                parent_scope.reserve_child(
+                    id,
+                    Arc::downgrade(&scope_core),
+                    scope_core.options().requirement,
+                )
+            });
+        if allow_claimed_after_close && parent.is_some() && !provisional_parent {
+            return Err(SubmitError::new(AdmissionError::ScopeEnded, body));
+        }
+        if let Err(reason) = preflight(id) {
+            if provisional_parent {
+                parent
+                    .as_ref()
+                    .expect("parent reservation has a parent")
+                    .1
+                    .rollback_child_reservation(id);
+            }
+            return Err(SubmitError::new(reason, body));
+        }
+        if provisional_parent {
+            parent
+                .as_ref()
+                .expect("parent reservation has a parent")
+                .1
+                .commit_child_reservation(id);
+        }
+        self.track_resource_recoveries(&permit.resource_scope, groups.clone());
         {
             let mut state = lock(&self.state);
-            let allowed = match (state.phase, parent_id) {
-                (ManagerPhase::Open, _) => true,
-                (ManagerPhase::Draining, Some(_)) => true,
-                (ManagerPhase::Draining, None) => false,
-                (ManagerPhase::Cancelling | ManagerPhase::Closed, _) => false,
-            };
+            let allowed = allow_claimed_after_close
+                || match (state.phase, parent_id) {
+                    (ManagerPhase::Open, _) => true,
+                    (ManagerPhase::Draining, Some(_)) => true,
+                    (ManagerPhase::Draining, None) => false,
+                    (ManagerPhase::Cancelling | ManagerPhase::Closed, _) => false,
+                };
             if !allowed {
                 drop(state);
                 return Err(SubmitError::new(
@@ -347,20 +381,27 @@ impl ManagerCore {
                     body,
                 ));
             }
-            let register_result = crate::v02::manager::group::GroupCore::register_scope_many_with(
-                groups,
-                id,
-                Arc::downgrade(&scope_core),
-                parent_id.is_some(),
-                || {
-                    if let Some((_, parent_scope)) = parent.as_ref()
-                        && !parent_scope.mark_child(id, Arc::downgrade(&scope_core), scope_core.options().requirement)
-                    {
-                        return Err(AdmissionError::ScopeEnded);
-                    }
-                    Ok(())
-                },
-            );
+            let register_result =
+                crate::v02::manager::group::GroupCore::register_scope_many_with_claimed(
+                    groups,
+                    id,
+                    Arc::downgrade(&scope_core),
+                    parent_id.is_some() || allow_claimed_after_close,
+                    allow_claimed_after_close,
+                    || {
+                        if !provisional_parent
+                            && let Some((_, parent_scope)) = parent.as_ref()
+                            && !parent_scope.mark_child(
+                                id,
+                                Arc::downgrade(&scope_core),
+                                scope_core.options().requirement,
+                            )
+                        {
+                            return Err(AdmissionError::ScopeEnded);
+                        }
+                        Ok(())
+                    },
+                );
             if let Err(reason) = register_result {
                 drop(state);
                 return Err(SubmitError::new(reason, body));
@@ -369,10 +410,18 @@ impl ManagerCore {
             #[cfg(test)]
             state.relationships.push((id, parent_id));
         }
+        let group_cancelled = allow_claimed_after_close
+            && groups
+                .iter()
+                .any(|group| group.mode() == crate::v02::report::ShutdownMode::Cancel);
+        if group_cancelled {
+            scope_core.request_stop(crate::v02::report::StopReason::ParentStopped);
+        }
         let mut permit = permit;
         for group_permit in group_permits {
             permit.lifecycle = Arc::new(crate::v02::manager::group::GroupLease::new(
-                Arc::clone(&permit.lifecycle), group_permit,
+                Arc::clone(&permit.lifecycle),
+                group_permit,
             ));
         }
         Ok((body, id, scope_core, permit))
@@ -388,16 +437,22 @@ impl ManagerCore {
     where
         F: FnOnce(OperationScope) + Send + 'static,
     {
-        let (body, id, scope_core, permit) = self.reserve_scope(target, options, ExecutionKind::Sync, body)?;
+        let (body, id, scope_core, permit) =
+            self.reserve_scope(target, options, ExecutionKind::Sync, body)?;
         let core = Arc::clone(self);
-        permit.execution.dispatch(OperationJob::Sync(Box::new(move || {
-            let scope = OperationScope::new(Arc::clone(&scope_core), core);
-            let _frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
-            let manager = scope_core.manager().upgrade().expect("active scope manager exists");
-            let groups = scope_core.groups().to_vec();
-            let _context = ExecutionContextGuard::enter(&manager, id, &groups);
-            body(scope);
-        })));
+        permit
+            .execution
+            .dispatch(OperationJob::Sync(Box::new(move || {
+                let scope = OperationScope::new(Arc::clone(&scope_core), core);
+                let _frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
+                let manager = scope_core
+                    .manager()
+                    .upgrade()
+                    .expect("active scope manager exists");
+                let groups = scope_core.groups().to_vec();
+                let _context = ExecutionContextGuard::enter(&manager, id, &groups);
+                body(scope);
+            })));
         Ok(id)
     }
 
@@ -412,22 +467,31 @@ impl ManagerCore {
         F: FnOnce(OperationScope) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let (body, id, scope_core, permit) = self.reserve_scope(target, options, ExecutionKind::Async, body)?;
+        let (body, id, scope_core, permit) =
+            self.reserve_scope(target, options, ExecutionKind::Async, body)?;
         let core = Arc::clone(self);
         let scope = OperationScope::new(Arc::clone(&scope_core), core);
         let future = async move {
             let _frame = ExecutionFrameGuard::new(scope_core);
-            let manager = scope.core.manager().upgrade().expect("active scope manager exists");
+            let manager = scope
+                .core
+                .manager()
+                .upgrade()
+                .expect("active scope manager exists");
             let groups = scope.core.groups().to_vec();
             let user_future = {
                 let _context = ExecutionContextGuard::enter(&manager, id, &groups);
                 body(scope)
             };
-            if let Err(payload) = ExecutionContextFuture::new(user_future, manager, id, groups).await {
+            if let Err(payload) =
+                ExecutionContextFuture::new(user_future, manager, id, groups).await
+            {
                 dispose_panic_payload(payload);
             }
         };
-        permit.execution.dispatch(OperationJob::Async(Box::pin(future)));
+        permit
+            .execution
+            .dispatch(OperationJob::Async(Box::pin(future)));
         Ok(id)
     }
 }
@@ -621,7 +685,10 @@ impl ManagerCore {
     /// - `lease`: reservation lease whose execution permit is released.
     /// - `parent`: optional parent scope receiving the child outcome.
     /// - `control`: operation control notified about input release.
-    pub(in crate::v02::manager::core) fn abandon_reserved_operation<T: Send + 'static, E: Send + 'static>(
+    pub(in crate::v02::manager::core) fn abandon_reserved_operation<
+        T: Send + 'static,
+        E: Send + 'static,
+    >(
         scope: Arc<ScopeCore>,
         operation: Arc<OperationCore>,
         slot: Arc<OutcomeSlot<T, E>>,
@@ -677,16 +744,25 @@ impl ManagerCore {
                 (ManagerPhase::Open, crate::v02::report::ShutdownMode::Drain) => {
                     state.phase = ManagerPhase::Draining;
                 }
-                (ManagerPhase::Open | ManagerPhase::Draining, crate::v02::report::ShutdownMode::Cancel) => {
+                (
+                    ManagerPhase::Open | ManagerPhase::Draining,
+                    crate::v02::report::ShutdownMode::Cancel,
+                ) => {
                     state.phase = ManagerPhase::Cancelling;
                 }
                 _ => {}
             }
-            if state.phase != ManagerPhase::Closed && mode == crate::v02::report::ShutdownMode::Cancel {
+            if state.phase != ManagerPhase::Closed
+                && mode == crate::v02::report::ShutdownMode::Cancel
+            {
                 state.shutdown_mode = crate::v02::report::ShutdownMode::Cancel;
             }
             let scopes = if state.phase == ManagerPhase::Cancelling {
-                state.active_scopes.values().filter_map(Weak::upgrade).collect()
+                state
+                    .active_scopes
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -872,7 +948,8 @@ impl ManagerCore {
         let capacity = Arc::new(owner.capacity().resource_scope_for(id, options.capacity));
         let resource_scope = self.port.operation_resource_scope(id, capacity)?;
         self.track_resource_recoveries(&resource_scope, owner.groups().to_vec());
-        match owner.attach_resource_scope_with_permit(resource_scope.internal_clone(), scope_permit) {
+        match owner.attach_resource_scope_with_permit(resource_scope.internal_clone(), scope_permit)
+        {
             Ok(()) => Ok(resource_scope),
             Err(resource_scope) => {
                 resource_scope.end();
@@ -897,7 +974,10 @@ impl ManagerCore {
     pub(crate) fn shutdown_wait_for(&self, timeout: std::time::Duration) -> bool {
         let until = std::time::Instant::now().checked_add(timeout);
         let mut state = lock(&self.state);
-        while !state.active_scopes.is_empty() || !state.service_scopes.is_empty() || !state.recoveries.is_empty() {
+        while !state.active_scopes.is_empty()
+            || !state.service_scopes.is_empty()
+            || !state.recoveries.is_empty()
+        {
             if let Some(until) = until {
                 let now = std::time::Instant::now();
                 if now >= until {
@@ -934,7 +1014,10 @@ impl ManagerCore {
     /// - `self`: coordinator whose tracked state is awaited.
     pub(crate) fn shutdown_wait_blocking(&self) {
         let mut state = lock(&self.state);
-        while !state.active_scopes.is_empty() || !state.service_scopes.is_empty() || !state.recoveries.is_empty() {
+        while !state.active_scopes.is_empty()
+            || !state.service_scopes.is_empty()
+            || !state.recoveries.is_empty()
+        {
             state = self
                 .shutdown_changed
                 .wait(state)
@@ -975,7 +1058,9 @@ impl ManagerCore {
     #[inline]
     pub(crate) fn is_shutdown_empty(&self) -> bool {
         let state = lock(&self.state);
-        state.active_scopes.is_empty() && state.service_scopes.is_empty() && state.recoveries.is_empty()
+        state.active_scopes.is_empty()
+            && state.service_scopes.is_empty()
+            && state.recoveries.is_empty()
     }
 
     /// Counts manager-lifetime resource scopes awaiting settlement.
@@ -1016,10 +1101,16 @@ impl ManagerCore {
     ///
     /// - `self`: coordinator whose recovery handles are counted.
     pub(crate) fn unconfirmed_recovery_count(&self) -> usize {
-        let handles = lock(&self.state).recoveries.values().cloned().collect::<Vec<_>>();
+        let handles = lock(&self.state)
+            .recoveries
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
         handles
             .iter()
-            .filter(|handle| handle.snapshot().phase == crate::v02::report::RecoveryPhase::Unconfirmed)
+            .filter(|handle| {
+                handle.snapshot().phase == crate::v02::report::RecoveryPhase::Unconfirmed
+            })
             .count()
     }
 
@@ -1062,8 +1153,14 @@ impl ManagerCore {
                     .collect::<Vec<_>>(),
             )
         };
-        operations.iter().map(|scope| scope.cleanup_in_flight()).sum::<usize>()
-            + services.iter().map(ResourceScope::cleanup_in_flight).sum::<usize>()
+        operations
+            .iter()
+            .map(|scope| scope.cleanup_in_flight())
+            .sum::<usize>()
+            + services
+                .iter()
+                .map(ResourceScope::cleanup_in_flight)
+                .sum::<usize>()
     }
 }
 
@@ -1137,11 +1234,16 @@ impl ManagerCore {
             SubmissionTarget::Root { groups } | SubmissionTarget::Parent { groups, .. } => groups,
         };
         let descendant = parent.is_some();
-        let mut port_wait = self.port.wait_for_capacity(parent.clone(), execution, options);
-        let mut scope_wait = parent.as_ref().map(|scope| Box::pin(scope.wait_unavailable()));
+        let mut port_wait = self
+            .port
+            .wait_for_capacity(parent.clone(), execution, options);
+        let mut scope_wait = parent
+            .as_ref()
+            .map(|scope| Box::pin(scope.wait_unavailable()));
         loop {
             let manager_generation = self.shutdown_notify.generation();
-            let mut manager_changed = Box::pin(self.shutdown_notify.notified_since(manager_generation));
+            let mut manager_changed =
+                Box::pin(self.shutdown_notify.notified_since(manager_generation));
             let mut group_changed: Vec<_> = groups
                 .iter()
                 .map(|group| {
@@ -1153,7 +1255,10 @@ impl ManagerCore {
             let phase = lock(&self.state).phase;
             match (phase, descendant) {
                 (ManagerPhase::Open, _) | (ManagerPhase::Draining, true) => {}
-                (ManagerPhase::Draining | ManagerPhase::Cancelling | ManagerPhase::Closed, false) => {
+                (
+                    ManagerPhase::Draining | ManagerPhase::Cancelling | ManagerPhase::Closed,
+                    false,
+                ) => {
                     return Err(AdmissionError::Closed);
                 }
                 (ManagerPhase::Cancelling | ManagerPhase::Closed, true) => {
@@ -1177,7 +1282,10 @@ impl ManagerCore {
                 if manager_changed.as_mut().poll(context).is_ready() {
                     return Poll::Ready(None);
                 }
-                if group_changed.iter_mut().any(|changed| changed.as_mut().poll(context).is_ready()) {
+                if group_changed
+                    .iter_mut()
+                    .any(|changed| changed.as_mut().poll(context).is_ready())
+                {
                     return Poll::Ready(None);
                 }
                 if let Some(wait) = scope_wait.as_mut()
@@ -1212,7 +1320,9 @@ impl ManagerCore {
 
 impl ManagerCore {
     #[cfg(test)]
-    pub(in crate::v02::manager::core) fn test_relationships(&self) -> Vec<(OperationId, Option<OperationId>)> {
+    pub(in crate::v02::manager::core) fn test_relationships(
+        &self,
+    ) -> Vec<(OperationId, Option<OperationId>)> {
         lock(&self.state).relationships.clone()
     }
 
@@ -1229,7 +1339,9 @@ impl ManagerCore {
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test_with_diagnostic_limit(diagnostic_limit: usize) -> (Arc<Self>, OperationManager) {
+    pub(crate) fn for_test_with_diagnostic_limit(
+        diagnostic_limit: usize,
+    ) -> (Arc<Self>, OperationManager) {
         let core = Self::new_with_diagnostic_limit(
             Arc::new(TestPort),
             OperationContext::new(crate::v02::report::ContextOptions::default()).unwrap(),

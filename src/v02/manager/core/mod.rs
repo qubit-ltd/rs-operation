@@ -33,7 +33,12 @@ pub(crate) use internal::SubmissionReservation;
 pub(crate) use internal::SubmissionTarget;
 use internal::ThreadUnparker;
 pub(crate) use internal::dispose_panic_payload;
+pub(super) use operation_manager::ExternalBindResult;
+pub(super) use operation_manager::ExternalExecutionContext;
+pub(super) use operation_manager::ExternalOutcomePublisher;
+pub(super) use operation_manager::ExternalStopControl;
 pub use operation_manager::OperationManager;
+pub(super) use operation_manager::drive_external;
 
 use crate::v02::adapter::ManagedOperationControl;
 use crate::v02::manager::capacity::ScopeCapacity;
@@ -72,13 +77,20 @@ use crate::v02::scope::ScopeCore;
 ///
 /// - `operation_id`: Identifies the child operation.
 /// - `outcome`: Supplies the child's terminal outcome.
-fn child_outcome_summary<T, E>(operation_id: OperationId, outcome: &OperationOutcome<T, E>) -> ChildOutcomeSummary {
+fn child_outcome_summary<T, E>(
+    operation_id: OperationId,
+    outcome: &OperationOutcome<T, E>,
+) -> ChildOutcomeSummary {
     let (kind, summary) = match outcome {
         OperationOutcome::Succeeded(_) => (ChildOutcomeKind::Succeeded, "child succeeded"),
-        OperationOutcome::Failed(_) | OperationOutcome::ChildFailed(_) => (ChildOutcomeKind::Failed, "child failed"),
+        OperationOutcome::Failed(_) | OperationOutcome::ChildFailed(_) => {
+            (ChildOutcomeKind::Failed, "child failed")
+        }
         OperationOutcome::Stopped(_) => (ChildOutcomeKind::Stopped, "child stopped"),
         OperationOutcome::Panicked(panic) => (ChildOutcomeKind::Panicked, panic.summary.as_str()),
-        OperationOutcome::ExecutionFailed(failure) => (ChildOutcomeKind::ExecutionFailed, failure.summary.as_str()),
+        OperationOutcome::ExecutionFailed(failure) => {
+            (ChildOutcomeKind::ExecutionFailed, failure.summary.as_str())
+        }
     };
     ChildOutcomeSummary {
         operation_id,
@@ -97,7 +109,9 @@ fn child_outcome_summary<T, E>(operation_id: OperationId, outcome: &OperationOut
 ///
 /// Returns an admission error if the parent scope ended, stopped, or its
 /// context is invalid.
-fn resolve_wait_parent(target: &SubmissionTarget) -> Result<Option<Arc<ScopeCore>>, AdmissionError> {
+fn resolve_wait_parent(
+    target: &SubmissionTarget,
+) -> Result<Option<Arc<ScopeCore>>, AdmissionError> {
     let SubmissionTarget::Parent { scope, .. } = target else {
         return Ok(None);
     };
@@ -160,7 +174,9 @@ fn block_on<F: Future>(future: F) -> F::Output {
 fn map_context_error(error: ContextError) -> AdmissionError {
     match error {
         ContextError::Stopped => AdmissionError::Stopped,
-        ContextError::ClockUnavailable | ContextError::ClockDomainMismatch => AdmissionError::DeadlineExpired,
+        ContextError::ClockUnavailable | ContextError::ClockDomainMismatch => {
+            AdmissionError::DeadlineExpired
+        }
         ContextError::BudgetRejected(_) => AdmissionError::CapacityExceeded,
     }
 }
@@ -180,7 +196,9 @@ fn map_context_error(error: ContextError) -> AdmissionError {
 ///
 /// The mutex guard, including when the mutex was poisoned.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]
@@ -253,7 +271,10 @@ pub(crate) fn test_resources(
     scope_id: OperationId,
     parent: Option<&ScopeCore>,
     options: &OperationOptions,
-) -> (Arc<crate::v02::manager::capacity::ScopeCapacity>, ResourceScope) {
+) -> (
+    Arc<crate::v02::manager::capacity::ScopeCapacity>,
+    ResourceScope,
+) {
     use crate::v02::manager::capacity::ManagerCapacityPools;
     use crate::v02::manager::capacity::ScopeCapacity;
     use crate::v02::report::ManagerId;
@@ -272,7 +293,9 @@ pub(crate) fn test_resources(
 
     let manager = ManagerCapacityPools::new(ManagerLimits::default());
     let capacity = Arc::new(match parent {
-        Some(parent) => parent.capacity().child_for_operation(scope_id, options.limits),
+        Some(parent) => parent
+            .capacity()
+            .child_for_operation(scope_id, options.limits),
         None => ScopeCapacity::root_for_operation(&manager, scope_id, options.limits),
     });
     let resource_scope = ResourceScope::new(

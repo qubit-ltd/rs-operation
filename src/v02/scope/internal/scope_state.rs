@@ -7,15 +7,16 @@
 // =============================================================================
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use super::ScopeResourceOwner;
 use super::child_record::ChildRecord;
 use super::start_state::StartState;
 use crate::v02::manager::capacity::PermitBundle;
-use crate::v02::report::EffectRecord;
 use crate::v02::report::ChildFailureSummary;
 use crate::v02::report::ChildSettlement;
 use crate::v02::report::CleanupFailure;
+use crate::v02::report::EffectRecord;
 use crate::v02::report::OperationId;
 use crate::v02::report::RecoveryHandle;
 use crate::v02::report::ResourceCleanupReport;
@@ -31,6 +32,8 @@ pub(super) struct ScopeState {
     pub(super) start: StartState,
     /// Child operations that still owe outcome, settlement, or input release.
     pub(super) active_children: HashMap<OperationId, ChildRecord>,
+    /// Child links provisionally reserved while external bind runs.
+    pub(super) provisional_children: HashSet<OperationId>,
     /// Bounded retained child settlement details.
     pub(super) children: Vec<ChildSettlement>,
     /// Total observed children, including details omitted after the cap.

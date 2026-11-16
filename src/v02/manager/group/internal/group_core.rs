@@ -87,10 +87,12 @@ impl GroupCore {
     /// Returns the admission reason when shutdown or capacity prevents
     /// reservation.
     #[cfg(test)]
-    pub(crate) fn reserve(self: &Arc<Self>, descendant: bool) -> Result<GroupPermit, AdmissionError> {
-        Self::reserve_many(std::slice::from_ref(self), descendant).map(|mut permits| {
-            permits.pop().expect("one group produces one permit")
-        })
+    pub(crate) fn reserve(
+        self: &Arc<Self>,
+        descendant: bool,
+    ) -> Result<GroupPermit, AdmissionError> {
+        Self::reserve_many(std::slice::from_ref(self), descendant)
+            .map(|mut permits| permits.pop().expect("one group produces one permit"))
     }
 
     /// Atomically reserves membership in every distinct group.
@@ -170,7 +172,10 @@ impl GroupCore {
     ///
     /// - `self`: Group whose notifications are observed.
     /// - `generation`: Previously sampled notification generation.
-    pub(crate) fn admission_notified_since(&self, generation: u64) -> crate::v02::internal::notify::Notified {
+    pub(crate) fn admission_notified_since(
+        &self,
+        generation: u64,
+    ) -> crate::v02::internal::notify::Notified {
         self.notify.notified_since(generation)
     }
 
@@ -193,11 +198,29 @@ impl GroupCore {
     /// `commit_parent` rejects the child, every insertion is rolled back before
     /// any group can observe it or request cancellation. Cancellation racing
     /// this transaction therefore observes either every membership or none.
+    #[cfg(test)]
     pub(crate) fn register_scope_many_with<F>(
         groups: &[Arc<Self>],
         id: OperationId,
         scope: Weak<crate::v02::scope::ScopeCore>,
         descendant: bool,
+        commit_parent: F,
+    ) -> Result<(), AdmissionError>
+    where
+        F: FnOnce() -> Result<(), AdmissionError>,
+    {
+        Self::register_scope_many_with_claimed(groups, id, scope, descendant, false, commit_parent)
+    }
+
+    /// Registers an adapter claim that completed during the final admission
+    /// preflight. A concurrent Cancel transition must produce a stopped
+    /// accepted operation instead of returning an already claimed Arc.
+    pub(crate) fn register_scope_many_with_claimed<F>(
+        groups: &[Arc<Self>],
+        id: OperationId,
+        scope: Weak<crate::v02::scope::ScopeCore>,
+        descendant: bool,
+        claimed: bool,
         commit_parent: F,
     ) -> Result<(), AdmissionError>
     where
@@ -211,10 +234,10 @@ impl GroupCore {
             states.push(lock(&group.state));
         }
         for state in &states {
-            if state.mode == ShutdownMode::Cancel {
+            if state.mode == ShutdownMode::Cancel && !claimed {
                 return Err(AdmissionError::Stopped);
             }
-            if !state.accepting && !descendant {
+            if !state.accepting && !descendant && !claimed {
                 return Err(AdmissionError::Closed);
             }
         }
@@ -245,7 +268,11 @@ impl GroupCore {
     /// `true` if registration succeeded; cancellation mode rejects it.
     #[must_use]
     #[cfg(test)]
-    pub(crate) fn register_scope(&self, id: OperationId, scope: Weak<crate::v02::scope::ScopeCore>) -> bool {
+    pub(crate) fn register_scope(
+        &self,
+        id: OperationId,
+        scope: Weak<crate::v02::scope::ScopeCore>,
+    ) -> bool {
         let mut state = lock(&self.state);
         if state.mode == ShutdownMode::Cancel {
             return false;
@@ -302,7 +329,11 @@ impl GroupCore {
             if mode == ShutdownMode::Cancel {
                 state.mode = mode;
                 (
-                    state.scopes.values().filter_map(Weak::upgrade).collect::<Vec<_>>(),
+                    state
+                        .scopes
+                        .values()
+                        .filter_map(Weak::upgrade)
+                        .collect::<Vec<_>>(),
                     state
                         .services
                         .values()
@@ -423,7 +454,9 @@ impl GroupCore {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state = next;
                 if result.timed_out()
-                    && (state.active != 0 || !state.services.is_empty() || !state.recoveries.is_empty())
+                    && (state.active != 0
+                        || !state.services.is_empty()
+                        || !state.recoveries.is_empty())
                 {
                     return false;
                 }
@@ -523,7 +556,11 @@ impl GroupCore {
         let (operations, services) = {
             let state = lock(&self.state);
             (
-                state.scopes.values().filter_map(Weak::upgrade).collect::<Vec<_>>(),
+                state
+                    .scopes
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .collect::<Vec<_>>(),
                 state
                     .services
                     .values()
@@ -531,7 +568,10 @@ impl GroupCore {
                     .collect::<Vec<_>>(),
             )
         };
-        operations.iter().map(|scope| scope.cleanup_in_flight()).sum::<usize>()
+        operations
+            .iter()
+            .map(|scope| scope.cleanup_in_flight())
+            .sum::<usize>()
             + services
                 .iter()
                 .map(crate::v02::resource::ResourceScope::cleanup_in_flight)
@@ -578,7 +618,11 @@ impl GroupCore {
     /// - `handle`: Recovery handle whose active state changed.
     /// - `active`: Whether the handle should remain counted as active recovery.
     /// - `self`: Group core whose recovery accounting is updated.
-    pub(crate) fn recovery_changed(&self, handle: crate::v02::resource::RecoveryHandle, active: bool) {
+    pub(crate) fn recovery_changed(
+        &self,
+        handle: crate::v02::resource::RecoveryHandle,
+        active: bool,
+    ) {
         let removed = {
             let mut state = lock(&self.state);
             if active {
@@ -629,7 +673,11 @@ mod tests {
 
         let one = GroupCore::new(1);
         let two = GroupCore::new(1);
-        let (first, later) = if one.id < two.id { (one, two) } else { (two, one) };
+        let (first, later) = if one.id < two.id {
+            (one, two)
+        } else {
+            (two, one)
+        };
         let _later_full = GroupCore::reserve_many(std::slice::from_ref(&later), false).unwrap();
         let later_state = later.state.lock().unwrap();
         let (started_tx, started_rx) = mpsc::channel();
@@ -647,10 +695,15 @@ mod tests {
         loop {
             match first.state.try_lock() {
                 Err(std::sync::TryLockError::WouldBlock) => break,
-                Err(std::sync::TryLockError::Poisoned(error)) => panic!("group mutex poisoned: {error}"),
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    panic!("group mutex poisoned: {error}")
+                }
                 Ok(state) => {
                     drop(state);
-                    assert!(Instant::now() < deadline, "batch did not acquire the earlier group lock");
+                    assert!(
+                        Instant::now() < deadline,
+                        "batch did not acquire the earlier group lock"
+                    );
                     std::thread::yield_now();
                 }
             }
@@ -668,18 +721,41 @@ mod tests {
     fn canceled_later_group_rejects_batch_without_partial_scope_registration() {
         let first = GroupCore::new(1);
         let later = GroupCore::new(1);
-        let (first, later) = if first.id < later.id { (first, later) } else { (later, first) };
-        let permits = GroupCore::reserve_many(&[Arc::clone(&first), Arc::clone(&later)], false).unwrap();
+        let (first, later) = if first.id < later.id {
+            (first, later)
+        } else {
+            (later, first)
+        };
+        let permits =
+            GroupCore::reserve_many(&[Arc::clone(&first), Arc::clone(&later)], false).unwrap();
         later.begin_shutdown(ShutdownMode::Cancel);
         let operation = OperationId::new_unique();
 
         assert!(matches!(
-            GroupCore::register_scope_many_with(&[Arc::clone(&first), Arc::clone(&later)], operation, Weak::new(), false, || Ok(())),
+            GroupCore::register_scope_many_with(
+                &[Arc::clone(&first), Arc::clone(&later)],
+                operation,
+                Weak::new(),
+                false,
+                || Ok(())
+            ),
             Err(AdmissionError::Stopped)
         ));
         assert_eq!(first.shutdown_snapshot().queued_operations, 0);
         assert_eq!(later.shutdown_snapshot().queued_operations, 0);
         assert_eq!(first.public_snapshot().active_operations, 1);
+        let claimed_operation = OperationId::new_unique();
+        GroupCore::register_scope_many_with_claimed(
+            &[Arc::clone(&first), Arc::clone(&later)],
+            claimed_operation,
+            Weak::new(),
+            false,
+            true,
+            || Ok(()),
+        )
+        .expect("a final-preflight claim is registered for stopped completion");
+        assert_eq!(first.shutdown_snapshot().queued_operations, 1);
+        assert_eq!(later.shutdown_snapshot().queued_operations, 1);
         drop(permits);
         assert_eq!(first.public_snapshot().active_operations, 0);
         assert_eq!(later.public_snapshot().active_operations, 0);
@@ -693,7 +769,10 @@ mod tests {
             Weak::new(),
             false,
             || {
-                assert!(matches!(rejected_first.state.try_lock(), Err(std::sync::TryLockError::WouldBlock)));
+                assert!(matches!(
+                    rejected_first.state.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
                 Err(AdmissionError::ScopeEnded)
             },
         );

@@ -11,6 +11,8 @@ use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use super::AdmissionError;
 use super::AsyncOperationHandle;
@@ -19,10 +21,13 @@ use super::DiagnosticSummary;
 use super::ExecutionFrameGuard;
 use super::ExecutionKind;
 use super::ExecutionPhase;
+use super::ExternalBindResult;
+use super::ExternalExecutionContext;
+use super::ExternalOutcomePublisher;
+use super::ExternalStopControl;
 use super::ManagedOperationControl;
 use super::ManagerCore;
 use super::OperationCore;
-#[cfg(test)]
 use super::OperationId;
 use super::OperationJob;
 use super::OperationManager;
@@ -37,6 +42,7 @@ use super::SubmissionTarget;
 use super::SubmitError;
 use super::child_outcome_summary;
 use super::dispose_panic_payload;
+use super::drive_external;
 use super::lock;
 use super::panic_message;
 use crate::v02::scope::ExecutionContextFuture;
@@ -64,11 +70,9 @@ pub struct AsyncOperationManager {
 impl AsyncOperationManager {
     /// Attempts to submit a prepared external operation.
     ///
-    /// This interface is declared in 0.3; this version's adapter driver is not
-    /// yet available, so the prepared owner is returned unchanged.
     pub fn try_submit_external<T, E, P>(
         &self,
-        _options: OperationOptions,
+        options: OperationOptions,
         prepared: Arc<P>,
     ) -> Result<AsyncOperationHandle<T, E>, SubmitError<Arc<P>>>
     where
@@ -76,7 +80,237 @@ impl AsyncOperationManager {
         E: Send + 'static,
         P: crate::v02::adapter::PreparedExternalOperation<T, E>,
     {
-        Err(SubmitError::new(AdmissionError::ExecutorUnavailable, prepared))
+        let bind_result: ExternalBindResult = Arc::new(Mutex::new(None));
+        let managed_control: Arc<Mutex<Option<Arc<ManagedOperationControl>>>> =
+            Arc::new(Mutex::new(None));
+        let execution_context: Arc<Mutex<Option<Arc<ExternalExecutionContext>>>> =
+            Arc::new(Mutex::new(None));
+        let outcome_publisher: ExternalOutcomePublisher<T, E> = Arc::new(Mutex::new(None));
+        let activation_permitted = Arc::new(AtomicBool::new(false));
+        let state_for_preflight = Arc::clone(&bind_result);
+        let adapter_for_preflight = Arc::clone(&prepared);
+        let preflight = move |id| {
+            let result = catch_unwind(AssertUnwindSafe(|| adapter_for_preflight.bind(id)));
+            match result {
+                Ok(Ok(())) => *lock(&state_for_preflight) = Some(Ok(())),
+                Ok(Err(crate::v02::adapter::ExternalBindError::AlreadyBound)) => {
+                    return Err(AdmissionError::AlreadyBound);
+                }
+                Ok(Err(crate::v02::adapter::ExternalBindError::Failed(failure))) => {
+                    *lock(&state_for_preflight) = Some(Err(failure));
+                }
+                Err(payload) => {
+                    *lock(&state_for_preflight) = Some(Err(crate::v02::report::ExecutionFailure {
+                        operation_id: id,
+                        summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
+                        source: None,
+                    }));
+                }
+            }
+            Ok(())
+        };
+        let bind_state = Arc::clone(&bind_result);
+        let managed_state = Arc::clone(&managed_control);
+        let execution_state = Arc::clone(&execution_context);
+        let publisher_state = Arc::clone(&outcome_publisher);
+        let activation_state = Arc::clone(&activation_permitted);
+        let adapter_for_runner = Arc::clone(&prepared);
+        let runner = move |scope: OperationScope| {
+            let bind_state = Arc::clone(&bind_state);
+            let managed_state = Arc::clone(&managed_state);
+            let execution_state = Arc::clone(&execution_state);
+            let publisher_state = Arc::clone(&publisher_state);
+            let adapter = Arc::clone(&adapter_for_runner);
+            let activation_state = Arc::clone(&activation_state);
+            async move {
+                drive_external(
+                    scope,
+                    adapter,
+                    bind_state,
+                    managed_state,
+                    execution_state,
+                    publisher_state,
+                    activation_state.load(Ordering::Acquire),
+                )
+                .await;
+            }
+        };
+        self.try_submit_external_raw(
+            options,
+            runner,
+            preflight,
+            Arc::clone(&managed_control),
+            Arc::clone(&execution_context),
+            Arc::clone(&outcome_publisher),
+            Arc::clone(&activation_permitted),
+        )
+        .map_err(|(reason, _runner)| SubmitError::new(reason, prepared))
+    }
+
+    fn try_submit_external_raw<T, E, F, Fut, C>(
+        &self,
+        options: OperationOptions,
+        body: F,
+        preflight: C,
+        external_managed: Arc<Mutex<Option<Arc<ManagedOperationControl>>>>,
+        external_execution: Arc<Mutex<Option<Arc<ExternalExecutionContext>>>>,
+        early_publisher: ExternalOutcomePublisher<T, E>,
+        activation_permitted: Arc<AtomicBool>,
+    ) -> Result<AsyncOperationHandle<T, E>, (AdmissionError, F)>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        F: FnOnce(OperationScope) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+        C: FnOnce(OperationId) -> Result<(), AdmissionError>,
+    {
+        let body_cell = Arc::new(Mutex::new(Some(body)));
+        let body_for_job = Arc::clone(&body_cell);
+        let parts: Arc<Mutex<Option<RunnerParts<T, E>>>> = Arc::new(Mutex::new(None));
+        let parts_for_job = Arc::clone(&parts);
+        let early_published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let early_published_for_runner = Arc::clone(&early_published);
+        let execution_for_runner = Arc::clone(&external_execution);
+        let runner = move |scope: OperationScope| {
+            let body = lock(&body_for_job)
+                .take()
+                .expect("accepted async external body is present");
+            let (operation, slot, lease, parent, control) = lock(&parts_for_job)
+                .take()
+                .expect("accepted async external runner capsule is present");
+            let scope_core = Arc::clone(&scope.core);
+            let operation_id = scope.id();
+            let frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
+            operation.set_execution(ExecutionPhase::Running);
+            *lock(&execution_for_runner) = Some(Arc::new(ExternalExecutionContext::new(
+                Arc::clone(&operation),
+                Arc::clone(&lease),
+                Arc::clone(&scope_core),
+                Some(frame),
+            )));
+            let manager_core = scope_core
+                .manager()
+                .upgrade()
+                .expect("active async scope manager exists");
+            let groups = scope_core.groups().to_vec();
+            let body_future = {
+                let _context = ExecutionContextGuard::enter(&manager_core, operation_id, &groups);
+                body(scope)
+            };
+            async move {
+                let result =
+                    ExecutionContextFuture::new(body_future, manager_core, operation_id, groups)
+                        .await;
+                if let Some(context) = lock(&execution_for_runner).as_ref() {
+                    context.finish();
+                }
+                if !early_published_for_runner.load(std::sync::atomic::Ordering::Acquire) {
+                    scope_core.on_outcomes_ready(move || {
+                        let outcome = match result {
+                            Ok(()) => OperationOutcome::ExecutionFailed(
+                                crate::v02::report::ExecutionFailure {
+                                    operation_id,
+                                    summary: DiagnosticSummary::new(
+                                        "async external driver ended without an outcome",
+                                    ),
+                                    source: None,
+                                },
+                            ),
+                            Err(payload) => OperationOutcome::Panicked(PanicSummary {
+                                operation_id,
+                                phase: ExecutionPhase::Running,
+                                summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
+                            }),
+                        };
+                        let summary = child_outcome_summary(operation_id, &outcome);
+                        control.publish_outcome(summary.clone());
+                        if let Some(parent) = parent {
+                            let _ = parent.record_child_outcome(summary);
+                        }
+                        let _ = slot.publish(outcome);
+                    });
+                }
+                scope_core.mark_body_finished();
+            }
+        };
+        let (runner, id, scope, reservation) = match self.core.reserve_scope_with_preflight(
+            &self.target,
+            options,
+            ExecutionKind::Async,
+            runner,
+            preflight,
+            true,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let (reason, runner) = error.into_parts();
+                drop(runner);
+                return Err((
+                    reason,
+                    lock(&body_cell)
+                        .take()
+                        .expect("rejected async body is retained"),
+                ));
+            }
+        };
+        let operation = OperationCore::new(id);
+        scope.bind_operation_core(&operation);
+        let slot = Arc::new(OutcomeSlot::new(Arc::clone(&operation)));
+        let lease = Arc::clone(&reservation.lifecycle);
+        slot.set_delivery_hook({
+            let lease = Arc::clone(&lease);
+            move |delivery| lease.outcome_delivered(delivery)
+        });
+        let parent = scope.parent();
+        let control = ManagedOperationControl::new(Arc::clone(&operation), Arc::clone(&scope));
+        *lock(&external_managed) = Some(Arc::clone(&control));
+        let scope_for_publisher = Arc::clone(&scope);
+        let control_for_publisher = Arc::clone(&control);
+        let slot_for_publisher = Arc::clone(&slot);
+        let parent_for_publisher = parent.clone();
+        let flag_for_callback = Arc::clone(&early_published);
+        *lock(&early_publisher) = Some(Box::new(move |outcome| {
+            if flag_for_callback.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return;
+            }
+            let callback_scope = Arc::clone(&scope_for_publisher);
+            let callback_scope_for_outcome = Arc::clone(&callback_scope);
+            callback_scope.on_outcomes_ready(move || {
+                let outcome = callback_scope_for_outcome.resolve_typed_outcome(outcome);
+                let summary = child_outcome_summary(callback_scope_for_outcome.id(), &outcome);
+                control_for_publisher.publish_outcome(summary.clone());
+                if let Some(parent) = parent_for_publisher {
+                    let _ = parent.record_child_outcome(summary);
+                }
+                let _ = slot_for_publisher.publish(outcome);
+            });
+        }));
+        self.core.register_settlement(
+            Arc::clone(&scope),
+            Arc::clone(&operation),
+            Arc::clone(&lease),
+            Arc::clone(&control),
+        );
+        *lock(&parts) = Some((
+            Arc::clone(&operation),
+            Arc::clone(&slot),
+            Arc::clone(&lease),
+            parent,
+            Arc::clone(&control),
+        ));
+        let stop: Arc<dyn StopControl> = Arc::new(ExternalStopControl {
+            managed: Arc::clone(&control),
+        });
+        let handle = AsyncOperationHandle::new(Arc::clone(&operation), Arc::clone(&slot), stop);
+        let start_permitted = scope.commit_start().is_ok() && scope.activate_start().is_ok();
+        activation_permitted.store(start_permitted, Ordering::Release);
+        let execution = reservation.execution;
+        let future = runner(OperationScope::new(
+            Arc::clone(&scope),
+            Arc::clone(&self.core),
+        ));
+        execution.dispatch(OperationJob::Async(Box::pin(future)));
+        Ok(handle)
     }
     /// Constructs an async view with real bounded executors and cleanup.
     ///
@@ -95,7 +329,9 @@ impl AsyncOperationManager {
     /// Returns [`ManagerCreateError`](crate::v02::report::ManagerCreateError)
     /// when a configured executor, adapter, or cleanup resource cannot be
     /// initialized.
-    pub fn new(options: crate::v02::report::ManagerOptions) -> Result<Self, crate::v02::report::ManagerCreateError> {
+    pub fn new(
+        options: crate::v02::report::ManagerOptions,
+    ) -> Result<Self, crate::v02::report::ManagerCreateError> {
         crate::v02::manager::production::new_async(options)
     }
 
@@ -221,7 +457,11 @@ impl AsyncOperationManager {
                     }
                     if let Err(reason) = self
                         .core
-                        .wait_for_retry_capacity(&self.target, ExecutionKind::Async, options.clone())
+                        .wait_for_retry_capacity(
+                            &self.target,
+                            ExecutionKind::Async,
+                            options.clone(),
+                        )
                         .await
                     {
                         return Err(SubmitError::new(reason, original));
@@ -272,7 +512,9 @@ impl AsyncOperationManager {
         let parts: Arc<Mutex<Option<RunnerParts<T, E>>>> = Arc::new(Mutex::new(None));
         let parts_for_job = Arc::clone(&parts);
         let runner = move |scope: OperationScope| {
-            let body = lock(&body_for_job).take().expect("accepted async body is present");
+            let body = lock(&body_for_job)
+                .take()
+                .expect("accepted async body is present");
             let (operation, slot, lease, parent, control) = lock(&parts_for_job)
                 .take()
                 .expect("accepted async runner capsule is present");
@@ -281,15 +523,20 @@ impl AsyncOperationManager {
             async move {
                 let frame = ExecutionFrameGuard::new(Arc::clone(&scope_core));
                 operation.set_execution(ExecutionPhase::Running);
-                let manager_core = scope_core.manager().upgrade().expect("active scope manager exists");
+                let manager_core = scope_core
+                    .manager()
+                    .upgrade()
+                    .expect("active scope manager exists");
                 let groups = scope_core.groups().to_vec();
                 let construction = {
-                    let _context = ExecutionContextGuard::enter(&manager_core, operation_id, &groups);
+                    let _context =
+                        ExecutionContextGuard::enter(&manager_core, operation_id, &groups);
                     catch_unwind(AssertUnwindSafe(|| body(scope)))
                 };
                 let result = match construction {
                     Ok(user_future) => {
-                        ExecutionContextFuture::new(user_future, manager_core, operation_id, groups).await
+                        ExecutionContextFuture::new(user_future, manager_core, operation_id, groups)
+                            .await
                     }
                     Err(payload) => Err(payload),
                 };
@@ -332,7 +579,9 @@ impl AsyncOperationManager {
                 Ok(result) => result,
                 Err(error) => {
                     let (reason, _runner) = error.into_parts();
-                    let body = lock(&body_cell).take().expect("rejected async body is retained");
+                    let body = lock(&body_cell)
+                        .take()
+                        .expect("rejected async body is retained");
                     return Err(SubmitError::new(reason, body));
                 }
             };
@@ -364,7 +613,10 @@ impl AsyncOperationManager {
             Arc::clone(&slot),
             Arc::clone(&control) as Arc<dyn StopControl>,
         );
-        let future = runner(OperationScope::new(Arc::clone(&scope), Arc::clone(&self.core)));
+        let future = runner(OperationScope::new(
+            Arc::clone(&scope),
+            Arc::clone(&self.core),
+        ));
         let abandon_scope = Arc::clone(&scope);
         let abandon_operation = Arc::clone(&operation);
         let abandon_slot = Arc::clone(&slot);
@@ -483,7 +735,10 @@ impl AsyncOperationManager {
             .await
             .map_err(crate::v02::report::RunError::Outcome)?;
         let settlement = operation.wait_settlement().await;
-        Ok(crate::v02::report::OperationCompletion { outcome, settlement })
+        Ok(crate::v02::report::OperationCompletion {
+            outcome,
+            settlement,
+        })
     }
 
     /// Submits an async unit-returning body through the test execution port.

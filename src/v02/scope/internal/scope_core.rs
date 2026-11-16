@@ -31,15 +31,14 @@ use crate::v02::manager::group::GroupCore;
 use crate::v02::operation::OperationCore;
 use crate::v02::report::AdmissionError;
 use crate::v02::report::ChildFailurePolicy;
-use crate::v02::report::EffectRecord;
-use crate::v02::report::EffectRecordError;
-use crate::v02::report::StopRequestStatus;
 use crate::v02::report::ChildFailureSummary;
 use crate::v02::report::ChildOutcomeKind;
 use crate::v02::report::ChildOutcomeSummary;
 use crate::v02::report::ChildRequirement;
 use crate::v02::report::ChildSettlement;
 use crate::v02::report::CleanupFailure;
+use crate::v02::report::EffectRecord;
+use crate::v02::report::EffectRecordError;
 use crate::v02::report::OperationId;
 use crate::v02::report::OperationOptions;
 use crate::v02::report::OperationOutcome;
@@ -51,6 +50,7 @@ use crate::v02::report::ResourceScopeReport;
 use crate::v02::report::SettlementReport;
 use crate::v02::report::StopReason;
 use crate::v02::report::StopReport;
+use crate::v02::report::StopRequestStatus;
 use crate::v02::report::TransferReceipt;
 use crate::v02::resource::ResourceScope;
 use crate::v02::resource::recovery::RecoveryHandle;
@@ -144,6 +144,7 @@ impl ScopeCore {
                 stopping: false,
                 start: StartState::Reserved,
                 active_children: HashMap::new(),
+                provisional_children: std::collections::HashSet::new(),
                 children: Vec::with_capacity(diagnostic_limit),
                 children_total: 0,
                 children_truncated: false,
@@ -351,7 +352,11 @@ impl ScopeCore {
     #[must_use]
     pub(crate) fn child_reports(&self) -> (Vec<ChildSettlement>, usize, bool) {
         let state = lock(&self.state);
-        (state.children.clone(), state.children_total, state.children_truncated)
+        (
+            state.children.clone(),
+            state.children_total,
+            state.children_truncated,
+        )
     }
 
     /// Clones bounded resource, cleanup, recovery, and transfer report sets.
@@ -456,13 +461,22 @@ impl ScopeCore {
     /// `true` if the child was registered, or `false` if this scope is closed,
     /// stopping, or its inherited context has stopped.
     #[must_use = "check whether the child was registered before proceeding"]
-    pub(crate) fn mark_child(&self, id: OperationId, scope: Weak<ScopeCore>, requirement: ChildRequirement) -> bool {
+    pub(crate) fn mark_child(
+        &self,
+        id: OperationId,
+        scope: Weak<ScopeCore>,
+        requirement: ChildRequirement,
+    ) -> bool {
         let mut state = lock(&self.state);
         if !state.open || state.stopping || self.context.check().is_err() {
             return false;
         }
         let (children_total, overflowed) = state.children_total.overflowing_add(1);
-        state.children_total = if overflowed { usize::MAX } else { children_total };
+        state.children_total = if overflowed {
+            usize::MAX
+        } else {
+            children_total
+        };
         state.children_truncated |= overflowed;
         state.active_children.insert(
             id,
@@ -475,6 +489,64 @@ impl ScopeCore {
             },
         );
         true
+    }
+
+    /// Reserves a parent link before foreign bind runs, so parent shutdown
+    /// observes and stops the pending child while the adapter call stays
+    /// outside the scope lock.
+    pub(crate) fn reserve_child(
+        &self,
+        id: OperationId,
+        scope: Weak<ScopeCore>,
+        requirement: ChildRequirement,
+    ) -> bool {
+        let mut state = lock(&self.state);
+        if !state.open || state.stopping || self.context.check().is_err() {
+            return false;
+        }
+        state.active_children.insert(
+            id,
+            ChildRecord {
+                scope,
+                requirement,
+                outcome: None,
+                settlement: None,
+                input_released: false,
+            },
+        );
+        state.provisional_children.insert(id);
+        true
+    }
+
+    /// Commits a provisional parent link after bind claims the adapter.
+    pub(crate) fn commit_child_reservation(&self, id: OperationId) {
+        let mut state = lock(&self.state);
+        if !state.provisional_children.remove(&id) {
+            return;
+        }
+        let (children_total, overflowed) = state.children_total.overflowing_add(1);
+        state.children_total = if overflowed {
+            usize::MAX
+        } else {
+            children_total
+        };
+        state.children_truncated |= overflowed;
+    }
+
+    /// Rolls back a provisional parent link when bind rejects an already
+    /// claimed adapter. It also completes parent settlement if shutdown was
+    /// waiting solely for this reservation.
+    pub(crate) fn rollback_child_reservation(&self, id: OperationId) {
+        let callback = {
+            let mut state = lock(&self.state);
+            if !state.provisional_children.remove(&id) {
+                return;
+            }
+            state.active_children.remove(&id);
+            Self::take_settlement_callback(&mut state)
+        };
+        self.children_changed.notify_waiters();
+        invoke_callback(callback);
     }
 
     /// Retains an owner that receives the scope-end event before settlement.
@@ -505,7 +577,10 @@ impl ScopeCore {
     ///
     /// Returns the original resource scope if this operation scope has already
     /// ended.
-    pub(crate) fn attach_resource_scope(self: &Arc<Self>, resource_scope: ResourceScope) -> Result<(), ResourceScope> {
+    pub(crate) fn attach_resource_scope(
+        self: &Arc<Self>,
+        resource_scope: ResourceScope,
+    ) -> Result<(), ResourceScope> {
         self.attach_resource_scope_inner(resource_scope, None)
     }
 
@@ -539,7 +614,10 @@ impl ScopeCore {
     ///
     /// `Ok(())` if the child outcome was recorded. Returns `Err(outcome)` if
     /// the child is unknown, already retired, or already has an outcome.
-    pub(crate) fn record_child_outcome(&self, outcome: ChildOutcomeSummary) -> Result<(), ChildOutcomeSummary> {
+    pub(crate) fn record_child_outcome(
+        &self,
+        outcome: ChildOutcomeSummary,
+    ) -> Result<(), ChildOutcomeSummary> {
         let id = outcome.operation_id;
         let stop_siblings = {
             let mut state = lock(&self.state);
@@ -633,7 +711,11 @@ impl ScopeCore {
     /// `true` if recording this settlement retired the child; `false` if the
     /// child is unknown, already has a settlement, or still awaits another
     /// lifecycle fact.
-    pub(crate) fn record_child_settlement(&self, id: OperationId, settlement: Arc<SettlementReport>) -> bool {
+    pub(crate) fn record_child_settlement(
+        &self,
+        id: OperationId,
+        settlement: Arc<SettlementReport>,
+    ) -> bool {
         {
             let mut state = lock(&self.state);
             let Some(record) = state.active_children.get_mut(&id) else {
@@ -703,7 +785,10 @@ impl ScopeCore {
     ///
     /// Returns `ScopeEnded` if this scope is closed, or `Stopped` if an
     /// ancestor stop or manager shutdown prevents the mutation.
-    pub(crate) fn with_resource_lifecycle<R>(&self, action: impl FnOnce() -> R) -> Result<R, ResourceManageErrorKind> {
+    pub(crate) fn with_resource_lifecycle<R>(
+        &self,
+        action: impl FnOnce() -> R,
+    ) -> Result<R, ResourceManageErrorKind> {
         self.with_lifecycle_gate(|| {
             if !self.is_open() {
                 return Err(ResourceManageErrorKind::ScopeEnded);
@@ -835,7 +920,8 @@ impl ScopeCore {
         let callback = {
             let mut state = lock(&self.state);
             assert!(state.settlement_callback.is_none());
-            if !state.open && state.active_children.is_empty() && state.pending_resource_scopes == 0 {
+            if !state.open && state.active_children.is_empty() && state.pending_resource_scopes == 0
+            {
                 Some(Box::new(callback) as Box<dyn FnOnce() + Send>)
             } else {
                 state.settlement_callback = Some(Box::new(callback));
@@ -897,6 +983,24 @@ impl ScopeCore {
             Ok(value) => OperationOutcome::Succeeded(value),
             Err(error) => OperationOutcome::Failed(error),
         }
+    }
+
+    /// Applies this scope's stop and required-child policy to a typed outcome
+    /// supplied by an external execution adapter.
+    pub(crate) fn resolve_typed_outcome<T, E>(
+        &self,
+        outcome: OperationOutcome<T, E>,
+    ) -> OperationOutcome<T, E> {
+        if let Some(failure) = self.required_failure() {
+            return OperationOutcome::ChildFailed(failure);
+        }
+        if let Some(reason) = self.context.stop_reason() {
+            return OperationOutcome::Stopped(StopReport {
+                reason,
+                accepted_at: None,
+            });
+        }
+        outcome
     }
 
     /// Ends child/resource admission, ends registered owners, and signals
@@ -968,7 +1072,9 @@ impl ScopeCore {
                 return Err(resource_scope);
             }
             state.pending_resource_scopes = state.pending_resource_scopes.saturating_add(1);
-            state.resources.push(Box::new(resource_scope.internal_clone()));
+            state
+                .resources
+                .push(Box::new(resource_scope.internal_clone()));
         }
         let weak = Arc::downgrade(self);
         let progress_scope = Arc::downgrade(self);
@@ -997,7 +1103,9 @@ impl ScopeCore {
         let callback = {
             let mut state = lock(&self.state);
             state.pending_resource_scopes = state.pending_resource_scopes.saturating_sub(1);
-            state.resource_reports_total = state.resource_reports_total.saturating_add(report.resources.len());
+            state.resource_reports_total = state
+                .resource_reports_total
+                .saturating_add(report.resources.len());
             for resource in report.resources.iter().cloned() {
                 if state.resource_reports.len() < self.diagnostic_limit {
                     state.resource_reports.push(resource);
@@ -1005,7 +1113,9 @@ impl ScopeCore {
                     state.resource_reports_truncated = true;
                 }
             }
-            state.cleanup_failures_total = state.cleanup_failures_total.saturating_add(report.failures.len());
+            state.cleanup_failures_total = state
+                .cleanup_failures_total
+                .saturating_add(report.failures.len());
             for failure in report.failures.iter().cloned() {
                 if state.cleanup_failures.len() < self.diagnostic_limit {
                     state.cleanup_failures.push(failure);
@@ -1013,7 +1123,9 @@ impl ScopeCore {
                     state.cleanup_failures_truncated = true;
                 }
             }
-            state.recoveries_total = state.recoveries_total.saturating_add(report.recoveries.len());
+            state.recoveries_total = state
+                .recoveries_total
+                .saturating_add(report.recoveries.len());
             for recovery in report.recoveries.iter().cloned() {
                 if state.recoveries.len() < self.diagnostic_limit {
                     state.recoveries.push(recovery);
@@ -1051,10 +1163,9 @@ impl ScopeCore {
     #[inline]
     fn outcomes_ready(state: &ScopeState) -> bool {
         state.body_finished
-            && state
-                .active_children
-                .values()
-                .all(|record| record.requirement != ChildRequirement::Required || record.outcome.is_some())
+            && state.active_children.values().all(|record| {
+                record.requirement != ChildRequirement::Required || record.outcome.is_some()
+            })
     }
 
     /// Takes the outcome callback exactly once after the required facts are
@@ -1091,14 +1202,16 @@ impl ScopeCore {
     fn settle_child_if_ready(&self, id: OperationId) -> bool {
         let settled = {
             let mut state = lock(&self.state);
-            let ready = state
-                .active_children
-                .get(&id)
-                .is_some_and(|record| record.outcome.is_some() && record.settlement.is_some() && record.input_released);
+            let ready = state.active_children.get(&id).is_some_and(|record| {
+                record.outcome.is_some() && record.settlement.is_some() && record.input_released
+            });
             if !ready {
                 return false;
             }
-            let record = state.active_children.remove(&id).expect("ready child record exists");
+            let record = state
+                .active_children
+                .remove(&id)
+                .expect("ready child record exists");
             let child = ChildSettlement {
                 operation_id: id,
                 outcome: record.outcome.expect("ready child has outcome"),
@@ -1129,13 +1242,17 @@ impl ScopeCore {
     /// `true` if this scope or one of its ancestors has accepted a stop.
     #[must_use]
     fn ancestor_stop_accepted(&self) -> bool {
-        lock(&self.state).stopping
-            || self.context.stop_reason().is_some()
-            || self
-                .parent
-                .as_ref()
-                .and_then(Weak::upgrade)
-                .is_some_and(|parent| parent.ancestor_stop_accepted())
+        ({
+            let state = lock(&self.state);
+            state.stopping || !state.open
+        }) || {
+            self.context.stop_reason().is_some()
+                || self
+                    .parent
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|parent| parent.ancestor_stop_accepted())
+        }
     }
 
     /// Runs `action` under the manager-wide start/stop gate when available.
@@ -1329,7 +1446,10 @@ mod lifecycle_tests {
         manager
             .try_submit_body(move |scope| {
                 let core = Arc::clone(&scope.core);
-                assert!(core.register_resource_owner(Box::new(EndProbe(counter))).is_ok());
+                assert!(
+                    core.register_resource_owner(Box::new(EndProbe(counter)))
+                        .is_ok()
+                );
                 scope.manager().try_submit_body(|_| {}).unwrap();
                 *saved_in_body.lock().unwrap() = Some(core);
             })
@@ -1378,7 +1498,8 @@ mod lifecycle_tests {
                 let scope = Arc::clone(&operation_scope.core);
                 let id = ResourceScopeId::new_unique();
                 let capacity = Arc::new(scope.capacity().resource_scope_for(id, 1));
-                let resources = ResourceScope::new(ManagerId::new_unique(), id, capacity, Arc::new(NoCleanup));
+                let resources =
+                    ResourceScope::new(ManagerId::new_unique(), id, capacity, Arc::new(NoCleanup));
                 let permit = scope.capacity().resource_scope_permits().unwrap();
 
                 assert!(matches!(
@@ -1473,8 +1594,15 @@ mod lifecycle_tests {
             })
             .unwrap();
         let sibling = sibling.lock().unwrap().take().unwrap();
-        assert_eq!(sibling.context.stop_reason(), Some(StopReason::RequiredChildFailed));
-        assert!(!sibling.mark_child(OperationId::new_unique(), Weak::new(), ChildRequirement::Required,));
+        assert_eq!(
+            sibling.context.stop_reason(),
+            Some(StopReason::RequiredChildFailed)
+        );
+        assert!(!sibling.mark_child(
+            OperationId::new_unique(),
+            Weak::new(),
+            ChildRequirement::Required,
+        ));
 
         let parent = Arc::new(Mutex::new(None::<Arc<ScopeCore>>));
         let parent_in_body = Arc::clone(&parent);
@@ -1486,13 +1614,24 @@ mod lifecycle_tests {
                     requirement: ChildRequirement::Optional,
                     ..OperationOptions::default()
                 };
-                let id = scope.manager().try_submit_body_with(options, |_| {}).unwrap();
+                let id = scope
+                    .manager()
+                    .try_submit_body_with(options, |_| {})
+                    .unwrap();
                 core.record_child_outcome(outcome(id, ChildOutcomeKind::Failed))
                     .unwrap();
                 *parent_in_body.lock().unwrap() = Some(core);
             })
             .unwrap();
-        assert!(parent.lock().unwrap().as_ref().unwrap().required_failure().is_none());
+        assert!(
+            parent
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .required_failure()
+                .is_none()
+        );
     }
 
     #[test]

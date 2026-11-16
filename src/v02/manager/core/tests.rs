@@ -222,10 +222,13 @@ fn test_async_submit_is_lazy_and_cancel_releases_waiter() {
     let async_manager = root.as_async();
     let body_calls = Arc::new(AtomicUsize::new(0));
     let body_counter = Arc::clone(&body_calls);
-    let mut submit = Box::pin(async_manager.submit(OperationOptions::default(), move |_| async move {
-        body_counter.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, ()>(())
-    }));
+    let mut submit = Box::pin(async_manager.submit(
+        OperationOptions::default(),
+        move |_| async move {
+            body_counter.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ()>(())
+        },
+    ));
     assert_eq!(port.attempts.load(Ordering::SeqCst), 0);
     assert_eq!(port.waiters.load(Ordering::SeqCst), 0);
     assert!(poll_once(submit.as_mut()).is_pending());
@@ -244,10 +247,13 @@ fn test_async_submit_retries_after_capacity_wake_without_losing_notification() {
     let async_manager = root.as_async();
     let body_calls = Arc::new(AtomicUsize::new(0));
     let body_counter = Arc::clone(&body_calls);
-    let mut submit = Box::pin(async_manager.submit(OperationOptions::default(), move |_| async move {
-        body_counter.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, ()>(8usize)
-    }));
+    let mut submit = Box::pin(async_manager.submit(
+        OperationOptions::default(),
+        move |_| async move {
+            body_counter.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ()>(8usize)
+        },
+    ));
     assert!(poll_once(submit.as_mut()).is_pending());
     assert_eq!(port.waiters.load(Ordering::SeqCst), 1);
     port.make_ready();
@@ -288,13 +294,14 @@ fn test_async_submit_parent_close_and_stop_interrupt_wait_and_preserve_body() {
         let body_calls = Arc::new(AtomicUsize::new(0));
         let body_counter = Arc::clone(&body_calls);
         let captured = DropCounter(Arc::clone(&body_calls));
-        let mut submit = Box::pin(
-            async_child_manager.submit(OperationOptions::default(), move |_| async move {
+        let mut submit = Box::pin(async_child_manager.submit(
+            OperationOptions::default(),
+            move |_| async move {
                 let _captured = captured;
                 body_counter.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, ()>(())
-            }),
-        );
+            },
+        ));
         assert!(poll_once(submit.as_mut()).is_pending());
         assert_eq!(port.waiters.load(Ordering::SeqCst), 1);
         port.make_ready();
@@ -479,10 +486,11 @@ fn test_recovery_required_overrides_real_transfer_in_operation_settlement() {
             )
             .unwrap();
             let transferred_id = ResourceId::new(manager_id, 1, 1);
-            let receipt = match receiver.accept(transferred_id, source_scope_id, Box::new(TransferOwner)) {
-                Ok(receipt) => receipt,
-                Err(_) => panic!("receiver should accept committed transfer"),
-            };
+            let receipt =
+                match receiver.accept(transferred_id, source_scope_id, Box::new(TransferOwner)) {
+                    Ok(receipt) => receipt,
+                    Err(_) => panic!("receiver should accept committed transfer"),
+                };
             assert_eq!(receipt.resource(), transferred_id);
 
             let failing_resource = reporting_scope.manage(PanicsOnDrop).unwrap();
@@ -506,7 +514,10 @@ fn test_recovery_required_overrides_real_transfer_in_operation_settlement() {
 
 struct TransferOwner;
 impl CleanupJob for TransferOwner {
-    fn schedule(self: Box<Self>, executor: Arc<CleanupExecutor>) -> Result<(), Box<dyn CleanupJob>> {
+    fn schedule(
+        self: Box<Self>,
+        executor: Arc<CleanupExecutor>,
+    ) -> Result<(), Box<dyn CleanupJob>> {
         match executor.reserve_drop() {
             Ok(permit) => {
                 permit.drop_value(self);
@@ -556,10 +567,11 @@ fn test_accepted_cleanup_transfer_is_in_operation_settlement() {
             )
             .unwrap();
             let resource_id = ResourceId::new(manager_id, 1, 1);
-            let receipt = match receiver.accept(resource_id, source_scope_id, Box::new(TransferOwner)) {
-                Ok(receipt) => receipt,
-                Err(_) => panic!("receiver should accept committed transfer"),
-            };
+            let receipt =
+                match receiver.accept(resource_id, source_scope_id, Box::new(TransferOwner)) {
+                    Ok(receipt) => receipt,
+                    Err(_) => panic!("receiver should accept committed transfer"),
+                };
             assert_eq!(receipt.resource(), resource_id);
             assert_eq!(receiver.drive(1), 1);
             executor.shutdown().wait().unwrap();
@@ -571,7 +583,10 @@ fn test_accepted_cleanup_transfer_is_in_operation_settlement() {
         Some(crate::v02::report::OperationOutcome::Succeeded(()))
     ));
     let settlement = handle.wait_settlement().unwrap();
-    assert_eq!(settlement.status, crate::v02::report::SettlementStatus::Transferred);
+    assert_eq!(
+        settlement.status,
+        crate::v02::report::SettlementStatus::Transferred
+    );
     assert_eq!(settlement.transferred_count, 1);
     assert_eq!(settlement.transfers_total, 1);
     assert_eq!(settlement.transfers.len(), 1);
@@ -582,7 +597,9 @@ fn test_typed_async_submission_preserves_target_and_publishes_lifecycle() {
     let (_, root) = ManagerCore::for_test();
     let mut handle = root
         .as_async()
-        .try_submit(OperationOptions::default(), |_| async { Ok::<_, ()>(24usize) })
+        .try_submit(OperationOptions::default(), |_| async {
+            Ok::<_, ()>(24usize)
+        })
         .unwrap()
         .into_sync();
     assert!(matches!(
@@ -790,7 +807,10 @@ fn test_required_child_failure_changes_parent_outcome_but_not_settlement_fact() 
         crate::v02::report::OperationOutcome::ChildFailed(_)
     ));
     let settlement = parent.wait_settlement().unwrap();
-    assert_eq!(settlement.status, crate::v02::report::SettlementStatus::Released);
+    assert_eq!(
+        settlement.status,
+        crate::v02::report::SettlementStatus::Released
+    );
     assert_eq!(settlement.children_total, 1);
     drop(parent);
     drop(root);
@@ -865,7 +885,12 @@ fn test_manager_conversion_preserves_parent() {
     let (core, root) = ManagerCore::for_test();
     root.try_submit_body(|scope| {
         let parent = scope.id();
-        scope.manager().as_async().as_sync().try_submit_body(|_| {}).unwrap();
+        scope
+            .manager()
+            .as_async()
+            .as_sync()
+            .try_submit_body(|_| {})
+            .unwrap();
         assert_eq!(parent, scope.id());
     })
     .unwrap();
@@ -915,7 +940,11 @@ fn test_frame_end_closes_scope_even_when_scope_moves_out() {
     let scope = escaped.lock().unwrap().take().unwrap();
     assert!(!scope.is_open());
     assert_eq!(
-        scope.manager().try_submit_body(|_| {}).unwrap_err().reason(),
+        scope
+            .manager()
+            .try_submit_body(|_| {})
+            .unwrap_err()
+            .reason(),
         AdmissionError::ScopeEnded
     );
 }
@@ -958,7 +987,12 @@ fn reserve_production_root(
     SubmissionReservation,
 ) {
     let core = manager.core_arc();
-    let reserved = core.reserve_scope(&manager.target, OperationOptions::default(), ExecutionKind::Sync, || {});
+    let reserved = core.reserve_scope(
+        &manager.target,
+        OperationOptions::default(),
+        ExecutionKind::Sync,
+        || {},
+    );
     let (_, id, scope, reservation) = match reserved {
         Ok(reserved) => reserved,
         Err(_) => panic!("default production manager should reserve a root"),
@@ -976,6 +1010,7 @@ fn test_preflight_rejection_returns_body_before_scope_registration() {
         ExecutionKind::Sync,
         17usize,
         |_| Err(AdmissionError::AlreadyBound),
+        false,
     );
     let error = match rejected {
         Ok(_) => panic!("preflight rejection must roll back reservation"),
@@ -1015,7 +1050,10 @@ fn test_production_cancel_abandons_adapter_without_running_unstarted_body() {
         core.request_shutdown(ShutdownMode::Cancel),
         super::ManagerPhase::Cancelling
     );
-    assert_eq!(scope.context().stop_reason(), Some(StopReason::ManagerShutdown));
+    assert_eq!(
+        scope.context().stop_reason(),
+        Some(StopReason::ManagerShutdown)
+    );
     let ran_body = Arc::new(AtomicUsize::new(0));
     let payload_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let abandon_count = Arc::new(AtomicUsize::new(0));
@@ -1152,14 +1190,19 @@ fn test_async_manager_run_and_run_and_settle_return_outcomes() {
     let (_, root) = ManagerCore::for_test();
     let async_manager = root.as_async();
 
-    let mut run = Box::pin(async_manager.run(OperationOptions::default(), |_| async { Ok::<_, ()>(17usize) }));
+    let mut run = Box::pin(async_manager.run(OperationOptions::default(), |_| async {
+        Ok::<_, ()>(17usize)
+    }));
     assert!(matches!(
         poll_once(run.as_mut()),
         std::task::Poll::Ready(Ok(crate::v02::report::OperationOutcome::Succeeded(17)))
     ));
 
-    let mut run_and_settle =
-        Box::pin(async_manager.run_and_settle(OperationOptions::default(), |_| async { Ok::<_, ()>(23usize) }));
+    let mut run_and_settle = Box::pin(
+        async_manager.run_and_settle(OperationOptions::default(), |_| async {
+            Ok::<_, ()>(23usize)
+        }),
+    );
     match poll_once(run_and_settle.as_mut()) {
         std::task::Poll::Ready(Ok(completion)) => {
             assert!(matches!(
