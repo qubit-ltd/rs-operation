@@ -1,7 +1,7 @@
 error[E0596]: cannot borrow data in dereference of `ResourceRef<String>` as mutable
- --> tests/ui/v03/resource_ref_deref_mut.rs:4:5
-  |
-4 |     resource.push_str("forbidden");
-  |     ^^^^^^^^ cannot borrow as mutable
-  |
-  = help: trait `DerefMut` is required to modify through a dereference, but it is not implemented for `ResourceRef<String>`
+  --> tests/ui/v03/resource_ref_deref_mut.rs:12:5
+   |
+12 |     resource.push_str("forbidden");
+   |     ^^^^^^^^ cannot borrow as mutable
+   |
+   = help: trait `DerefMut` is required to modify through a dereference, but it is not implemented for `ResourceRef<String>`
