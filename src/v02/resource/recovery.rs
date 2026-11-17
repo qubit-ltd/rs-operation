@@ -48,6 +48,8 @@ use crate::v02::report::RecoveryStoreOptions;
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Display;
+    use std::fmt::Formatter;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -70,6 +72,41 @@ mod tests {
     use crate::v02::report::DiagnosticSummary;
     use crate::v02::report::ManagerId;
     use crate::v02::report::ResourceId;
+
+    struct PanicOnDropError(Arc<AtomicUsize>);
+
+    impl std::fmt::Debug for PanicOnDropError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("PanicOnDropError")
+        }
+    }
+
+    impl Display for PanicOnDropError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("error panics on drop")
+        }
+    }
+
+    impl std::error::Error for PanicOnDropError {}
+
+    impl Drop for PanicOnDropError {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("diagnostic source drop panic");
+        }
+    }
+
+    fn failure_with_panicking_source(
+        resource_id: ResourceId,
+        drops: &Arc<AtomicUsize>,
+    ) -> CleanupFailure {
+        CleanupFailure {
+            resource_id,
+            stage: CleanupStage::Drop,
+            summary: DiagnosticSummary::new("panicking diagnostic source"),
+            source: Some(Arc::new(PanicOnDropError(Arc::clone(drops)))),
+        }
+    }
 
     struct Noop;
     impl RecoveryAction for Noop {
@@ -102,6 +139,71 @@ mod tests {
                 Ok(())
             }))
         }
+    }
+
+    #[test]
+    fn test_recovery_finalization_publishes_to_all_observers() {
+        let resource_id = ResourceId::new(ManagerId::new_unique(), 20, 1);
+        let (started, started_receiver) = std::sync::mpsc::channel();
+        let gate = Arc::new(Gate {
+            state: Mutex::new((false, None)),
+            started,
+        });
+        let core = Arc::new(RecoveryCore::new(
+            vec![resource_id],
+            Arc::new(()),
+            Arc::new(GateAction(Arc::clone(&gate))),
+        ));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let failed = core.try_retry().expect("retry should be admitted");
+        failed.finish(Err(failure_with_panicking_source(resource_id, &drops)));
+        let first_report = failed.wait().unwrap();
+        assert_eq!(first_report.recovery.failures_total, 1);
+        drop(first_report);
+        drop(failed);
+
+        let terminal_calls = Arc::new(AtomicUsize::new(0));
+        let callback_count = Arc::clone(&terminal_calls);
+        core.set_terminal_callback(Arc::new(move |present| {
+            assert!(!present);
+            callback_count.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let attempt = core.try_retry().expect("retry should be admitted");
+        let observer = attempt.as_async();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(WakeCounter(Arc::clone(&wakes))));
+        let mut context = Context::from_waker(&waker);
+        let mut wait = Box::pin(observer.wait());
+        assert!(matches!(wait.as_mut().poll(&mut context), Poll::Pending));
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("retry action should start before returning Pending");
+        gate.open();
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wait.as_mut().poll(&mut context)));
+
+        assert!(
+            result.is_ok(),
+            "diagnostic drop must not prevent terminal publication"
+        );
+        let async_report = match result.unwrap() {
+            Poll::Ready(report) => report,
+            Poll::Pending => panic!("completed gate should wake its async observer"),
+        };
+        let sync_report = attempt.wait().unwrap();
+        assert_eq!(sync_report.recovery.phase, RecoveryPhase::Resolved);
+        assert_eq!(async_report.recovery.phase, sync_report.recovery.phase);
+        assert_eq!(async_report.recovery.id, sync_report.recovery.id);
+        assert_eq!(
+            async_report.recovery.failures_total,
+            sync_report.recovery.failures_total
+        );
+        assert!(sync_report.recovery.last_failures.is_empty());
+        assert_eq!(sync_report.recovery.failures_total, 0);
+        assert_eq!(terminal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(wakes.load(Ordering::SeqCst) > 0, "completion should wake the pending observer");
     }
 
     struct Probe(Arc<AtomicUsize>);
@@ -137,6 +239,34 @@ mod tests {
                 }
             })
             .await
+        }
+    }
+
+    struct GateAction(Arc<Gate>);
+
+    impl RecoveryAction for GateAction {
+        fn retry(
+            &self,
+            _payload: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), CleanupFailure>> + Send + 'static>> {
+            let gate = Arc::clone(&self.0);
+            Box::pin(async move {
+                let _ = gate.started.send(());
+                gate.wait().await;
+                Ok(())
+            })
+        }
+    }
+
+    struct WakeCounter(Arc<AtomicUsize>);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 

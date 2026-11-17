@@ -460,11 +460,14 @@ impl RecoveryCore {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::fmt::Display;
+    use std::fmt::Formatter;
     use std::future::ready;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::sync::Weak;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
 
     use super::RecoveryCore;
     use crate::v02::report::CleanupFailure;
@@ -474,6 +477,42 @@ mod tests {
     use crate::v02::report::ResourceId;
     use crate::v02::resource::recovery::RecoveryAction;
     use crate::v02::resource::recovery::RecoveryFuture;
+
+    struct PanicOnDropError(Arc<AtomicUsize>);
+
+    impl std::fmt::Debug for PanicOnDropError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("PanicOnDropError")
+        }
+    }
+
+    impl Display for PanicOnDropError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("error panics on drop")
+        }
+    }
+
+    impl Error for PanicOnDropError {}
+
+    impl Drop for PanicOnDropError {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("diagnostic source drop panic");
+        }
+    }
+
+    fn failure_with_panicking_source(
+        resource_id: ResourceId,
+        sequence: usize,
+        drops: &Arc<AtomicUsize>,
+    ) -> CleanupFailure {
+        CleanupFailure {
+            resource_id,
+            stage: CleanupStage::Drop,
+            summary: DiagnosticSummary::new(&format!("failure-{sequence}")),
+            source: Some(Arc::new(PanicOnDropError(Arc::clone(drops)))),
+        }
+    }
 
     struct NoopAction;
 
@@ -538,7 +577,11 @@ mod tests {
     #[test]
     fn test_failure_history_metadata_saturates_clears_and_survives_transfer() {
         let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
-        let core = Arc::new(RecoveryCore::new(vec![resource_id], Arc::new(()), Arc::new(NoopAction)));
+        let core = Arc::new(RecoveryCore::new(
+            vec![resource_id],
+            Arc::new(()),
+            Arc::new(NoopAction),
+        ));
         {
             let mut state = super::lock(&core.state);
             state.failures_total = usize::MAX;
@@ -562,6 +605,121 @@ mod tests {
         assert_eq!(resolved.failures_total, 0);
         assert!(!resolved.failures_truncated);
         assert_eq!(resolved.attempts, 1, "success must preserve the attempt count");
+    }
+
+    #[test]
+    fn test_recovery_finalization_success_clears_panicking_history() {
+        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
+        let core = Arc::new(RecoveryCore::new(vec![resource_id], Arc::new(()), Arc::new(NoopAction)));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let failed_attempt = core.try_retry().expect("retry should be admitted");
+        failed_attempt.finish(Err(failure_with_panicking_source(resource_id, 0, &drops)));
+        drop(failed_attempt);
+
+        let resolved_attempt = core.try_retry().expect("retry should be admitted");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resolved_attempt.finish(Ok(()));
+        }));
+
+        assert!(
+            result.is_ok(),
+            "diagnostic source panic must not escape finalization"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(core.snapshot().phase, crate::v02::report::RecoveryPhase::Resolved);
+        assert!(core.snapshot().last_failures.is_empty());
+        assert_eq!(core.snapshot().failures_total, 0);
+    }
+
+    #[test]
+    fn test_recovery_finalization_eviction_keeps_reportable_history() {
+        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
+        let core = Arc::new(RecoveryCore::new(
+            vec![resource_id],
+            Arc::new(()),
+            Arc::new(NoopAction),
+        ));
+        let drops = Arc::new(AtomicUsize::new(0));
+        for sequence in 0..64 {
+            let attempt = core.try_retry().expect("retry should be admitted");
+            let failure = if sequence == 0 {
+                failure_with_panicking_source(resource_id, sequence, &drops)
+            } else {
+                failure(resource_id, sequence)
+            };
+            attempt.finish(Err(failure));
+        }
+
+        let attempt = core.try_retry().expect("retry should be admitted");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            attempt.finish(Err(failure(resource_id, 64)));
+        }));
+
+        assert!(
+            result.is_ok(),
+            "evicted source panic must not interrupt failure publication"
+        );
+        let report = attempt.wait().expect("completed attempt report should be published");
+        let snapshot = core.snapshot();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(report.recovery.phase, crate::v02::report::RecoveryPhase::Pending);
+        assert_eq!(report.recovery.last_failures.len(), 64);
+        assert_eq!(report.recovery.failures_total, 65);
+        assert!(report.recovery.failures_truncated);
+        assert_eq!(snapshot.phase, crate::v02::report::RecoveryPhase::Pending);
+        assert_eq!(snapshot.last_failures.len(), 64);
+        assert_eq!(snapshot.failures_total, 65);
+        assert!(snapshot.failures_truncated);
+    }
+
+    #[test]
+    fn test_recovery_finalization_multiple_panicking_sources_child() {
+        if std::env::var_os("OP008_MULTIPLE_PANICKING_SOURCES_CHILD").is_some() {
+            let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
+            let core = Arc::new(RecoveryCore::new(
+                vec![resource_id],
+                Arc::new(()),
+                Arc::new(NoopAction),
+            ));
+            let drops = Arc::new(AtomicUsize::new(0));
+            for sequence in 0..2 {
+                let attempt = core.try_retry().expect("retry should be admitted");
+                attempt.finish(Err(failure_with_panicking_source(
+                    resource_id,
+                    sequence,
+                    &drops,
+                )));
+            }
+            let attempt = core.try_retry().expect("retry should be admitted");
+            attempt.finish(Ok(()));
+            assert_eq!(drops.load(Ordering::SeqCst), 2);
+            return;
+        }
+
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable path"))
+                .arg("--exact")
+                .arg("v02::resource::recovery::internal::recovery_core::tests::test_recovery_finalization_multiple_panicking_sources_child")
+                .arg("--nocapture")
+                .env("OP008_MULTIPLE_PANICKING_SOURCES_CHILD", "1")
+                .spawn()
+                .expect("child test should start");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("child status should be available") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().expect("timed out child should be killed");
+                let _ = child.wait();
+                panic!("multiple-source finalization child exceeded five-second watchdog");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "isolated multiple-source child exited with {status}"
+        );
     }
 
     #[test]
