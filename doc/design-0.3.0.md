@@ -311,6 +311,8 @@ Transfer means accepted responsibility, not resource release. The store independ
 
 A completed recovery future is explicitly dropped inside a panic boundary after it returns Ready. If that final destructor panics, its result is not trusted: the group becomes Unconfirmed, retains its owner and action, and publishes the attempt report. The returned value is also disposed behind an unwind boundary. This conservative result applies even when poll returned success because the destructor may still perform required cleanup.
 
+Once finalization has reliable evidence that cleanup succeeded, later panics while dropping old failure sources or completed run, action, payload, and wrapper references do not revoke Resolved or the cleared history. Each such value is dropped behind its own unwind boundary, after which terminal notification and attempt-report publication continue. If a retry failed, a panic while dropping an evicted diagnostic source leaves the group Pending with the existing bounded history, total, and truncation semantics; its attempt report can still be published. A panic during cleanup construction or polling, or during destruction of the Ready future, remains Unconfirmed and retains the owner, action, or future under the existing rules. These guarantees cover the described finalization drops; they do not imply that every callback or waker panic is caught, that panic=abort is recoverable, or that the system provides a complete panic audit.
+
 ### 10.3 Bounded history independent of ownership
 
 Recovery snapshots retain the latest 64 failures, oldest to newest. Totals saturate, truncation marks eviction, and confirmed success resets history. Attempt failures represent retained history at completion, not only that attempt's events.

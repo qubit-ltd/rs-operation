@@ -478,6 +478,8 @@ pub fn hand_off(handle: &RecoveryHandle, store: &RecoveryStore) -> Result<(), St
 
 完成后的 retry future 在返回 `Ready` 后还会被显式析构。若最终析构 panic，即使 poll 返回成功也不信任该结果：恢复组进入 `Unconfirmed`，保留 owner 和 action，并发布 attempt 报告。放弃的结果值会在单独的 unwind 边界内释放，避免其错误值清理再次阻断报告发布。
 
+恢复逻辑取得可靠的清理成功证据后，之后析构旧失败 source、已完成的 run/action/payload 或包装引用时发生的 panic，不会撤销 `Resolved` 或已清空的失败历史。收尾会逐项隔离这些析构，并继续 terminal notification 与 attempt report 发布。重试失败时，淘汰诊断 source 的析构 panic 会保持恢复组为 `Pending`；仍遵循有界 history、total 和 truncated 语义，attempt report 仍可发布。清理构造或 poll 期间的 panic，以及 `Ready` future 析构 panic，仍为 `Unconfirmed`，并按现有责任规则保留 owner、action 或 future。这只保障这些收尾路径；不保证捕获所有 callback 或 waker panic，不能恢复 `panic=abort`，也不提供完整 panic 审计。
+
 直接驱动模式中，第一个等待者推进清理；丢弃正在驱动的 Pending future 会保留未完成动作并记录 Unconfirmed。若已派发到 store worker，取消观察不停止 worker。不要为了重试超时而立即创建第二个清理动作；先确认已有 attempt 和资源状态。
 
 ### 11.3 恢复历史和持久化边界

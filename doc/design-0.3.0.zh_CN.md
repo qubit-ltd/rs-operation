@@ -311,6 +311,8 @@ RecoveryStore 验证状态、身份、资源组和容量后才返回 receipt，�
 
 恢复 future 返回 Ready 后，会在 panic 边界内显式析构。若最终析构 panic，结果不可信：恢复组进入 Unconfirmed，保留 owner 和 action，并发布 attempt 报告。放弃的返回值也在 unwind 边界内释放。即使 poll 返回成功也采用这一保守结果，因为析构本身仍可能承担必要清理。
 
+收尾取得可靠的清理成功证据后，之后析构旧失败 source、已完成的 run/action/payload 或包装引用时发生的 panic，不会撤销 Resolved 或已清空的历史。每个值都在各自的 unwind 边界内析构，随后继续 terminal notification 和 attempt report 发布。重试失败时，淘汰诊断 source 的析构 panic 会使恢复组保持 Pending，沿用既有有界 history、total 和 truncated 语义；attempt report 仍可发布。清理构造或 poll 期间的 panic，或 Ready future 析构 panic，仍为 Unconfirmed，并按既有规则保留 owner、action 或 future。这些保证只覆盖所述收尾析构；不代表捕获所有 callback 或 waker panic，不能恢复 panic=abort，也不提供完整 panic 审计。
+
 ### 10.3 有界历史与 owner 分离
 
 恢复快照保留最近 64 条失败，旧到新排列；total 饱和计数，truncated 记录淘汰，确认成功后重置。attempt failures 是完成时的保留历史，不是仅本次事件。
