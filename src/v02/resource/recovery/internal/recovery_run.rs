@@ -6,6 +6,7 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use crate::v02::report::CleanupFailure;
@@ -28,7 +29,7 @@ pub(in crate::v02::resource::recovery) struct RecoveryRun {
     /// Shared owner payload kept alive until this retry finishes or is dropped.
     pub(in crate::v02::resource::recovery) payload: Option<RecoveryPayload>,
     /// Action that performs cleanup for this retry.
-    pub(in crate::v02::resource::recovery) action: Arc<dyn RecoveryAction>,
+    pub(in crate::v02::resource::recovery) action: Option<Arc<dyn RecoveryAction>>,
     /// Whether this run has already published or abandoned its outcome.
     pub(in crate::v02::resource::recovery) completed: bool,
     /// Optional capacity reserved for scheduling the async cleanup action.
@@ -36,6 +37,23 @@ pub(in crate::v02::resource::recovery) struct RecoveryRun {
 }
 
 impl RecoveryRun {
+    /// Drops one value owned by recovery finalization behind an unwind boundary.
+    fn drop_finalization_value<T>(value: T) {
+        if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(value))) {
+            crate::v02::manager::core::dispose_panic_payload(panic);
+        }
+    }
+
+    /// Releases the references owned by this run after its core transition.
+    fn release_run_references(&mut self) {
+        if let Some(payload) = self.payload.take() {
+            Self::drop_finalization_value(payload);
+        }
+        if let Some(action) = self.action.take() {
+            Self::drop_finalization_value(action);
+        }
+    }
+
     /// Records an unconfirmed outcome after an action panic without releasing
     /// the payload or action retained by the recovery core.
     ///
@@ -51,7 +69,7 @@ impl RecoveryRun {
     ) {
         self.core.mark_unconfirmed(self.generation, panic, future);
         self.completed = true;
-        self.payload.take();
+        self.release_run_references();
     }
 
     /// Records a cancelled retry while preserving its pending cleanup future.
@@ -66,7 +84,7 @@ impl RecoveryRun {
     ) {
         self.core.mark_cancelled(self.generation, future);
         self.completed = true;
-        self.payload.take();
+        self.release_run_references();
     }
 
     /// Applies the cleanup result if this run still owns the active generation.
@@ -84,13 +102,15 @@ impl RecoveryRun {
         let mut released_action = None;
         let mut old_failures = Vec::new();
         let mut evicted_failure = None;
+        let mut rejected_result = None;
         let resolved;
         {
             let mut state = lock(&self.core.state);
             if state.phase != RecoveryPhase::Running || state.generation != self.generation {
                 self.completed = true;
-                return;
-            }
+                rejected_result = Some(result);
+                resolved = false;
+            } else {
             match result {
                 Ok(()) => {
                     state.phase = RecoveryPhase::Resolved;
@@ -106,14 +126,25 @@ impl RecoveryRun {
                 }
             }
             resolved = state.phase == RecoveryPhase::Resolved;
+            }
         }
         self.completed = true;
-        self.payload.take();
-        // A resource's last Drop may call arbitrary user code.
-        drop(released_payload);
-        drop(released_action);
-        drop(old_failures);
-        drop(evicted_failure);
+        if let Some(result) = rejected_result {
+            Self::drop_finalization_value(result);
+        }
+        self.release_run_references();
+        if let Some(payload) = released_payload {
+            Self::drop_finalization_value(payload);
+        }
+        if let Some(action) = released_action {
+            Self::drop_finalization_value(action);
+        }
+        while let Some(failure) = old_failures.pop() {
+            Self::drop_finalization_value(failure);
+        }
+        if let Some(failure) = evicted_failure {
+            Self::drop_finalization_value(failure);
+        }
         if resolved {
             self.core.notify_terminal(false);
         }
@@ -134,11 +165,12 @@ impl Drop for RecoveryRun {
         if self.completed {
             return;
         }
-        let mut state = lock(&self.core.state);
-        if state.phase == RecoveryPhase::Running && state.generation == self.generation {
-            state.phase = RecoveryPhase::Unconfirmed;
+        {
+            let mut state = lock(&self.core.state);
+            if state.phase == RecoveryPhase::Running && state.generation == self.generation {
+                state.phase = RecoveryPhase::Unconfirmed;
+            }
         }
-        drop(state);
-        self.payload.take();
+        self.release_run_references();
     }
 }

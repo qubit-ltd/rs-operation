@@ -152,7 +152,12 @@ impl RecoveryAttempt {
                 let observation = Arc::clone(&self.observation);
                 permit.spawn(async move {
                     let payload = run.payload.as_ref().expect("attempt owns payload").clone();
-                    match retry_catching_panic(Arc::clone(&run.action), payload).await {
+                    match retry_catching_panic(
+                        Arc::clone(run.action.as_ref().expect("attempt owns recovery action")),
+                        payload,
+                    )
+                    .await
+                    {
                         Ok(result) => run.complete(result),
                         Err((panic, future)) => run.complete_unconfirmed(panic, future),
                     }

@@ -251,7 +251,7 @@ impl RecoveryCore {
                 core: Arc::clone(self),
                 generation,
                 payload: Some(payload),
-                action,
+                action: Some(action),
                 completed: false,
                 permit,
             }))),
@@ -522,6 +522,30 @@ mod tests {
         }
     }
 
+    struct PanicOnDropOwner(Arc<AtomicUsize>);
+
+    impl Drop for PanicOnDropOwner {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("owner wrapper drop panic");
+        }
+    }
+
+    struct PanicOnDropAction(Arc<AtomicUsize>);
+
+    impl RecoveryAction for PanicOnDropAction {
+        fn retry(&self, _payload: crate::v02::resource::recovery::RecoveryPayload) -> RecoveryFuture {
+            Box::pin(ready(Ok(())))
+        }
+    }
+
+    impl Drop for PanicOnDropAction {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("action wrapper drop panic");
+        }
+    }
+
     fn failure(resource_id: ResourceId, sequence: usize) -> CleanupFailure {
         CleanupFailure {
             resource_id,
@@ -629,6 +653,32 @@ mod tests {
         assert_eq!(core.snapshot().phase, crate::v02::report::RecoveryPhase::Resolved);
         assert!(core.snapshot().last_failures.is_empty());
         assert_eq!(core.snapshot().failures_total, 0);
+    }
+
+    #[test]
+    fn test_recovery_finalization_isolates_last_owner_and_action_drops() {
+        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
+        let owner_drops = Arc::new(AtomicUsize::new(0));
+        let action_drops = Arc::new(AtomicUsize::new(0));
+        let core = Arc::new(RecoveryCore::new(
+            vec![resource_id],
+            Arc::new(PanicOnDropOwner(Arc::clone(&owner_drops))),
+            Arc::new(PanicOnDropAction(Arc::clone(&action_drops))),
+        ));
+        let attempt = core.try_retry().expect("retry should be admitted");
+
+        let finish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            attempt.finish(Ok(()));
+        }));
+
+        assert!(finish.is_ok(), "last owner/action Drop must not escape finish");
+        assert_eq!(owner_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(action_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(core.snapshot().phase, crate::v02::report::RecoveryPhase::Resolved);
+        assert_eq!(
+            attempt.wait().expect("finish should publish its report").recovery.phase,
+            crate::v02::report::RecoveryPhase::Resolved
+        );
     }
 
     #[test]

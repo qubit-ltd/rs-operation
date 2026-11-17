@@ -87,7 +87,8 @@ impl Future for DirectRecoveryDriver {
         if this.future.is_none() {
             let run = this.run.as_mut().expect("direct retry run remains present");
             let payload = run.payload.as_ref().expect("attempt owns payload").clone();
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.action.retry(payload))) {
+            let action = Arc::clone(run.action.as_ref().expect("attempt owns recovery action"));
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action.retry(payload))) {
                 Ok(future) => this.future = Some(future),
                 Err(panic) => {
                     this.complete_unconfirmed(panic, None);
