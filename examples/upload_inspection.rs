@@ -1,12 +1,20 @@
-// Copyright (c) 2026 Haixing Hu.
-// SPDX-License-Identifier: Apache-2.0
+// =============================================================================
+//    Copyright (c) 2026 Haixing Hu.
+//
+//    SPDX-License-Identifier: Apache-2.0
+//
+//    Licensed under the Apache License, Version 2.0.
+// =============================================================================
 //! Minimal application-owned service integration used by the developer guide.
 
-use qubit_operation::{
-    ManagerOptions, OperationManager, OperationOptions, OperationOutcome, SettlementReport,
-    ShutdownMode,
-};
 use std::sync::Arc;
+
+use qubit_operation::ManagerOptions;
+use qubit_operation::OperationManager;
+use qubit_operation::OperationOptions;
+use qubit_operation::OperationOutcome;
+use qubit_operation::SettlementReport;
+use qubit_operation::ShutdownMode;
 
 // Application-owned service boundary; no HTTP or MIME library is implied.
 struct InspectionService {
@@ -26,16 +34,14 @@ impl InspectionService {
     }
 
     fn inspect(&self, bytes: Vec<u8>) -> Result<Inspection, Box<dyn std::error::Error>> {
-        let mut handle = self
-            .manager
-            .try_submit(OperationOptions::default(), move |scope| {
-                let input = scope.manage(bytes).map_err(|error| {
-                    let (kind, bytes) = error.into_parts();
-                    drop(bytes); // Vec needs no remote or asynchronous cleanup.
-                    format!("input registration failed: {kind:?}")
-                })?;
-                Ok::<_, String>(input.starts_with(b"%PDF-").then_some("application/pdf"))
+        let mut handle = self.manager.try_submit(OperationOptions::default(), move |scope| {
+            let input = scope.manage(bytes).map_err(|error| {
+                let (kind, bytes) = error.into_parts();
+                drop(bytes); // Vec needs no remote or asynchronous cleanup.
+                format!("input registration failed: {kind:?}")
             })?;
+            Ok::<_, String>(input.starts_with(b"%PDF-").then_some("application/pdf"))
+        })?;
         // This result owns no ResourceRef; either branch can now be settled.
         let outcome = handle.wait_outcome()?;
         let settlement = handle.wait_settlement()?;
