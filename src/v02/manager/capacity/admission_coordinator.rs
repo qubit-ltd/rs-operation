@@ -122,19 +122,135 @@ impl AdmissionCoordinator {
 
     /// Advances the generation and wakes every registered task.
     pub(in crate::v02::manager::capacity) fn notify(&self) {
-        {
+        let waiters = {
             let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             state.generation = state.generation.wrapping_add(1);
-        }
-        loop {
-            let waiter = {
-                let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.waiters.iter_mut().find_map(Option::take)
-            };
-            let Some(waiter) = waiter else {
-                break;
-            };
+            let mut waiters = Vec::with_capacity(state.waiters.len());
+            for slot in &mut state.waiters {
+                if let Some(waiter) = slot.take() {
+                    waiters.push(waiter);
+                }
+            }
+            waiters
+        };
+        for waiter in waiters {
             waiter.waker.wake();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Wake;
+
+    use super::*;
+
+    struct ReregisteringWake {
+        coordinator: Arc<AdmissionCoordinator>,
+        wake_count: AtomicUsize,
+        reregistered: std::sync::atomic::AtomicBool,
+    }
+
+    impl Wake for ReregisteringWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wake_count.fetch_add(1, Ordering::SeqCst);
+            if !self.reregistered.swap(true, Ordering::SeqCst) {
+                let waker = Waker::from(Arc::clone(self));
+                let generation = self.coordinator.generation();
+                self.coordinator.register(1, generation, &waker);
+            }
+        }
+    }
+
+    #[test]
+    fn test_notify_batch_excludes_reregistered_waiter() {
+        let coordinator = AdmissionCoordinator::new(1);
+        let wake = Arc::new(ReregisteringWake {
+            coordinator: Arc::clone(&coordinator),
+            wake_count: AtomicUsize::new(0),
+            reregistered: std::sync::atomic::AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&wake));
+        coordinator.register(1, coordinator.generation(), &waker);
+
+        coordinator.notify();
+
+        assert_eq!(wake.wake_count.load(Ordering::SeqCst), 1);
+        assert!(coordinator.state.lock().unwrap().waiters[0].is_some());
+
+        coordinator.notify();
+
+        assert_eq!(wake.wake_count.load(Ordering::SeqCst), 2);
+        coordinator.unregister(1);
+    }
+
+    #[test]
+    fn test_notify_batch_handles_empty_and_multiple_waiters_without_shrinking_slots() {
+        let coordinator = AdmissionCoordinator::new(3);
+        coordinator.notify();
+
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wake_count))));
+        for id in 1..=3 {
+            coordinator.register(id, coordinator.generation(), &waker);
+        }
+        coordinator.notify();
+
+        assert_eq!(wake_count.load(Ordering::SeqCst), 3);
+        assert_eq!(coordinator.state.lock().unwrap().waiters.len(), 3);
+        assert!(
+            coordinator
+                .state
+                .lock()
+                .unwrap()
+                .waiters
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    struct CountWake(Arc<AtomicUsize>);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_notify_batch_excludes_unregistered_waiter() {
+        let coordinator = AdmissionCoordinator::new(2);
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wake_count))));
+        coordinator.register(1, coordinator.generation(), &waker);
+        coordinator.register(2, coordinator.generation(), &waker);
+
+        coordinator.unregister(1);
+        coordinator.notify();
+
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        let state = coordinator.state.lock().unwrap();
+        assert_eq!(state.waiters.len(), 2);
+        assert!(state.waiters.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn test_notify_batch_generation_race_wakes_registration_immediately() {
+        let coordinator = AdmissionCoordinator::new(1);
+        let wake_count = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wake_count))));
+        let observed_generation = coordinator.generation();
+        coordinator.notify();
+
+        coordinator.register(1, observed_generation, &waker);
+
+        assert_eq!(wake_count.load(Ordering::SeqCst), 1);
+        assert!(coordinator.state.lock().unwrap().waiters[0].is_none());
     }
 }
