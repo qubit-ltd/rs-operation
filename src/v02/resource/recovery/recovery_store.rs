@@ -38,8 +38,9 @@ pub(super) type CallbackInstallGate = Arc<Mutex<Option<Arc<(std::sync::Barrier, 
 ///
 /// The store limits both retained dependency groups and the total number of
 /// resources across those groups. It retries cleanup on its worker pool and
-/// keeps unresolved owners alive until cleanup succeeds or the group is moved
-/// to another store. Clones refer to the same store state.
+/// keeps unresolved owners alive until cleanup succeeds. Once accepted, a
+/// group remains owned by that store even while retry phases change. Clones
+/// refer to the same store state.
 ///
 /// # Examples
 ///
@@ -313,8 +314,9 @@ impl RecoveryStore {
     /// Takes ownership of a complete recovery group when capacity permits.
     ///
     /// Group identity, manager ownership, and unique resource membership are
-    /// checked before the group is inserted. The returned transfer receipt
-    /// identifies this store as the receiving owner.
+    /// checked before the group is inserted. A group can be accepted by only
+    /// one store over its lifetime. The returned transfer receipt identifies
+    /// this store as the receiving owner.
     ///
     /// # Parameters
     ///

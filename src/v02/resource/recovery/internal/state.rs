@@ -17,10 +17,14 @@ use crate::v02::resource::recovery::RecoveryPayload;
 /// Maximum number of recent cleanup failures retained by one recovery core.
 pub(super) const RECOVERY_FAILURE_HISTORY_LIMIT: usize = 64;
 
-/// Mutable phase, payload, action, and failure state for one recovery group.
+/// Mutable phase, permanent store ownership, payload, action, and failure state
+/// for one recovery group.
 pub(in crate::v02::resource::recovery) struct State {
     /// Current lifecycle phase of the recovery group.
     pub(super) phase: RecoveryPhase,
+    /// Whether any store has accepted this group; retry phase changes never
+    /// clear this permanent ownership marker.
+    pub(super) store_owned: bool,
     /// Number of retry attempts admitted for this group.
     pub(super) attempts: usize,
     /// Wrapping generation assigned to the current or most recent retry run.

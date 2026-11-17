@@ -81,6 +81,29 @@ mod tests {
         }
     }
 
+    struct FailOnce {
+        calls: AtomicUsize,
+        resource_id: ResourceId,
+    }
+    impl RecoveryAction for FailOnce {
+        fn retry(
+            &self,
+            _payload: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), CleanupFailure>> + Send + 'static>> {
+            let fail = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(std::future::ready(if fail {
+                Err(CleanupFailure {
+                    resource_id: self.resource_id,
+                    stage: CleanupStage::Drop,
+                    summary: DiagnosticSummary::new("temporary failure"),
+                    source: None,
+                })
+            } else {
+                Ok(())
+            }))
+        }
+    }
+
     struct Probe(Arc<AtomicUsize>);
     impl Drop for Probe {
         fn drop(&mut self) {
@@ -968,5 +991,182 @@ mod tests {
         assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Running);
         attempt.finish(Ok(()));
         assert_eq!(group.snapshot().phase, crate::v02::report::RecoveryPhase::Resolved);
+    }
+
+    #[test]
+    fn test_recovery_store_ownership_failed_retry_rejects_second_store() {
+        let manager = ManagerId::new_unique();
+        let group = Arc::new(RecoveryCore::new(
+            vec![ResourceId::new(manager, 11, 1)],
+            Arc::new(()),
+            Arc::new(FailOnce {
+                calls: AtomicUsize::new(0),
+                resource_id: ResourceId::new(manager, 11, 1),
+            }),
+        ));
+        let handle = super::RecoveryHandle::new(Arc::clone(&group));
+        let store_a = super::RecoveryStore::with_capacity(2, 2).unwrap();
+        let store_b = super::RecoveryStore::with_capacity(2, 2).unwrap();
+        let id = group.id();
+
+        handle.transfer_to(&store_a).unwrap();
+        assert_eq!(
+            handle.transfer_to(&store_a),
+            Err(crate::v02::report::RecoveryTransferError::AlreadyTransferred),
+        );
+        let failed = store_a.try_retry(id).unwrap().wait().unwrap();
+        assert_eq!(failed.recovery.phase, RecoveryPhase::Pending);
+        assert_eq!(group.snapshot().phase, RecoveryPhase::Pending);
+
+        assert_eq!(
+            handle.transfer_to(&store_b),
+            Err(crate::v02::report::RecoveryTransferError::AlreadyTransferred),
+        );
+        assert!(store_a.contains(id));
+        assert!(!store_b.contains(id));
+
+        assert!(!store_a.request_shutdown().wait_for(Duration::ZERO).unwrap());
+        assert_eq!(handle.try_retry().unwrap().wait().unwrap().recovery.phase, RecoveryPhase::Resolved);
+        assert!(store_a.request_shutdown().wait_for(Duration::from_secs(2)).unwrap());
+        assert!(super::block_on(store_b.request_shutdown().wait_async()).is_ok());
+    }
+
+    #[test]
+    fn test_recovery_store_ownership_rejects_pending_and_unconfirmed_duplicates() {
+        let manager = ManagerId::new_unique();
+        let store_a = super::RecoveryStore::with_capacity(2, 2).unwrap();
+        let store_b = super::RecoveryStore::with_capacity(2, 2).unwrap();
+        let pending = Arc::new(RecoveryCore::new(
+            vec![ResourceId::new(manager, 12, 1)],
+            Arc::new(()),
+            Arc::new(Noop),
+        ));
+        let pending_handle = super::RecoveryHandle::new(Arc::clone(&pending));
+        pending_handle.transfer_to(&store_a).unwrap();
+        assert_eq!(pending.snapshot().phase, RecoveryPhase::Transferred);
+        assert_eq!(
+            pending.try_retry().unwrap().wait().unwrap().recovery.phase,
+            RecoveryPhase::Resolved,
+        );
+        assert_eq!(
+            pending_handle.transfer_to(&store_b),
+            Err(crate::v02::report::RecoveryTransferError::AlreadyTransferred),
+        );
+        assert!(!store_b.contains(pending.id()));
+
+        let unconfirmed = Arc::new(RecoveryCore::new_unconfirmed(
+            vec![ResourceId::new(manager, 13, 1)],
+            Arc::new(()),
+        ));
+        let unconfirmed_handle = super::RecoveryHandle::new(Arc::clone(&unconfirmed));
+        unconfirmed_handle.transfer_to(&store_a).unwrap();
+        assert_eq!(unconfirmed.snapshot().phase, RecoveryPhase::Transferred);
+        assert_eq!(
+            unconfirmed_handle.transfer_to(&store_b),
+            Err(crate::v02::report::RecoveryTransferError::AlreadyTransferred),
+        );
+        assert!(!store_b.contains(unconfirmed.id()));
+        // The unconfirmed group cannot be retried; observe that its store
+        // remains pending without waiting indefinitely for shutdown.
+        assert!(!store_a.request_shutdown().wait_for(Duration::ZERO).unwrap());
+        assert!(store_b.request_shutdown().wait_for(Duration::from_secs(2)).unwrap());
+    }
+
+    #[test]
+    fn test_recovery_store_ownership_rejects_second_store_after_retry_becomes_unconfirmed() {
+        let (group, store_a) = panic_cleanup_group(false, true);
+        let store_a = store_a.unwrap();
+        let store_b = super::RecoveryStore::with_capacity(2, 2).unwrap();
+        let handle = super::RecoveryHandle::new(Arc::clone(&group));
+
+        assert_eq!(store_a.try_retry(group.id()).unwrap().wait().unwrap().recovery.phase, RecoveryPhase::Pending);
+        assert_eq!(
+            store_a.try_retry(group.id()).unwrap().wait().unwrap().recovery.phase,
+            RecoveryPhase::Unconfirmed,
+        );
+        assert_eq!(
+            handle.transfer_to(&store_b),
+            Err(crate::v02::report::RecoveryTransferError::AlreadyTransferred),
+        );
+        assert!(store_a.contains(group.id()));
+        assert!(!store_b.contains(group.id()));
+        assert!(!store_a.request_shutdown().wait_for(Duration::ZERO).unwrap());
+        assert!(store_b.request_shutdown().wait_for(Duration::from_secs(2)).unwrap());
+    }
+
+    #[test]
+    fn test_recovery_store_ownership_competing_first_transfers_only_one_succeeds() {
+        let manager = ManagerId::new_unique();
+        let group = Arc::new(RecoveryCore::new(
+            vec![ResourceId::new(manager, 14, 1)],
+            Arc::new(()),
+            Arc::new(Noop),
+        ));
+        let stores = [
+            super::RecoveryStore::with_capacity(2, 2).unwrap(),
+            super::RecoveryStore::with_capacity(2, 2).unwrap(),
+        ];
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let threads = stores.clone().map(|store| {
+            let group = Arc::clone(&group);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.accept(group)
+            })
+        });
+        barrier.wait();
+        let results = threads.map(|thread| thread.join().unwrap());
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(stores.iter().filter(|store| store.contains(group.id())).count(), 1);
+        let owner = stores.iter().find(|store| store.contains(group.id())).unwrap();
+        owner.try_retry(group.id()).unwrap().wait().unwrap();
+        for store in &stores {
+            assert!(store.request_shutdown().wait_for(Duration::from_secs(2)).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_recovery_store_ownership_initial_rejections_do_not_claim_group() {
+        let manager = ManagerId::new_unique();
+        let group = Arc::new(RecoveryCore::new(
+            vec![ResourceId::new(manager, 15, 1)],
+            Arc::new(()),
+            Arc::new(Noop),
+        ));
+        let handle = super::RecoveryHandle::new(Arc::clone(&group));
+        let closed = super::RecoveryStore::with_capacity(2, 2).unwrap();
+        closed.close_admission();
+        assert_eq!(handle.transfer_to(&closed), Err(crate::v02::report::RecoveryTransferError::Closed));
+
+        let full = super::RecoveryStore::with_capacity(1, 2).unwrap();
+        let occupant = Arc::new(RecoveryCore::new(
+            vec![ResourceId::new(manager, 16, 1)],
+            Arc::new(()),
+            Arc::new(Noop),
+        ));
+        assert!(full.accept(Arc::clone(&occupant)).is_ok());
+        assert_eq!(
+            handle.transfer_to(&full),
+            Err(crate::v02::report::RecoveryTransferError::CapacityExceeded),
+        );
+        assert_eq!(group.snapshot().phase, RecoveryPhase::Pending);
+
+        let invalid = Arc::new(RecoveryCore::new(Vec::new(), Arc::new(()), Arc::new(Noop)));
+        let invalid_handle = super::RecoveryHandle::new(Arc::clone(&invalid));
+        let accepting = super::RecoveryStore::with_capacity(2, 2).unwrap();
+        assert_eq!(
+            invalid_handle.transfer_to(&accepting),
+            Err(crate::v02::report::RecoveryTransferError::InvalidGroup),
+        );
+        assert_eq!(invalid.snapshot().phase, RecoveryPhase::Pending);
+
+        handle.transfer_to(&accepting).unwrap();
+        assert_eq!(accepting.try_retry(group.id()).unwrap().wait().unwrap().recovery.phase, RecoveryPhase::Resolved);
+        assert_eq!(full.try_retry(occupant.id()).unwrap().wait().unwrap().recovery.phase, RecoveryPhase::Resolved);
+        for store in [&closed, &full, &accepting] {
+            assert!(store.request_shutdown().wait_for(Duration::from_secs(2)).unwrap());
+        }
     }
 }

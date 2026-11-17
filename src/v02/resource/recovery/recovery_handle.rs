@@ -126,9 +126,10 @@ impl RecoveryHandle {
 
     /// Transfers this recovery group to a destination store.
     ///
-    /// After acceptance, the store owns the retry route for the group. A
-    /// failed transfer does not produce a receipt and leaves this handle
-    /// available to the caller.
+    /// After acceptance, that store permanently owns the retry route for the
+    /// group, including across failed retries. A later transfer attempt is
+    /// rejected. A failed initial transfer does not produce a receipt and
+    /// leaves this handle available to the caller.
     ///
     /// # Parameters
     ///
@@ -142,7 +143,7 @@ impl RecoveryHandle {
     /// # Errors
     ///
     /// Returns [`RecoveryTransferError`] when the store is closed, full, the
-    /// group was already transferred, or the group is invalid.
+    /// group was already accepted by any store, or the group is invalid.
     pub fn transfer_to(&self, destination: &RecoveryStore) -> Result<RecoveryTransfer, RecoveryTransferError> {
         destination
             .accept(Arc::clone(&self.core))

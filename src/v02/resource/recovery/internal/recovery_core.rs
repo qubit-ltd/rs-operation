@@ -41,7 +41,8 @@ pub(crate) struct RecoveryCore {
     pub(in crate::v02::resource::recovery) id: RecoveryId,
     /// Resource identities managed by this recovery group.
     pub(in crate::v02::resource::recovery) resources: Arc<[ResourceId]>,
-    /// Phase, retry count, retained owner payload, action, and failure history.
+    /// Phase, permanent store ownership, retry count, retained owner payload,
+    /// action, and failure history.
     pub(in crate::v02::resource::recovery) state: Mutex<State>,
     /// Observer notified when this recovery enters or leaves a tracked store.
     pub(in crate::v02::resource::recovery) terminal: Mutex<Option<TerminalCallback>>,
@@ -98,6 +99,7 @@ impl RecoveryCore {
             resources: resources.into(),
             state: Mutex::new(State {
                 phase: RecoveryPhase::Pending,
+                store_owned: false,
                 attempts: 0,
                 generation: 0,
                 payload: Some(payload),
@@ -134,6 +136,7 @@ impl RecoveryCore {
             resources: resources.into(),
             state: Mutex::new(State {
                 phase: RecoveryPhase::Unconfirmed,
+                store_owned: false,
                 attempts: 0,
                 generation: 0,
                 payload: Some(payload),
@@ -358,13 +361,17 @@ impl RecoveryCore {
     ///
     /// # Returns
     ///
-    /// `true` when the phase changed to transferred; `false` if the group is
-    /// already running, resolved, or transferred.
+    /// `true` when this is the first store acceptance and the phase changed to
+    /// transferred; `false` if a store already accepted the group or it is not
+    /// pending or unconfirmed.
     pub(crate) fn mark_transferred(&self) -> bool {
         let mut state = lock(&self.state);
-        if state.phase != RecoveryPhase::Pending && state.phase != RecoveryPhase::Unconfirmed {
+        if state.store_owned
+            || (state.phase != RecoveryPhase::Pending && state.phase != RecoveryPhase::Unconfirmed)
+        {
             return false;
         }
+        state.store_owned = true;
         state.phase = RecoveryPhase::Transferred;
         drop(state);
         true
@@ -394,18 +401,19 @@ impl RecoveryCore {
         }
     }
 
-    /// Restores a transferred group to its source after a failed store handoff.
+    /// Moves a store-owned group back to pending for a retry routed by its
+    /// owning store; permanent store ownership is unchanged.
     ///
-    /// Pending and unconfirmed phases are already source-owned and remain
-    /// unchanged.
+    /// Pending and unconfirmed phases remain unchanged. This method never
+    /// clears the permanent store ownership marker.
     ///
     /// # Parameters
     ///
-    /// * `self` — recovery group whose previous ownership is being restored.
+    /// * `self` — recovery group whose retry phase is being prepared.
     ///
     /// # Returns
     ///
-    /// `Ok(())` after restoring or confirming source ownership.
+    /// `Ok(())` after preparing the retry phase.
     ///
     /// # Errors
     ///

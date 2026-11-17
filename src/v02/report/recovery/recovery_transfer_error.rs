@@ -31,7 +31,7 @@ pub enum RecoveryTransferError {
     Closed,
     /// The receiving store has reached a configured capacity.
     CapacityExceeded,
-    /// The record has already been transferred elsewhere.
+    /// A store has already accepted this recovery group.
     AlreadyTransferred,
     /// The group is empty, contains duplicate resources, or spans managers.
     InvalidGroup,
