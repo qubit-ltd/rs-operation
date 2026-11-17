@@ -96,10 +96,7 @@ mod tests {
         }
     }
 
-    fn failure_with_panicking_source(
-        resource_id: ResourceId,
-        drops: &Arc<AtomicUsize>,
-    ) -> CleanupFailure {
+    fn failure_with_panicking_source(resource_id: ResourceId, drops: &Arc<AtomicUsize>) -> CleanupFailure {
         CleanupFailure {
             resource_id,
             stage: CleanupStage::Drop,
@@ -180,13 +177,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("retry action should start before returning Pending");
         gate.open();
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wait.as_mut().poll(&mut context)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wait.as_mut().poll(&mut context)));
 
-        assert!(
-            result.is_ok(),
-            "diagnostic drop must not prevent terminal publication"
-        );
+        assert!(result.is_ok(), "diagnostic drop must not prevent terminal publication");
         let async_report = match result.unwrap() {
             Poll::Ready(report) => report,
             Poll::Pending => panic!("completed gate should wake its async observer"),
@@ -203,7 +196,10 @@ mod tests {
         assert_eq!(sync_report.recovery.failures_total, 0);
         assert_eq!(terminal_calls.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert!(wakes.load(Ordering::SeqCst) > 0, "completion should wake the pending observer");
+        assert!(
+            wakes.load(Ordering::SeqCst) > 0,
+            "completion should wake the pending observer"
+        );
     }
 
     #[test]
@@ -225,8 +221,8 @@ mod tests {
         drop(failed.wait().expect("initial report should be available"));
         drop(failed);
 
-        let store = super::RecoveryStore::new(super::RecoveryStoreOptions::default())
-            .expect("recovery store should start");
+        let store =
+            super::RecoveryStore::new(super::RecoveryStoreOptions::default()).expect("recovery store should start");
         let id = core.id();
         assert!(store.accept(Arc::clone(&core)).is_ok(), "store should accept group");
         let shutdown = store.request_shutdown();
@@ -256,8 +252,7 @@ mod tests {
                 report = Some(completed);
             }
             if shutdown_result.is_none()
-                && let Poll::Ready(completed) =
-                    shutdown_observer.as_mut().poll(&mut shutdown_context)
+                && let Poll::Ready(completed) = shutdown_observer.as_mut().poll(&mut shutdown_context)
             {
                 shutdown_result = Some(completed);
             }
@@ -281,7 +276,10 @@ mod tests {
             shutdown_wakes.load(Ordering::SeqCst) > 0,
             "terminal notification should wake shutdown observer"
         );
-        assert!(!store.contains(id), "terminal store notification should prune resolved group");
+        assert!(
+            !store.contains(id),
+            "terminal store notification should prune resolved group"
+        );
     }
 
     struct Probe(Arc<AtomicUsize>);

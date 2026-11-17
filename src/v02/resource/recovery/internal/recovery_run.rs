@@ -37,7 +37,17 @@ pub(in crate::v02::resource::recovery) struct RecoveryRun {
 }
 
 impl RecoveryRun {
-    /// Drops one value owned by recovery finalization behind an unwind boundary.
+    /// Drops one value owned by recovery finalization behind an unwind
+    /// boundary.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `T` — Value whose destructor is isolated from the rest of
+    ///   finalization.
+    ///
+    /// # Parameters
+    ///
+    /// * `value` — Owned value to drop behind an unwind boundary.
     fn drop_finalization_value<T>(value: T) {
         if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(|| drop(value))) {
             crate::v02::manager::core::dispose_panic_payload(panic);
@@ -111,21 +121,21 @@ impl RecoveryRun {
                 rejected_result = Some(result);
                 resolved = false;
             } else {
-            match result {
-                Ok(()) => {
-                    state.phase = RecoveryPhase::Resolved;
-                    old_failures = std::mem::take(&mut state.failures);
-                    state.failures_total = 0;
-                    state.failures_truncated = false;
-                    released_action = state.action.take();
-                    released_payload = state.payload.take();
+                match result {
+                    Ok(()) => {
+                        state.phase = RecoveryPhase::Resolved;
+                        old_failures = std::mem::take(&mut state.failures);
+                        state.failures_total = 0;
+                        state.failures_truncated = false;
+                        released_action = state.action.take();
+                        released_payload = state.payload.take();
+                    }
+                    Err(failure) => {
+                        state.phase = RecoveryPhase::Pending;
+                        evicted_failure = state.append_failure(failure);
+                    }
                 }
-                Err(failure) => {
-                    state.phase = RecoveryPhase::Pending;
-                    evicted_failure = state.append_failure(failure);
-                }
-            }
-            resolved = state.phase == RecoveryPhase::Resolved;
+                resolved = state.phase == RecoveryPhase::Resolved;
             }
         }
         self.completed = true;
