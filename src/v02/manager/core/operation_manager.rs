@@ -574,11 +574,15 @@ impl OperationManager {
                             summary: DiagnosticSummary::new("external driver ended without publishing an outcome"),
                             source: None,
                         }),
-                        Err(payload) => OperationOutcome::Panicked(PanicSummary {
-                            operation_id,
-                            phase: ExecutionPhase::Running,
-                            summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
-                        }),
+                        Err(payload) => {
+                            let summary = DiagnosticSummary::new(&panic_message(payload.as_ref()));
+                            super::dispose_panic_payload(payload);
+                            OperationOutcome::Panicked(PanicSummary {
+                                operation_id,
+                                phase: ExecutionPhase::Running,
+                                summary,
+                            })
+                        }
                     };
                     let outcome = callback_scope.resolve_typed_outcome(outcome);
                     let summary = child_outcome_summary(operation_id, &outcome);

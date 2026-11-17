@@ -44,6 +44,24 @@ use qubit_operation::StopReason;
 use qubit_operation::StopRequestStatus;
 use qubit_operation::ThreadPoolExecutorOptions;
 
+struct DropPanicsOnDrop(Arc<std::sync::atomic::AtomicUsize>);
+
+const PANIC_PAYLOAD_SNAPSHOT: usize = 1 << 0;
+const PANIC_PAYLOAD_ACTIVATE: usize = 1 << 1;
+const PANIC_PAYLOAD_TAKE_OUTCOME: usize = 1 << 2;
+const PANIC_PAYLOAD_SUMMARY: usize = 1 << 3;
+const PANIC_PAYLOAD_STOP: usize = 1 << 4;
+const PANIC_PAYLOAD_ABANDON: usize = 1 << 5;
+const PANIC_PAYLOAD_RELEASE: usize = 1 << 6;
+const PANIC_PAYLOAD_SETTLEMENT: usize = 1 << 7;
+
+impl Drop for DropPanicsOnDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("payload drop probe");
+    }
+}
+
 struct Prepared {
     activated: std::sync::atomic::AtomicUsize,
     id: std::sync::Mutex<Option<OperationId>>,
@@ -51,6 +69,9 @@ struct Prepared {
     release_waker: std::sync::Mutex<Option<std::task::Waker>>,
     release_polls: std::sync::atomic::AtomicUsize,
     fail_bind: std::sync::atomic::AtomicBool,
+    panic_bind_payload: std::sync::atomic::AtomicBool,
+    panic_payload_flags: std::sync::atomic::AtomicUsize,
+    payload_drop_attempts: Arc<std::sync::atomic::AtomicUsize>,
     abandon_calls: std::sync::atomic::AtomicUsize,
     activation_thread: std::sync::Mutex<Option<String>>,
     bind_gate: std::sync::Mutex<Option<BindGate>>,
@@ -86,6 +107,7 @@ struct BindGate {
 
 impl OperationControl for Prepared {
     fn request_stop(&self, _: StopReason) {
+        self.panic_if_requested(PANIC_PAYLOAD_STOP);
         assert_eq!(
             self.panic_flags.load(std::sync::atomic::Ordering::SeqCst) & 1,
             0,
@@ -94,6 +116,7 @@ impl OperationControl for Prepared {
         self.stop_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     fn snapshot(&self) -> ChildSnapshot {
+        self.panic_if_requested(PANIC_PAYLOAD_SNAPSHOT);
         assert!(
             !self.panic_snapshot.load(std::sync::atomic::Ordering::SeqCst),
             "snapshot panic requested"
@@ -108,6 +131,7 @@ impl OperationControl for Prepared {
         }
     }
     fn poll_outcome(&self, cx: &mut Context<'_>) -> Poll<ChildOutcomeSummary> {
+        self.panic_if_requested(PANIC_PAYLOAD_SUMMARY);
         assert_eq!(
             self.panic_flags.load(std::sync::atomic::Ordering::SeqCst) & 2,
             0,
@@ -137,6 +161,7 @@ impl OperationControl for Prepared {
         })
     }
     fn poll_release(&self, cx: &mut Context<'_>) -> Poll<ChildRelease> {
+        self.panic_if_requested(PANIC_PAYLOAD_RELEASE);
         assert_eq!(
             self.panic_flags.load(std::sync::atomic::Ordering::SeqCst) & 4,
             0,
@@ -157,6 +182,7 @@ impl OperationControl for Prepared {
         })
     }
     fn poll_settlement(&self, cx: &mut Context<'_>) -> Poll<Arc<SettlementReport>> {
+        self.panic_if_requested(PANIC_PAYLOAD_SETTLEMENT);
         assert_eq!(
             self.panic_flags.load(std::sync::atomic::Ordering::SeqCst) & 8,
             0,
@@ -214,6 +240,12 @@ impl OperationControl for Prepared {
 }
 
 impl Prepared {
+    fn panic_if_requested(&self, flag: usize) {
+        if self.panic_payload_flags.load(std::sync::atomic::Ordering::SeqCst) & flag != 0 {
+            std::panic::panic_any(DropPanicsOnDrop(Arc::clone(&self.payload_drop_attempts)));
+        }
+    }
+
     fn release_settlement(&self) {
         self.settlement_ready.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(waker) = self.settlement_waker.lock().unwrap().take() {
@@ -236,6 +268,9 @@ impl Prepared {
             release_waker: std::sync::Mutex::new(None),
             release_polls: std::sync::atomic::AtomicUsize::new(0),
             fail_bind: std::sync::atomic::AtomicBool::new(false),
+            panic_bind_payload: std::sync::atomic::AtomicBool::new(false),
+            panic_payload_flags: std::sync::atomic::AtomicUsize::new(0),
+            payload_drop_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             abandon_calls: std::sync::atomic::AtomicUsize::new(0),
             activation_thread: std::sync::Mutex::new(None),
             bind_gate: std::sync::Mutex::new(None),
@@ -277,6 +312,135 @@ impl Prepared {
         if let Some(waker) = self.release_waker.lock().unwrap().take() {
             waker.wake();
         }
+    }
+}
+
+#[test]
+fn test_external_payload_bind_drop_panic_does_not_escape() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let prepared = Prepared::ready_fixture();
+    prepared
+        .panic_bind_payload
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let submitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        manager.try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
+    }));
+    assert!(submitted.is_ok(), "secondary panic escaped external bind handling");
+    let mut external = submitted
+        .unwrap()
+        .expect("bind panic should remain an accepted setup failure");
+    assert_eq!(
+        prepared.payload_drop_attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(matches!(
+        external.wait_outcome().unwrap(),
+        OperationOutcome::ExecutionFailed(_)
+    ));
+    external.wait_settlement().unwrap();
+    let mut ordinary = manager
+        .try_submit(OperationOptions::default(), |_| Ok::<u8, ()>(1))
+        .unwrap();
+    assert!(matches!(
+        ordinary.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(1)
+    ));
+    ordinary.wait_settlement().unwrap();
+}
+
+#[test]
+fn test_external_payload_async_bind_drop_panic_does_not_escape() {
+    let manager = AsyncOperationManager::new(ManagerOptions::default()).unwrap();
+    let prepared = Prepared::ready_fixture();
+    prepared
+        .panic_bind_payload
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let submitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        manager.try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
+    }));
+    assert!(
+        submitted.is_ok(),
+        "secondary panic escaped async external bind handling"
+    );
+    let mut external = submitted
+        .unwrap()
+        .expect("bind panic should remain an accepted setup failure");
+    assert_eq!(
+        prepared.payload_drop_attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(matches!(
+        block_on_bounded(external.wait_outcome(), "async external outcome", || format!(
+            "outcome_polls={}",
+            prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst)
+        ))
+        .unwrap(),
+        OperationOutcome::ExecutionFailed(_)
+    ));
+    let _ = block_on_bounded(external.wait_settlement(), "async external settlement", || {
+        format!(
+            "settlement_polls={}",
+            prepared.settlement_polls.load(std::sync::atomic::Ordering::SeqCst)
+        )
+    });
+}
+
+#[test]
+fn test_external_payload_driver_callback_matrix_preserves_progress() {
+    for (name, flag, fail_bind, expected_activated, expected_abandoned) in [
+        ("snapshot", PANIC_PAYLOAD_SNAPSHOT, false, 0, 1),
+        ("activate", PANIC_PAYLOAD_ACTIVATE, false, 1, 0),
+        ("take_outcome", PANIC_PAYLOAD_TAKE_OUTCOME, false, 1, 0),
+        ("summary", PANIC_PAYLOAD_SUMMARY, false, 1, 0),
+        ("abandon", PANIC_PAYLOAD_ABANDON, true, 0, 1),
+    ] {
+        let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+        let prepared = Prepared::ready_fixture();
+        prepared
+            .panic_payload_flags
+            .store(flag, std::sync::atomic::Ordering::SeqCst);
+        prepared.fail_bind.store(fail_bind, std::sync::atomic::Ordering::SeqCst);
+        let handle = manager
+            .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
+            .unwrap_or_else(|_| panic!("{name} payload fixture should be admitted"));
+
+        let (outcome, settlement) = wait_handle_bounded(handle);
+        assert!(
+            matches!(outcome, OperationOutcome::ExecutionFailed(_)),
+            "{name} keeps its existing failure mapping"
+        );
+        assert_eq!(
+            settlement.status,
+            SettlementStatus::Released,
+            "{name} preserves provider release evidence"
+        );
+        assert_eq!(
+            prepared.payload_drop_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{name} payload is consumed once"
+        );
+        assert_eq!(
+            prepared.activated.load(std::sync::atomic::Ordering::SeqCst),
+            expected_activated,
+            "{name} activation strategy"
+        );
+        assert_eq!(
+            prepared.abandon_calls.load(std::sync::atomic::Ordering::SeqCst),
+            expected_abandoned,
+            "{name} abandon strategy"
+        );
+
+        let ordinary = manager
+            .try_submit(OperationOptions::default(), |_| Ok::<u8, ()>(1))
+            .unwrap();
+        let (outcome, settlement) = wait_handle_bounded(ordinary);
+        assert!(
+            matches!(outcome, OperationOutcome::Succeeded(1)),
+            "ordinary operation progresses after {name}"
+        );
+        assert_eq!(settlement.status, SettlementStatus::Released);
     }
 }
 
@@ -348,6 +512,131 @@ fn test_external_protocol_fault_panics_are_queryable_and_stop_polling() {
     }
 }
 
+fn wait_handle_bounded<T: Send + 'static, E: Send + 'static>(
+    mut handle: qubit_operation::OperationHandle<T, E>,
+) -> (OperationOutcome<T, E>, Arc<SettlementReport>) {
+    let observer = handle.observer();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let outcome = handle.wait_outcome();
+        let settlement = handle.wait_settlement();
+        let _ = sender.send((outcome, settlement));
+    });
+    let (outcome, settlement) = recv_bounded(&receiver, "operation outcome and settlement", move || {
+        format!("{:?}", observer.snapshot())
+    });
+    (
+        outcome.expect("operation outcome observation"),
+        settlement.expect("operation settlement"),
+    )
+}
+
+fn wait_outcome_bounded<T: Send + 'static, E: Send + 'static>(
+    mut handle: qubit_operation::OperationHandle<T, E>,
+) -> OperationOutcome<T, E> {
+    let observer = handle.observer();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(handle.wait_outcome());
+    });
+    recv_bounded(&receiver, "operation outcome", move || {
+        format!("{:?}", observer.snapshot())
+    })
+    .expect("operation outcome observation")
+}
+
+fn wait_outcome_return_handle_bounded<T: Send + 'static, E: Send + 'static>(
+    mut handle: qubit_operation::OperationHandle<T, E>,
+    stage: &'static str,
+) -> (qubit_operation::OperationHandle<T, E>, OperationOutcome<T, E>) {
+    let observer = handle.observer();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let outcome = handle.wait_outcome();
+        let _ = sender.send((handle, outcome));
+    });
+    let (handle, outcome) = recv_bounded(&receiver, stage, move || format!("{:?}", observer.snapshot()));
+    (handle, outcome.expect("operation outcome observation"))
+}
+
+fn wait_for_counter(stage: &str, count: impl Fn() -> usize, snapshot: impl Fn() -> String) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if count() > 0 {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "watchdog expired waiting for {stage}; count={}; snapshot={}",
+                count(),
+                snapshot()
+            );
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn wait_future_bounded<F: Future>(
+    mut future: std::pin::Pin<&mut F>,
+    context: &mut Context<'_>,
+    stage: &str,
+    snapshot: impl Fn() -> String,
+) -> F::Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(context) {
+            return output;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            panic!("watchdog expired waiting for {stage}; snapshot={}", snapshot());
+        }
+        std::thread::park_timeout(deadline.saturating_duration_since(now));
+    }
+}
+
+fn recv_bounded<T>(receiver: &std::sync::mpsc::Receiver<T>, stage: &str, snapshot: impl Fn() -> String) -> T {
+    match receiver.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(value) => value,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("watchdog expired waiting for {stage}; snapshot={}", snapshot());
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!(
+                "channel disconnected while waiting for {stage}; snapshot={}",
+                snapshot()
+            );
+        }
+    }
+}
+
+fn recv_optional<T>(
+    receiver: &std::sync::mpsc::Receiver<T>,
+    timeout: std::time::Duration,
+    stage: &str,
+    snapshot: impl Fn() -> String,
+) -> Option<T> {
+    match receiver.recv_timeout(timeout) {
+        Ok(value) => Some(value),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("channel disconnected while observing {stage}; snapshot={}", snapshot());
+        }
+    }
+}
+
+fn join_bounded<T: Send + 'static>(
+    worker: std::thread::JoinHandle<T>,
+    stage: &str,
+    snapshot: impl Fn() -> String + Send + 'static,
+) -> T {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = sender.send(worker.join());
+    });
+    recv_bounded(&receiver, stage, snapshot).unwrap_or_else(|_| panic!("worker panicked during {stage}"))
+}
+
 impl PreparedExternalOperation<usize, ()> for Prepared {
     fn bind(&self, id: OperationId) -> Result<(), ExternalBindError> {
         let mut bound = self.id.lock().unwrap();
@@ -355,6 +644,7 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
             return Err(ExternalBindError::AlreadyBound);
         }
         *bound = Some(id);
+        drop(bound);
         if let Some(gate) = self.bind_gate.lock().unwrap().take() {
             let _ = gate.entered.send(());
             let (ready, changed) = &*gate.proceed;
@@ -362,6 +652,9 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
             while !*ready {
                 ready = changed.wait(ready).unwrap();
             }
+        }
+        if self.panic_bind_payload.load(std::sync::atomic::Ordering::SeqCst) {
+            std::panic::panic_any(DropPanicsOnDrop(Arc::clone(&self.payload_drop_attempts)));
         }
         if self.fail_bind.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ExternalBindError::Failed(ExecutionFailure {
@@ -374,6 +667,7 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
     }
     fn activate(self: Arc<Self>, scope: OperationScope) -> Result<(), ExecutionFailure> {
         self.activated.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.panic_if_requested(PANIC_PAYLOAD_ACTIVATE);
         assert!(
             !self.panic_activate.load(std::sync::atomic::Ordering::SeqCst),
             "activate panic requested"
@@ -413,8 +707,10 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
     }
     fn abandon(self: Arc<Self>) {
         self.abandon_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.panic_if_requested(PANIC_PAYLOAD_ABANDON);
     }
     fn poll_take_outcome(&self, cx: &mut Context<'_>) -> Poll<OperationOutcome<usize, ()>> {
+        self.panic_if_requested(PANIC_PAYLOAD_TAKE_OUTCOME);
         assert_eq!(
             self.panic_flags.load(std::sync::atomic::Ordering::SeqCst) & 16,
             0,
@@ -448,6 +744,9 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
         release_waker: std::sync::Mutex::new(None),
         release_polls: std::sync::atomic::AtomicUsize::new(0),
         fail_bind: std::sync::atomic::AtomicBool::new(false),
+        panic_bind_payload: std::sync::atomic::AtomicBool::new(false),
+        panic_payload_flags: std::sync::atomic::AtomicUsize::new(0),
+        payload_drop_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         abandon_calls: std::sync::atomic::AtomicUsize::new(0),
         activation_thread: std::sync::Mutex::new(None),
         bind_gate: std::sync::Mutex::new(None),
@@ -475,34 +774,36 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
         driver_waiting_tx: std::sync::Mutex::new(None),
         child_handle: std::sync::Mutex::new(None),
     });
-    let mut handle = manager
+    let handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .expect("external task should be admitted");
-    while prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        std::thread::yield_now();
-    }
+    wait_for_counter(
+        "typed outcome poll",
+        || prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst),
+        || format!("{:?}", handle.observer().snapshot()),
+    );
     assert_eq!(
         handle.request_stop(StopReason::UserCancelled),
         StopRequestStatus::Accepted
     );
     prepared.release_outcome();
-    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
+    let (handle, outcome) = wait_outcome_return_handle_bounded(handle, "stopped external outcome");
+    assert!(matches!(outcome, OperationOutcome::Stopped(_)));
+    let outcome_polls_after_ready = prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
-    for _ in 0..1000 {
-        std::thread::yield_now();
-    }
     let polls_without_release = prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst);
-    for _ in 0..1000 {
-        std::thread::yield_now();
-    }
-    assert_eq!(
-        prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst),
-        polls_without_release,
-        "the retained driver must wait for a wake instead of busy polling"
-    );
+    assert!(polls_without_release >= 1, "release port was observed before waiting");
     prepared.release_inputs();
-    let report = handle.wait_settlement().unwrap();
+    let report = match handle.wait_settlement_for(std::time::Duration::from_secs(5)).unwrap() {
+        SettlementWait::Ready(report) => report,
+        SettlementWait::Pending(snapshot) => panic!("settlement watchdog expired; snapshot={snapshot:?}"),
+    };
+    assert_eq!(
+        prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst),
+        outcome_polls_after_ready,
+        "the unique typed outcome must not be polled again after Ready"
+    );
     let external = report
         .external_settlement
         .as_ref()
@@ -512,15 +813,7 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
     assert_eq!(external.effects_total, 2);
     assert_eq!(external.effect_overflow, 1);
     assert!(report.all_released());
-    let outcome_polls_after_ready = prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst);
-    for _ in 0..1000 {
-        std::thread::yield_now();
-    }
-    assert_eq!(
-        prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst),
-        outcome_polls_after_ready,
-        "the driver must never poll the unique typed outcome after Ready"
-    );
+    assert!(prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     assert!(prepared.stop_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     let second = manager
         .try_submit_external::<usize, (), _>(OperationOptions::default(), Arc::clone(&prepared))
@@ -542,6 +835,9 @@ fn test_post_claim_bind_failure_is_accepted_and_abandoned_once() {
         release_waker: std::sync::Mutex::new(None),
         release_polls: std::sync::atomic::AtomicUsize::new(0),
         fail_bind: std::sync::atomic::AtomicBool::new(true),
+        panic_bind_payload: std::sync::atomic::AtomicBool::new(false),
+        panic_payload_flags: std::sync::atomic::AtomicUsize::new(0),
+        payload_drop_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         abandon_calls: std::sync::atomic::AtomicUsize::new(0),
         activation_thread: std::sync::Mutex::new(None),
         bind_gate: std::sync::Mutex::new(None),
@@ -593,6 +889,9 @@ fn test_stop_during_bind_wins_before_commit_and_abandons_without_activation() {
         release_waker: std::sync::Mutex::new(None),
         release_polls: std::sync::atomic::AtomicUsize::new(0),
         fail_bind: std::sync::atomic::AtomicBool::new(false),
+        panic_bind_payload: std::sync::atomic::AtomicBool::new(false),
+        panic_payload_flags: std::sync::atomic::AtomicUsize::new(0),
+        payload_drop_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         abandon_calls: std::sync::atomic::AtomicUsize::new(0),
         activation_thread: std::sync::Mutex::new(None),
         bind_gate: std::sync::Mutex::new(Some(BindGate {
@@ -628,15 +927,18 @@ fn test_stop_during_bind_wins_before_commit_and_abandons_without_activation() {
     let submit = std::thread::spawn(move || {
         submit_manager.try_submit_external::<usize, (), _>(OperationOptions::default(), submit_prepared)
     });
-    entered_rx.recv().expect("bind reached after admission");
+    recv_bounded(&entered_rx, "bind reached after admission", || {
+        format!("{:?}", prepared.id.lock().unwrap())
+    });
     let _shutdown = manager.request_shutdown(ShutdownMode::Cancel);
     let (ready, changed) = &*proceed;
     *ready.lock().unwrap() = true;
     changed.notify_all();
-    let mut handle = submit
-        .join()
-        .expect("submission thread did not panic")
-        .expect("claimed submission remains accepted after stop");
+    let mut handle = join_bounded(submit, "claimed submission after stop", {
+        let prepared = Arc::clone(&prepared);
+        move || format!("{:?}", prepared.id.lock().unwrap())
+    })
+    .expect("claimed submission remains accepted after stop");
     assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
     assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(prepared.abandon_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -651,11 +953,15 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
     let mut parent = manager
         .submit(OperationOptions::default(), move |scope| {
             child_manager_tx.send(scope.manager()).unwrap();
-            close_parent_rx.recv().unwrap();
+            recv_bounded(&close_parent_rx, "parent close gate", || {
+                "parent body active".to_owned()
+            });
             Ok::<_, ()>(())
         })
         .expect("parent operation should be admitted");
-    let child_manager = child_manager_rx.recv().unwrap();
+    let child_manager = recv_bounded(&child_manager_rx, "child manager handoff", || {
+        "parent scope starting".to_owned()
+    });
 
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let proceed = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -666,6 +972,9 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
         release_waker: std::sync::Mutex::new(None),
         release_polls: std::sync::atomic::AtomicUsize::new(0),
         fail_bind: std::sync::atomic::AtomicBool::new(false),
+        panic_bind_payload: std::sync::atomic::AtomicBool::new(false),
+        panic_payload_flags: std::sync::atomic::AtomicUsize::new(0),
+        payload_drop_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         abandon_calls: std::sync::atomic::AtomicUsize::new(0),
         activation_thread: std::sync::Mutex::new(None),
         bind_gate: std::sync::Mutex::new(Some(BindGate {
@@ -700,7 +1009,9 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
         let prepared = Arc::clone(&prepared);
         move || child_manager.try_submit_external::<usize, (), _>(OperationOptions::default(), prepared)
     });
-    entered_rx.recv().expect("child bind reached final preflight");
+    recv_bounded(&entered_rx, "child bind reached final preflight", || {
+        format!("parent={:?}", parent.observer().snapshot())
+    });
     assert_eq!(
         parent.request_stop(StopReason::UserCancelled),
         StopRequestStatus::Accepted
@@ -711,10 +1022,11 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
     let (ready, changed) = &*proceed;
     *ready.lock().unwrap() = true;
     changed.notify_all();
-    let mut child = submit
-        .join()
-        .expect("child submission thread did not panic")
-        .expect("a claimed child remains accepted while parent closes");
+    let mut child = join_bounded(submit, "claimed child submission after parent close", {
+        let observer = parent.observer();
+        move || format!("parent={:?}", observer.snapshot())
+    })
+    .expect("a claimed child remains accepted while parent closes");
     assert!(matches!(child.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
     assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(prepared.abandon_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -733,6 +1045,9 @@ fn test_already_bound_claim_rolls_back_provisional_parent_child_link() {
         release_waker: std::sync::Mutex::new(None),
         release_polls: std::sync::atomic::AtomicUsize::new(0),
         fail_bind: std::sync::atomic::AtomicBool::new(false),
+        panic_bind_payload: std::sync::atomic::AtomicBool::new(false),
+        panic_payload_flags: std::sync::atomic::AtomicUsize::new(0),
+        payload_drop_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         abandon_calls: std::sync::atomic::AtomicUsize::new(0),
         activation_thread: std::sync::Mutex::new(None),
         bind_gate: std::sync::Mutex::new(None),
@@ -771,11 +1086,15 @@ fn test_already_bound_claim_rolls_back_provisional_parent_child_link() {
     let parent = second_manager
         .submit(OperationOptions::default(), move |scope| {
             child_manager_tx.send(scope.manager()).unwrap();
-            close_parent_rx.recv().unwrap();
+            recv_bounded(&close_parent_rx, "parent close gate", || {
+                "parent body active".to_owned()
+            });
             Ok::<_, ()>(())
         })
         .unwrap();
-    let child_manager = child_manager_rx.recv().unwrap();
+    let child_manager = recv_bounded(&child_manager_rx, "child manager handoff", || {
+        "parent scope starting".to_owned()
+    });
     let rejected = child_manager
         .try_submit_external::<usize, (), _>(OperationOptions::default(), Arc::clone(&prepared))
         .err()
@@ -797,6 +1116,9 @@ fn test_dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
         release_waker: std::sync::Mutex::new(None),
         release_polls: std::sync::atomic::AtomicUsize::new(0),
         fail_bind: std::sync::atomic::AtomicBool::new(false),
+        panic_bind_payload: std::sync::atomic::AtomicBool::new(false),
+        panic_payload_flags: std::sync::atomic::AtomicUsize::new(0),
+        payload_drop_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         abandon_calls: std::sync::atomic::AtomicUsize::new(0),
         activation_thread: std::sync::Mutex::new(None),
         bind_gate: std::sync::Mutex::new(None),
@@ -824,10 +1146,11 @@ fn test_dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
         driver_waiting_tx: std::sync::Mutex::new(None),
         child_handle: std::sync::Mutex::new(None),
     });
-    let mut handle = manager
+    let handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .unwrap();
-    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
+    let (handle, outcome) = wait_outcome_return_handle_bounded(handle, "typed outcome before settlement");
+    assert!(matches!(outcome, OperationOutcome::Succeeded(7)));
     drop(handle);
     let shutdown = manager.request_shutdown(ShutdownMode::Cancel);
     prepared.release_inputs();
@@ -896,42 +1219,54 @@ fn test_callback_panics_are_captured_and_activation_panic_is_not_abandoned() {
 }
 
 #[test]
-fn test_request_stop_and_outcome_poll_panics_are_captured() {
+fn test_external_payload_request_stop_and_outcome_poll_panics_are_captured() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let stop_panics = Prepared::ready_fixture();
     stop_panics.panic_flags.store(1, std::sync::atomic::Ordering::SeqCst);
-    let mut stop_handle = manager
+    stop_panics
+        .panic_payload_flags
+        .store(PANIC_PAYLOAD_STOP, std::sync::atomic::Ordering::SeqCst);
+    let stop_handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&stop_panics))
         .unwrap();
     assert_eq!(
         stop_handle.request_stop(StopReason::UserCancelled),
         StopRequestStatus::Accepted
     );
-    assert!(matches!(
-        stop_handle.wait_outcome().unwrap(),
-        OperationOutcome::Stopped(_)
-    ));
-    stop_handle.wait_settlement().unwrap();
+    let (outcome, settlement) = wait_handle_bounded(stop_handle);
+    assert!(matches!(outcome, OperationOutcome::Stopped(_)));
+    assert_eq!(settlement.status, SettlementStatus::Released);
+    assert_eq!(
+        stop_panics
+            .payload_drop_attempts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
 
-    for panic_bit in [2, 16] {
+    for (panic_bit, payload_bit) in [(2, PANIC_PAYLOAD_SUMMARY), (16, PANIC_PAYLOAD_TAKE_OUTCOME)] {
         let prepared = Prepared::ready_fixture();
         prepared
             .panic_flags
             .store(panic_bit, std::sync::atomic::Ordering::SeqCst);
-        let mut handle = manager
+        prepared
+            .panic_payload_flags
+            .store(payload_bit, std::sync::atomic::Ordering::SeqCst);
+        let handle = manager
             .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
             .unwrap();
-        assert!(matches!(
-            handle.wait_outcome().unwrap(),
-            OperationOutcome::ExecutionFailed(_)
-        ));
-        handle.wait_settlement().unwrap();
+        let (outcome, settlement) = wait_handle_bounded(handle);
+        assert!(matches!(outcome, OperationOutcome::ExecutionFailed(_)));
+        assert_eq!(settlement.status, SettlementStatus::Released);
+        assert_eq!(
+            prepared.payload_drop_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }
 
 #[test]
-fn test_release_and_settlement_poll_panics_keep_scope_pending_without_fabricating_facts() {
-    for panic_bit in [4, 8] {
+fn test_external_payload_release_and_settlement_panics_keep_scope_pending_without_fabricating_facts() {
+    for (panic_bit, payload_bit) in [(4, PANIC_PAYLOAD_RELEASE), (8, PANIC_PAYLOAD_SETTLEMENT)] {
         let manager = OperationManager::new(ManagerOptions {
             sync_executor: ThreadPoolExecutorOptions {
                 worker_count: 1,
@@ -944,12 +1279,20 @@ fn test_release_and_settlement_poll_panics_keep_scope_pending_without_fabricatin
         prepared
             .panic_flags
             .store(panic_bit, std::sync::atomic::Ordering::SeqCst);
-        let mut handle = manager
+        prepared
+            .panic_payload_flags
+            .store(payload_bit, std::sync::atomic::Ordering::SeqCst);
+        let handle = manager
             .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
             .unwrap();
-        assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
+        let observer = handle.observer();
+        assert!(matches!(wait_outcome_bounded(handle), OperationOutcome::Succeeded(7)));
+        assert_eq!(
+            prepared.payload_drop_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert!(matches!(
-            handle
+            observer
                 .wait_settlement_for(std::time::Duration::from_millis(10))
                 .unwrap(),
             SettlementWait::Pending(_)
@@ -957,13 +1300,12 @@ fn test_release_and_settlement_poll_panics_keep_scope_pending_without_fabricatin
         let shutdown = manager.request_shutdown(ShutdownMode::Drain);
         assert_eq!(shutdown.snapshot().active_operations, 1);
         assert_eq!(prepared.abandon_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        drop(handle);
-
         // Each case intentionally leaves one driver pending because the
         // adapter panicked before supplying required lifecycle evidence.
         // Leak only this bounded test manager so executor teardown cannot wait
         // on the deliberately unresolved task.
         std::mem::forget(shutdown);
+        std::mem::forget(observer);
         std::mem::forget(manager);
     }
 }
@@ -976,23 +1318,35 @@ fn test_typed_result_waits_for_matching_summary_when_facts_arrive_out_of_order()
     let handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .unwrap();
-    while prepared.summary_polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        std::thread::yield_now();
-    }
-    let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
-    let waiter = std::thread::spawn(move || {
-        let mut handle = handle;
-        let result = handle.wait_outcome();
-        let _ = outcome_tx.send(result);
-        handle.wait_settlement().unwrap();
-    });
-    assert!(outcome_rx.recv_timeout(std::time::Duration::from_millis(10)).is_err());
+    let observer = handle.observer();
+    wait_for_counter(
+        "summary poll",
+        || prepared.summary_polls.load(std::sync::atomic::Ordering::SeqCst),
+        || format!("{:?}", observer.snapshot()),
+    );
+    let mut async_handle = handle.into_async();
+    let mut outcome = Box::pin(async_handle.wait_outcome());
+    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    assert!(
+        outcome.as_mut().poll(&mut context).is_pending(),
+        "typed outcome stays Pending while matching summary is gated"
+    );
     prepared.release_summary();
     assert!(matches!(
-        outcome_rx.recv().unwrap().unwrap(),
+        wait_future_bounded(
+            outcome.as_mut(),
+            &mut context,
+            "typed outcome after summary release",
+            || format!("{:?}", observer.snapshot()),
+        )
+        .unwrap(),
         OperationOutcome::Succeeded(7)
     ));
-    waiter.join().unwrap();
+    assert!(matches!(
+        observer.wait_settlement_for(std::time::Duration::from_secs(5)).unwrap(),
+        SettlementWait::Ready(_)
+    ));
 }
 
 #[test]
@@ -1085,7 +1439,10 @@ fn test_external_summary_rejects_wrong_classification_and_identity() {
         handle.wait_outcome().unwrap(),
         OperationOutcome::ExecutionFailed(_)
     ));
-    handle.wait_settlement().unwrap();
+    assert!(matches!(
+        handle.wait_settlement_for(std::time::Duration::from_secs(5)).unwrap(),
+        SettlementWait::Ready(_)
+    ));
 
     let wrong_id = Prepared::ready_fixture();
     *wrong_id.summary_id.lock().unwrap() = Some(foreign_id);
@@ -1104,10 +1461,11 @@ fn test_external_frame_ends_at_typed_outcome_while_release_is_still_pending() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let prepared = Prepared::ready_fixture();
     prepared.release_ready.store(false, std::sync::atomic::Ordering::SeqCst);
-    let mut handle = manager
+    let handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .unwrap();
-    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
+    let (handle, outcome) = wait_outcome_return_handle_bounded(handle, "typed outcome before release");
+    assert!(matches!(outcome, OperationOutcome::Succeeded(7)));
     let scoped_manager = prepared
         .captured_manager
         .lock()
@@ -1125,11 +1483,11 @@ fn test_external_frame_ends_at_typed_outcome_while_release_is_still_pending() {
         SettlementWait::Pending(_)
     ));
     prepared.release_inputs();
-    handle.wait_settlement().unwrap();
+    assert!(matches!(
+        handle.wait_settlement_for(std::time::Duration::from_secs(5)).unwrap(),
+        SettlementWait::Ready(_)
+    ));
     let release_polls_after_ready = prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst);
-    for _ in 0..1000 {
-        std::thread::yield_now();
-    }
     assert_eq!(
         prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst),
         release_polls_after_ready,
@@ -1148,9 +1506,11 @@ fn test_typed_outcome_precedes_settlement_and_ready_settlement_is_not_repolled()
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .unwrap();
     assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
-    while prepared.settlement_polls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        std::thread::yield_now();
-    }
+    wait_for_counter(
+        "settlement poll",
+        || prepared.settlement_polls.load(std::sync::atomic::Ordering::SeqCst),
+        || format!("{:?}", handle.observer().snapshot()),
+    );
     assert!(matches!(
         handle.wait_settlement_for(std::time::Duration::from_millis(5)).unwrap(),
         SettlementWait::Pending(_)
@@ -1158,9 +1518,6 @@ fn test_typed_outcome_precedes_settlement_and_ready_settlement_is_not_repolled()
     prepared.release_settlement();
     handle.wait_settlement().unwrap();
     let ready_polls = prepared.settlement_polls.load(std::sync::atomic::Ordering::SeqCst);
-    for _ in 0..1000 {
-        std::thread::yield_now();
-    }
     assert_eq!(
         prepared.settlement_polls.load(std::sync::atomic::Ordering::SeqCst),
         ready_polls,
@@ -1199,12 +1556,20 @@ fn test_concurrent_managers_claim_one_shared_arc_once() {
         }
     });
     barrier.wait();
-    entered_rx.recv().expect("one bind call acquired the Arc");
+    recv_bounded(&entered_rx, "one bind call acquired the Arc", || {
+        format!("prepared_id={:?}", prepared.id.lock().unwrap())
+    });
     let (ready, changed) = &*proceed;
     *ready.lock().unwrap() = true;
     changed.notify_all();
-    let first = first.join().unwrap();
-    let second = second.join().unwrap();
+    let first = join_bounded(first, "first cross-manager submit", {
+        let prepared = Arc::clone(&prepared);
+        move || format!("prepared_id={:?}", prepared.id.lock().unwrap())
+    });
+    let second = join_bounded(second, "second cross-manager submit", {
+        let prepared = Arc::clone(&prepared);
+        move || format!("prepared_id={:?}", prepared.id.lock().unwrap())
+    });
     let mut winner = match (first, second) {
         (Ok(handle), Err(error)) | (Err(error), Ok(handle)) => {
             assert_eq!(error.reason(), AdmissionError::AlreadyBound);
@@ -1234,11 +1599,15 @@ fn test_full_manager_rejects_before_calling_bind() {
     let mut held = manager
         .submit(OperationOptions::default(), move |_| {
             started_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
+            recv_bounded(&release_rx, "release held operation", || {
+                "held operation is running".to_owned()
+            });
             Ok::<_, ()>(())
         })
         .unwrap();
-    started_rx.recv().unwrap();
+    recv_bounded(&started_rx, "held operation started", || {
+        "manager capacity occupied".to_owned()
+    });
     let prepared = Prepared::ready_fixture();
     let error = manager
         .try_submit_external::<usize, (), _>(OperationOptions::default(), Arc::clone(&prepared))
@@ -1264,14 +1633,21 @@ impl Wake for ThreadWake {
     }
 }
 
-fn block_on<F: Future>(future: F) -> F::Output {
+fn block_on_bounded<F: Future>(future: F, stage: &str, snapshot: impl Fn() -> String) -> F::Output {
     let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
     let mut context = Context::from_waker(&waker);
     let mut future = Box::pin(future);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match future.as_mut().poll(&mut context) {
             Poll::Ready(output) => return output,
-            Poll::Pending => std::thread::park(),
+            Poll::Pending => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    panic!("watchdog expired waiting for {stage}; snapshot={}", snapshot());
+                }
+                std::thread::park_timeout(deadline.saturating_duration_since(now));
+            }
         }
     }
 }
@@ -1301,9 +1677,27 @@ fn test_sync_external_child_can_progress_without_releasing_driver() {
         .try_submit_external(OperationOptions::default(), Arc::clone(&probe))
         .unwrap();
 
-    let accepted = accepted_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
-    let driver_waiting = waiting_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
-    let started_without_escape = started_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+    let accepted = recv_optional(
+        &accepted_rx,
+        std::time::Duration::from_secs(5),
+        "child acceptance",
+        || format!("{:?}", parent.observer().snapshot()),
+    )
+    .is_some();
+    let driver_waiting = recv_optional(
+        &waiting_rx,
+        std::time::Duration::from_secs(5),
+        "external driver Pending",
+        || format!("{:?}", parent.observer().snapshot()),
+    )
+    .is_some();
+    let started_without_escape = recv_optional(
+        &started_rx,
+        std::time::Duration::from_secs(5),
+        "child start before gate release",
+        || format!("{:?}", parent.observer().snapshot()),
+    )
+    .is_some();
 
     // Keep the independent escape for failure cleanup; a correct async driver
     // lets the accepted sync child provide the facts without it.
@@ -1321,8 +1715,14 @@ fn test_sync_external_child_can_progress_without_releasing_driver() {
         .unwrap()
         .take()
         .map(|mut child| child.wait_outcome());
-    let started_after_cleanup =
-        started_without_escape || started_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+    let started_after_cleanup = started_without_escape
+        || recv_optional(
+            &started_rx,
+            std::time::Duration::from_secs(5),
+            "child start after cleanup",
+            || format!("{:?}", parent.observer().snapshot()),
+        )
+        .is_some();
 
     assert!(accepted, "child was accepted by the parent scope");
     assert!(
@@ -1359,11 +1759,15 @@ fn test_sync_external_rejects_when_async_capacity_is_full_without_claiming_arc()
     let mut blocker = async_manager
         .try_submit(OperationOptions::default(), move |_| async move {
             let _ = started_tx.send(());
-            let _ = release_rx.recv();
+            recv_bounded(&release_rx, "release gated async operation", || {
+                "async body is blocked at its test gate".to_owned()
+            });
             Ok::<(), ()>(())
         })
         .unwrap();
-    started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    recv_bounded(&started_rx, "async admission blocker started", || {
+        "async executor capacity test".to_owned()
+    });
 
     let prepared = Prepared::ready_fixture();
     let result = manager.try_submit_external(OperationOptions::default(), Arc::clone(&prepared));
@@ -1378,10 +1782,15 @@ fn test_sync_external_rejects_when_async_capacity_is_full_without_claiming_arc()
 
     release_tx.send(()).unwrap();
     assert!(matches!(
-        block_on(blocker.wait_outcome()).unwrap(),
+        block_on_bounded(blocker.wait_outcome(), "capacity blocker outcome", || {
+            "blocker accepted".to_owned()
+        })
+        .unwrap(),
         OperationOutcome::Succeeded(())
     ));
-    block_on(blocker.wait_settlement());
+    block_on_bounded(blocker.wait_settlement(), "capacity blocker settlement", || {
+        "blocker accepted".to_owned()
+    });
 
     assert!(rejection.is_some(), "full async executor rejects external driver");
     let (reason, returned) = rejection.unwrap();
@@ -1406,11 +1815,15 @@ fn test_sync_external_uses_async_capacity_when_sync_pool_is_busy() {
     let mut running = manager
         .try_submit(OperationOptions::default(), move |_| {
             let _ = running_tx.send(());
-            let _ = release_rx.recv();
+            recv_bounded(&release_rx, "release gated async operation", || {
+                "async body is blocked at its test gate".to_owned()
+            });
             Ok::<(), ()>(())
         })
         .unwrap();
-    running_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    recv_bounded(&running_rx, "sync worker started", || {
+        "sync executor capacity test".to_owned()
+    });
     let mut queued = manager
         .try_submit(OperationOptions::default(), |_| Ok::<(), ()>(()))
         .unwrap();
@@ -1452,6 +1865,9 @@ fn test_async_manager_drives_external_activation_on_portable_executor() {
         release_waker: std::sync::Mutex::new(None),
         release_polls: std::sync::atomic::AtomicUsize::new(0),
         fail_bind: std::sync::atomic::AtomicBool::new(false),
+        panic_bind_payload: std::sync::atomic::AtomicBool::new(false),
+        panic_payload_flags: std::sync::atomic::AtomicUsize::new(0),
+        payload_drop_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         abandon_calls: std::sync::atomic::AtomicUsize::new(0),
         activation_thread: std::sync::Mutex::new(None),
         bind_gate: std::sync::Mutex::new(None),
@@ -1483,7 +1899,11 @@ fn test_async_manager_drives_external_activation_on_portable_executor() {
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .expect("async external submission should be admitted");
     assert!(matches!(
-        block_on(handle.wait_outcome()).unwrap(),
+        block_on_bounded(handle.wait_outcome(), "async manager external outcome", || format!(
+            "outcome_polls={}",
+            prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst)
+        ))
+        .unwrap(),
         OperationOutcome::Succeeded(7)
     ));
     assert!(
@@ -1494,5 +1914,10 @@ fn test_async_manager_drives_external_activation_on_portable_executor() {
             .as_deref()
             .is_some_and(|name| name.starts_with("qubit-operation-async-"))
     );
-    block_on(handle.wait_settlement());
+    block_on_bounded(handle.wait_settlement(), "async manager external settlement", || {
+        format!(
+            "settlement_polls={}",
+            prepared.settlement_polls.load(std::sync::atomic::Ordering::SeqCst)
+        )
+    });
 }

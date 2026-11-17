@@ -121,9 +121,11 @@ impl AsyncOperationManager {
                     *lock(&state_for_preflight) = Some(Err(failure));
                 }
                 Err(payload) => {
+                    let summary = DiagnosticSummary::new(&panic_message(payload.as_ref()));
+                    dispose_panic_payload(payload);
                     *lock(&state_for_preflight) = Some(Err(crate::v02::report::ExecutionFailure {
                         operation_id: id,
-                        summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
+                        summary,
                         source: None,
                     }));
                 }
@@ -271,11 +273,15 @@ impl AsyncOperationManager {
                                 summary: DiagnosticSummary::new("async external driver ended without an outcome"),
                                 source: None,
                             }),
-                            Err(payload) => OperationOutcome::Panicked(PanicSummary {
-                                operation_id,
-                                phase: ExecutionPhase::Running,
-                                summary: DiagnosticSummary::new(&panic_message(payload.as_ref())),
-                            }),
+                            Err(payload) => {
+                                let summary = DiagnosticSummary::new(&panic_message(payload.as_ref()));
+                                dispose_panic_payload(payload);
+                                OperationOutcome::Panicked(PanicSummary {
+                                    operation_id,
+                                    phase: ExecutionPhase::Running,
+                                    summary,
+                                })
+                            }
                         };
                         let summary = child_outcome_summary(operation_id, &outcome);
                         control.publish_outcome(summary.clone());
