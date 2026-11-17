@@ -706,6 +706,8 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
         StopRequestStatus::Accepted
     );
     close_parent_tx.send(()).unwrap();
+    let parent_outcome = parent.wait_outcome().unwrap();
+    assert!(matches!(parent_outcome, OperationOutcome::Stopped(_)));
     let (ready, changed) = &*proceed;
     *ready.lock().unwrap() = true;
     changed.notify_all();
@@ -717,7 +719,6 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
     assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(prepared.abandon_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     child.wait_settlement().unwrap();
-    assert!(matches!(parent.wait_outcome().unwrap(), OperationOutcome::Stopped(_)));
     parent.wait_settlement().unwrap();
 }
 
