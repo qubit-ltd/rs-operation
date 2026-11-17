@@ -119,9 +119,11 @@ impl ScopeCompletion {
         };
         for handle in existing {
             let terminal = Arc::clone(&callback);
-            let terminal_handle = handle.clone();
+            let terminal_core = Arc::downgrade(&handle.core);
             handle.core.set_terminal_callback(Arc::new(move |present| {
-                terminal(terminal_handle.clone(), present);
+                if let Some(core) = terminal_core.upgrade() {
+                    terminal(crate::v02::resource::recovery::RecoveryHandle::new(core), present);
+                }
             }));
             callback(handle, true);
         }
@@ -309,10 +311,12 @@ impl ScopeCompletion {
         };
         if let Some((callback, handle)) = recovery_callback {
             let terminal = Arc::clone(&callback);
-            let terminal_handle = handle.clone();
-            handle
-                .core
-                .set_terminal_callback(Arc::new(move |present| terminal(terminal_handle.clone(), present)));
+            let terminal_core = Arc::downgrade(&handle.core);
+            handle.core.set_terminal_callback(Arc::new(move |present| {
+                if let Some(core) = terminal_core.upgrade() {
+                    terminal(crate::v02::resource::recovery::RecoveryHandle::new(core), present);
+                }
+            }));
             callback(handle, true);
         }
         if recovery.is_some() {
@@ -381,6 +385,50 @@ impl ScopeCompletion {
             transfers: Arc::from(state.transfers.clone()),
             transfers_total: state.transfers_total,
             transfers_truncated: state.transfers_truncated,
+        }
+    }
+}
+
+#[cfg(test)]
+mod recovery_lifetime_tests {
+    use std::sync::Arc;
+    use std::sync::Weak;
+
+    use super::ScopeCompletion;
+    use crate::v02::report::ManagerId;
+    use crate::v02::report::ResourceId;
+    use crate::v02::resource::recovery::RecoveryCore;
+    use crate::v02::resource::recovery::RecoveryHandle;
+
+    #[test]
+    fn test_recovery_terminal_observer_does_not_retain_its_own_core() {
+        for install_before_completion in [true, false] {
+            let core = Arc::new(RecoveryCore::new_unconfirmed(
+                vec![ResourceId::new(ManagerId::from_raw(1), 1, 0)],
+                Arc::new(()),
+            ));
+            let weak: Weak<_> = Arc::downgrade(&core);
+            let handle = RecoveryHandle::new(Arc::clone(&core));
+            let completion = ScopeCompletion::new();
+            let observer: Arc<dyn Fn(RecoveryHandle, bool) + Send + Sync> = Arc::new(|_, _| {});
+
+            if install_before_completion {
+                completion.set_recovery_callback(Arc::clone(&observer));
+            }
+            completion.complete(
+                ResourceId::new(ManagerId::from_raw(1), 1, 0),
+                None,
+                None,
+                Some(handle.clone()),
+            );
+            if !install_before_completion {
+                completion.set_recovery_callback(observer);
+            }
+
+            drop(handle);
+            drop(core);
+            drop(completion);
+            assert!(weak.upgrade().is_none(), "terminal observer retained its recovery core");
         }
     }
 }
