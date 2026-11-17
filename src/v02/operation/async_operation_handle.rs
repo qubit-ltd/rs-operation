@@ -85,7 +85,8 @@ impl<T: Send + 'static, E: Send + 'static> AsyncOperationHandle<T, E> {
     }
 
     /// Returns the bounded diagnostics reported by external protocol ports.
-    /// Faults are ordered Release then Settlement and do not alter the operation outcome.
+    /// Faults are ordered Release then Settlement and do not alter the
+    /// operation outcome.
     pub fn external_protocol_faults(&self) -> Arc<[crate::v02::report::ExternalProtocolFault]> {
         self.parts().core.external_protocol_faults()
     }
@@ -175,7 +176,8 @@ impl<T: Send + 'static, E: Send + 'static> AsyncOperationHandle<T, E> {
     /// An unconsumed outcome can retain a [`crate::v02::resource::ResourceRef`]
     /// and keep settlement pending. Consume the outcome, then drop references
     /// held by either its success or error value and their clones before
-    /// awaiting. See [`crate::v02::operation::OperationHandle::wait_settlement`]
+    /// awaiting. See
+    /// [`crate::v02::operation::OperationHandle::wait_settlement`]
     /// for a synchronous example of this ownership rule.
     ///
     /// # Returns

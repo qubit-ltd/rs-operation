@@ -22,14 +22,24 @@ use super::ManagedOperationControl;
 use super::OperationOutcome;
 use super::OperationScope;
 use super::child_outcome_summary;
+use super::dispose_panic_payload;
 use super::lock;
 use super::panic_message;
-use super::dispose_panic_payload;
 use crate::v02::report::ExternalProtocolFault;
 use crate::v02::report::ExternalProtocolFaultKind;
 use crate::v02::report::ExternalProtocolPort;
 use crate::v02::report::OperationId;
 
+/// Records one bounded diagnostic for an external protocol port.
+///
+/// # Parameters
+///
+/// - `state`: Shared execution context slot used to reach the operation core.
+/// - `operation_id`: Identity of the operation that owns the protocol.
+/// - `port`: External protocol port that failed.
+/// - `kind`: Category of the protocol fault.
+/// - `observed_operation_id`: Identity returned by a mismatched port, if any.
+/// - `summary`: Fixed summary describing the fault.
 fn record_protocol_fault(
     state: &Arc<Mutex<Option<Arc<ExternalExecutionContext>>>>,
     operation_id: OperationId,
@@ -224,16 +234,28 @@ pub async fn drive_external<T, E, P>(
                 Ok(Poll::Ready(value)) => {
                     release_polled = true;
                     if value.operation_id != operation_id {
-                        record_protocol_fault(&execution_state, operation_id, ExternalProtocolPort::Release,
-                            ExternalProtocolFaultKind::IdentityMismatch, Some(value.operation_id), "external release identity mismatch");
+                        record_protocol_fault(
+                            &execution_state,
+                            operation_id,
+                            ExternalProtocolPort::Release,
+                            ExternalProtocolFaultKind::IdentityMismatch,
+                            Some(value.operation_id),
+                            "external release identity mismatch",
+                        );
                     }
                     release = managed.confirm_input_release(value);
                 }
                 Ok(Poll::Pending) => {}
                 Err(payload) => {
                     release_poll_failed = true;
-                    record_protocol_fault(&execution_state, operation_id, ExternalProtocolPort::Release,
-                        ExternalProtocolFaultKind::Panicked, None, "external release poll panicked");
+                    record_protocol_fault(
+                        &execution_state,
+                        operation_id,
+                        ExternalProtocolPort::Release,
+                        ExternalProtocolFaultKind::Panicked,
+                        None,
+                        "external release poll panicked",
+                    );
                     dispose_panic_payload(payload);
                 }
             }
@@ -243,14 +265,26 @@ pub async fn drive_external<T, E, P>(
                 Ok(Poll::Ready(value)) if value.operation_id == operation_id => settlement = Some(value),
                 Ok(Poll::Ready(value)) => {
                     settlement_poll_failed = true;
-                    record_protocol_fault(&execution_state, operation_id, ExternalProtocolPort::Settlement,
-                        ExternalProtocolFaultKind::IdentityMismatch, Some(value.operation_id), "external settlement identity mismatch");
+                    record_protocol_fault(
+                        &execution_state,
+                        operation_id,
+                        ExternalProtocolPort::Settlement,
+                        ExternalProtocolFaultKind::IdentityMismatch,
+                        Some(value.operation_id),
+                        "external settlement identity mismatch",
+                    );
                 }
                 Ok(Poll::Pending) => {}
                 Err(payload) => {
                     settlement_poll_failed = true;
-                    record_protocol_fault(&execution_state, operation_id, ExternalProtocolPort::Settlement,
-                        ExternalProtocolFaultKind::Panicked, None, "external settlement poll panicked");
+                    record_protocol_fault(
+                        &execution_state,
+                        operation_id,
+                        ExternalProtocolPort::Settlement,
+                        ExternalProtocolFaultKind::Panicked,
+                        None,
+                        "external settlement poll panicked",
+                    );
                     dispose_panic_payload(payload);
                 }
             }

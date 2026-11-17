@@ -55,7 +55,8 @@ impl AsyncOperationObserver {
     }
 
     /// Returns the bounded diagnostics reported by external protocol ports.
-    /// Faults are ordered Release then Settlement and do not alter the operation outcome.
+    /// Faults are ordered Release then Settlement and do not alter the
+    /// operation outcome.
     pub fn external_protocol_faults(&self) -> Arc<[crate::v02::report::ExternalProtocolFault]> {
         self.core.external_protocol_faults()
     }
@@ -74,8 +75,9 @@ impl AsyncOperationObserver {
     /// Asynchronously waits for the immutable settlement report.
     ///
     /// The observer does not own the typed outcome, but another handle or owner
-    /// can retain a [`crate::v02::resource::ResourceRef`] needed for settlement.
-    /// Release references held by success and error values before awaiting.
+    /// can retain a [`crate::v02::resource::ResourceRef`] needed for
+    /// settlement. Release references held by success and error values
+    /// before awaiting.
     /// See [`crate::v02::operation::OperationHandle::wait_settlement`] for an
     /// example of the shared ownership rule.
     ///

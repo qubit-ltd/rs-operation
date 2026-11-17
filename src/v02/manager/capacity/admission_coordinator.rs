@@ -141,11 +141,13 @@ impl AdmissionCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::task::Wake;
+    use std::task::Waker;
 
-    use super::*;
+    use super::AdmissionCoordinator;
 
     struct ReregisteringWake {
         coordinator: Arc<AdmissionCoordinator>,
@@ -204,15 +206,7 @@ mod tests {
 
         assert_eq!(wake_count.load(Ordering::SeqCst), 3);
         assert_eq!(coordinator.state.lock().unwrap().waiters.len(), 3);
-        assert!(
-            coordinator
-                .state
-                .lock()
-                .unwrap()
-                .waiters
-                .iter()
-                .all(Option::is_none)
-        );
+        assert!(coordinator.state.lock().unwrap().waiters.iter().all(Option::is_none));
     }
 
     struct CountWake(Arc<AtomicUsize>);

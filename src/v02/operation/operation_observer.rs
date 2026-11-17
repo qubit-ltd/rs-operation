@@ -55,7 +55,8 @@ impl OperationObserver {
     }
 
     /// Returns the bounded diagnostics reported by external protocol ports.
-    /// Faults are ordered Release then Settlement and do not alter the operation outcome.
+    /// Faults are ordered Release then Settlement and do not alter the
+    /// operation outcome.
     pub fn external_protocol_faults(&self) -> Arc<[crate::v02::report::ExternalProtocolFault]> {
         self.core.external_protocol_faults()
     }
@@ -74,10 +75,10 @@ impl OperationObserver {
     /// Blocks until the stable settlement report is published.
     ///
     /// This observer does not own the typed outcome, but any handle, result,
-    /// error, clone, or other owner can retain a [`crate::v02::resource::ResourceRef`]
-    /// needed for settlement. Release those references before waiting.
-    /// `WouldDeadlock` only detects this operation's blocking worker, not every
-    /// resource wait cycle.
+    /// error, clone, or other owner can retain a
+    /// [`crate::v02::resource::ResourceRef`] needed for settlement. Release
+    /// those references before waiting. `WouldDeadlock` only detects this
+    /// operation's blocking worker, not every resource wait cycle.
     ///
     /// # Returns
     ///

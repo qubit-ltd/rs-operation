@@ -143,6 +143,10 @@ impl OperationCore {
     }
 
     /// Records the first fault for an external protocol port.
+    ///
+    /// # Parameters
+    ///
+    /// - `fault`: Bounded diagnostic to retain if this port has no prior fault.
     pub(crate) fn record_protocol_fault(&self, fault: ExternalProtocolFault) {
         let mut facts = lock(&self.facts);
         let slot = match fault.port {
@@ -458,11 +462,11 @@ mod tests {
     use std::time::Duration;
 
     use super::OperationCore;
-    use crate::v02::report::OperationId;
+    use crate::v02::report::DiagnosticSummary;
     use crate::v02::report::ExternalProtocolFault;
     use crate::v02::report::ExternalProtocolFaultKind;
     use crate::v02::report::ExternalProtocolPort;
-    use crate::v02::report::DiagnosticSummary;
+    use crate::v02::report::OperationId;
     use crate::v02::report::SettlementReport;
 
     #[test]

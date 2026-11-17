@@ -87,7 +87,8 @@ impl<T: Send + 'static, E: Send + 'static> OperationHandle<T, E> {
     }
 
     /// Returns the bounded diagnostics reported by external protocol ports.
-    /// Faults are ordered Release then Settlement and do not alter the operation outcome.
+    /// Faults are ordered Release then Settlement and do not alter the
+    /// operation outcome.
     pub fn external_protocol_faults(&self) -> Arc<[crate::v02::report::ExternalProtocolFault]> {
         self.parts().core.external_protocol_faults()
     }
