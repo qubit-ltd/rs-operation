@@ -58,6 +58,14 @@ pub struct RecoveryAttempt {
 /// A destructor panic means the cleanup result cannot be trusted. The future
 /// has already been removed from its owner and must never be polled or dropped
 /// again.
+///
+/// # Parameters
+///
+/// * `future` — completed retry future to destroy behind the unwind boundary.
+///
+/// # Returns
+///
+/// `Ok(())` when destruction succeeds, or the panic payload when it unwinds.
 pub(super) fn drop_completed_future(
     future: crate::v02::resource::recovery::RecoveryFuture,
 ) -> Result<(), Box<dyn std::any::Any + Send + 'static>> {
@@ -68,6 +76,10 @@ pub(super) fn drop_completed_future(
 }
 
 /// Disposes of a value abandoned after the completed future's Drop panicked.
+///
+/// # Parameters
+///
+/// * `result` — completed retry result whose destructor must not escape.
 fn dispose_abandoned_result(result: Result<(), CleanupFailure>) {
     if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(result))) {
         crate::v02::manager::core::dispose_panic_payload(panic);

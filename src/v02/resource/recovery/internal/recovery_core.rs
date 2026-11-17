@@ -366,9 +366,7 @@ impl RecoveryCore {
     /// pending or unconfirmed.
     pub(crate) fn mark_transferred(&self) -> bool {
         let mut state = lock(&self.state);
-        if state.store_owned
-            || (state.phase != RecoveryPhase::Pending && state.phase != RecoveryPhase::Unconfirmed)
-        {
+        if state.store_owned || (state.phase != RecoveryPhase::Pending && state.phase != RecoveryPhase::Unconfirmed) {
             return false;
         }
         state.store_owned = true;

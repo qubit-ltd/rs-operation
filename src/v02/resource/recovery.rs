@@ -1026,7 +1026,10 @@ mod tests {
         assert!(!store_b.contains(id));
 
         assert!(!store_a.request_shutdown().wait_for(Duration::ZERO).unwrap());
-        assert_eq!(handle.try_retry().unwrap().wait().unwrap().recovery.phase, RecoveryPhase::Resolved);
+        assert_eq!(
+            handle.try_retry().unwrap().wait().unwrap().recovery.phase,
+            RecoveryPhase::Resolved
+        );
         assert!(store_a.request_shutdown().wait_for(Duration::from_secs(2)).unwrap());
         assert!(super::block_on(store_b.request_shutdown().wait_async()).is_ok());
     }
@@ -1079,7 +1082,10 @@ mod tests {
         let store_b = super::RecoveryStore::with_capacity(2, 2).unwrap();
         let handle = super::RecoveryHandle::new(Arc::clone(&group));
 
-        assert_eq!(store_a.try_retry(group.id()).unwrap().wait().unwrap().recovery.phase, RecoveryPhase::Pending);
+        assert_eq!(
+            store_a.try_retry(group.id()).unwrap().wait().unwrap().recovery.phase,
+            RecoveryPhase::Pending
+        );
         assert_eq!(
             store_a.try_retry(group.id()).unwrap().wait().unwrap().recovery.phase,
             RecoveryPhase::Unconfirmed,
@@ -1138,7 +1144,10 @@ mod tests {
         let handle = super::RecoveryHandle::new(Arc::clone(&group));
         let closed = super::RecoveryStore::with_capacity(2, 2).unwrap();
         closed.close_admission();
-        assert_eq!(handle.transfer_to(&closed), Err(crate::v02::report::RecoveryTransferError::Closed));
+        assert_eq!(
+            handle.transfer_to(&closed),
+            Err(crate::v02::report::RecoveryTransferError::Closed)
+        );
 
         let full = super::RecoveryStore::with_capacity(1, 2).unwrap();
         let occupant = Arc::new(RecoveryCore::new(
@@ -1163,8 +1172,14 @@ mod tests {
         assert_eq!(invalid.snapshot().phase, RecoveryPhase::Pending);
 
         handle.transfer_to(&accepting).unwrap();
-        assert_eq!(accepting.try_retry(group.id()).unwrap().wait().unwrap().recovery.phase, RecoveryPhase::Resolved);
-        assert_eq!(full.try_retry(occupant.id()).unwrap().wait().unwrap().recovery.phase, RecoveryPhase::Resolved);
+        assert_eq!(
+            accepting.try_retry(group.id()).unwrap().wait().unwrap().recovery.phase,
+            RecoveryPhase::Resolved
+        );
+        assert_eq!(
+            full.try_retry(occupant.id()).unwrap().wait().unwrap().recovery.phase,
+            RecoveryPhase::Resolved
+        );
         for store in [&closed, &full, &accepting] {
             assert!(store.request_shutdown().wait_for(Duration::from_secs(2)).unwrap());
         }
