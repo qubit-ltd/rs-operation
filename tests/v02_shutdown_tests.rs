@@ -9,6 +9,8 @@ use std::future;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -27,6 +29,7 @@ use qubit_operation::ObservationError;
 use qubit_operation::OperationManager;
 use qubit_operation::OperationOptions;
 use qubit_operation::OperationOutcome;
+use qubit_operation::RecoveryPhase;
 use qubit_operation::RecoveryStore;
 use qubit_operation::RecoveryStoreOptions;
 use qubit_operation::ResourceId;
@@ -339,6 +342,38 @@ fn test_cancel_waits_for_noninterruptible_body_to_return() {
 
 struct FailingCleanup(Arc<Mutex<Option<ResourceId>>>);
 
+struct PanickingCleanup {
+    calls: AtomicUsize,
+    resource_id: Arc<Mutex<Option<ResourceId>>>,
+    panic_on_retry: bool,
+    retry_started: Option<mpsc::Sender<()>>,
+}
+
+impl AsyncCleanup<usize> for PanickingCleanup {
+    fn cleanup(self: Arc<Self>, resource: usize, _context: CleanupContext) -> CleanupFuture<usize> {
+        Box::pin(async move {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return CleanupOutcome::Failed {
+                    failure: CleanupFailure {
+                        resource_id: self.resource_id.lock().unwrap().unwrap(),
+                        stage: CleanupStage::AsyncRelease,
+                        summary: DiagnosticSummary::new("retry required"),
+                        source: None,
+                    },
+                    resource,
+                };
+            }
+            if self.panic_on_retry {
+                std::panic::panic_any(String::from("cleanup future panicked before confirming release"));
+            }
+            if let Some(started) = &self.retry_started {
+                let _ = started.send(());
+            }
+            std::future::pending::<CleanupOutcome<usize>>().await
+        })
+    }
+}
+
 impl AsyncCleanup<usize> for FailingCleanup {
     fn cleanup(self: Arc<Self>, resource: usize, _context: CleanupContext) -> CleanupFuture<usize> {
         Box::pin(future::ready(CleanupOutcome::Failed {
@@ -351,6 +386,79 @@ impl AsyncCleanup<usize> for FailingCleanup {
             resource,
         }))
     }
+}
+
+#[test]
+fn test_panicking_cleanup_future_is_published_as_unconfirmed_recovery() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let resource_id = Arc::new(Mutex::new(None));
+    let cleanup_resource_id = Arc::clone(&resource_id);
+    let completion = manager
+        .run_and_settle(OperationOptions::default(), move |scope| {
+            let resources = scope.resource_scope(ResourceScopeOptions { capacity: 1 }).unwrap();
+            let resource = resources
+                .manage_with(
+                    17usize,
+                    Arc::new(PanickingCleanup {
+                        calls: AtomicUsize::new(0),
+                        resource_id: Arc::clone(&cleanup_resource_id),
+                        panic_on_retry: true,
+                        retry_started: None,
+                    }),
+                )
+                .unwrap();
+            *cleanup_resource_id.lock().unwrap() = Some(resource.id());
+            drop(resource);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+
+    assert_eq!(completion.settlement.recovery_count, 1);
+    let recovery = &completion.settlement.recoveries[0];
+    assert_eq!(recovery.snapshot().phase, RecoveryPhase::Pending);
+    assert_eq!(
+        recovery.try_retry().unwrap().wait().unwrap().recovery.phase,
+        RecoveryPhase::Unconfirmed
+    );
+    assert_eq!(recovery.snapshot().phase, RecoveryPhase::Unconfirmed);
+    assert!(matches!(
+        recovery.try_retry(),
+        Err(qubit_operation::RetryError::ExecutorUnavailable)
+    ));
+
+    let resource_id = Arc::new(Mutex::new(None));
+    let cleanup_resource_id = Arc::clone(&resource_id);
+    let (retry_started, retry_started_rx) = mpsc::channel();
+    let completion = manager
+        .run_and_settle(OperationOptions::default(), move |scope| {
+            let resources = scope.resource_scope(ResourceScopeOptions { capacity: 1 }).unwrap();
+            let resource = resources
+                .manage_with(
+                    18usize,
+                    Arc::new(PanickingCleanup {
+                        calls: AtomicUsize::new(0),
+                        resource_id: Arc::clone(&cleanup_resource_id),
+                        panic_on_retry: false,
+                        retry_started: Some(retry_started),
+                    }),
+                )
+                .unwrap();
+            *cleanup_resource_id.lock().unwrap() = Some(resource.id());
+            drop(resource);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    let recovery = &completion.settlement.recoveries[0];
+    let attempt = recovery.try_retry().unwrap();
+    let async_attempt = attempt.as_async();
+    let mut wait = Box::pin(async_attempt.wait());
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::future::Future::poll(wait.as_mut(), &mut context).is_pending());
+    retry_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("retry cleanup should have started");
+    drop(wait);
+    assert_eq!(recovery.snapshot().phase, RecoveryPhase::Unconfirmed);
 }
 
 #[test]

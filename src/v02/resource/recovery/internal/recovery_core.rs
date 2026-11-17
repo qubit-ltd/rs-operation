@@ -769,6 +769,37 @@ mod tests {
         drop(attempt);
     }
 
+    #[test]
+    fn test_unconfirmed_core_retains_owner_without_retry_action() {
+        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
+        let core = Arc::new(RecoveryCore::new_unconfirmed(vec![resource_id], Arc::new(())));
+
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.phase, crate::v02::report::RecoveryPhase::Unconfirmed);
+        assert_eq!(snapshot.resources.as_ref(), &[resource_id]);
+        assert!(matches!(
+            core.try_retry(),
+            Err(crate::v02::report::RetryError::ExecutorUnavailable)
+        ));
+    }
+
+    #[test]
+    fn test_panicked_retry_records_unconfirmed_diagnostic() {
+        let resource_id = ResourceId::new(ManagerId::from_raw(1), 2, 3);
+        let core = Arc::new(RecoveryCore::new(vec![resource_id], Arc::new(()), Arc::new(NoopAction)));
+        let attempt = core.try_retry().expect("retry should be admitted");
+        let generation = super::lock(&core.state).generation;
+
+        core.mark_unconfirmed(generation, Box::new("cleanup panicked"), None);
+
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.phase, crate::v02::report::RecoveryPhase::Unconfirmed);
+        assert_eq!(snapshot.last_failures.len(), 1);
+        assert_eq!(snapshot.last_failures[0].summary.as_str(), "cleanup panicked");
+        assert_eq!(snapshot.attempts, 1);
+        drop(attempt);
+    }
+
     struct LockCheckingError {
         core: Weak<RecoveryCore>,
         lock_was_available_on_drop: Arc<AtomicBool>,
