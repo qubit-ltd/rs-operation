@@ -186,6 +186,8 @@ owner 和使用引用被有意分开：scope 结束关闭新登记与查找；�
 
 scope、资源 owner、准入协调器、结果槽和恢复状态各自保护共享状态。实现通过受保护状态记录一次性事件，再移出回调或唤醒参与者。下游适配器也必须把“检查事实”和“登记 waker”同步协调，否则事件可能落在二者之间导致永久等待。
 
+容量通知在状态锁内推进 generation，并捕获当前已登记 waiter 槽位作为固定批次。解锁后才调用 wake 和析构 waiter；回调中新登记的 waiter 留待下一次通知。
+
 外部驱动对多个回调捕获 unwind panic，并检查身份/结果一致性；这种防御不等于能重建任意受损 provider 状态，也不覆盖 abort。清理不确定性必须保留，不得因捕获 panic 就发布 Released。
 
 同步 worker 上的结算等待有 WouldDeadlock 防护。manager/group shutdown 等待也识别当前目标内的操作；零时长观察可用于获取状态。没有通用锁图检测，阻塞等待子任务等其他应用环仍需调用方避免。
@@ -262,7 +264,7 @@ sequenceDiagram
 
 ### 8.3 协议错误的处理
 
-驱动器校验激活前快照身份、typed outcome 与摘要种类、release 和领域报告身份。失配或部分回调 panic 可形成 ExecutionFailed；释放/结算端口失效则可能无法完成结算。框架不会把“报告失败”解释为“资源已释放”。
+驱动器校验激活前快照身份、typed outcome 与摘要种类、release 和领域报告身份。失配或部分回调 panic 可形成 ExecutionFailed；释放/结算端口失效则可能无法完成结算。框架不会把“报告失败”解释为“资源已释放”。handle 与 observer 提供有界的 `external_protocol_faults()` 快照，每个端口最多保留首次故障，顺序为 Release、Settlement。故障包含类别；身份失配还记录实际返回身份。诊断不能代替释放证据，也不会发布领域结算报告。
 
 领域报告必须独立于 manager 最终报告。manager 正等待它才能归结；反向等待必然形成循环。适配器必须保留实际 worker 所需的 ResourceRef 到真实访问结束，不能只依赖 provider 已返回 Cancelled。
 

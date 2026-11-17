@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::v02::report::ExecutionPhase;
+use crate::v02::report::ExternalProtocolFault;
 use crate::v02::report::ResourceProgress;
 use crate::v02::report::SettlementReport;
 use crate::v02::report::StopReport;
@@ -23,4 +24,8 @@ pub(in crate::v02::operation) struct CoreFacts {
     pub(in crate::v02::operation) resources: Option<ResourceProgress>,
     /// Immutable settlement report once settlement has completed.
     pub(in crate::v02::operation) settlement: Option<Arc<SettlementReport>>,
+    /// First external release protocol fault, if any.
+    pub(in crate::v02::operation) release_fault: Option<ExternalProtocolFault>,
+    /// First external settlement protocol fault, if any.
+    pub(in crate::v02::operation) settlement_fault: Option<ExternalProtocolFault>,
 }

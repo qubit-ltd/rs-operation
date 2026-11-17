@@ -18,6 +18,7 @@ use super::ExecutionPhase;
 use super::OperationCore;
 use super::lock;
 use crate::v02::scope::ScopeCore;
+use crate::v02::report::ExternalProtocolFault;
 
 /// Tracks execution resources for a manager-driven external operation.
 pub struct ExternalExecutionContext {
@@ -66,5 +67,10 @@ impl ExternalExecutionContext {
         self.lease.execution_finished();
         drop(lock(&self.frame).take());
         self.scope.mark_body_finished();
+    }
+
+    /// Records a bounded protocol diagnostic on this operation.
+    pub(super) fn record_protocol_fault(&self, fault: ExternalProtocolFault) {
+        self.operation.record_protocol_fault(fault);
     }
 }

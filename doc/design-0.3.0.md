@@ -186,6 +186,8 @@ Cleanup reserves its path before dispatch. When execution cannot accept a job im
 
 Scopes, owners, admission coordination, outcome slots, and recovery records protect their respective shared state. The implementation records one-shot transitions under synchronization and moves callbacks or wakeups to the appropriate execution boundary. Downstream adapters must likewise coordinate checking a fact with registering its waker or risk an event arriving between them and leaving a permanent wait.
 
+Capacity notifications capture the currently registered waiter slots as one fixed batch while advancing the generation under the state lock. Wake callbacks and waiter destruction happen after unlocking; registrations created by a callback belong to a later notification.
+
 The external driver catches unwind panics around several callbacks and validates identity/result consistency. This does not reconstruct arbitrary corrupted provider state or cover abort. Cleanup uncertainty must remain explicit; catching a panic does not justify Released.
 
 Synchronous worker settlement waits have WouldDeadlock protection. Manager/group shutdown waits also recognize operations inside their target, with zero-duration observation available as a special case. There is no general lock-graph detector; other cycles, including blocking child waits, remain application concerns.
@@ -262,7 +264,7 @@ This is one legal timeline, not a mandated order for every provider. The manager
 
 ### 8.3 Protocol faults
 
-The driver validates pre-activation snapshot identity, typed-result/summary kind, and release/domain-report identities. Mismatches and some callback panics become ExecutionFailed. Broken release or settlement ports may prevent settlement from completing. Failure to report is not proof of release.
+The driver validates pre-activation snapshot identity, typed-result/summary kind, and release/domain-report identities. Mismatches and some callback panics become ExecutionFailed. Broken release or settlement ports may prevent settlement from completing. Failure to report is not proof of release. Handles and observers expose a bounded `external_protocol_faults()` snapshot with at most the first fault for each port, in Release then Settlement order. A fault records the category and, for identity mismatch, the observed identity; it does not replace release evidence or publish a domain settlement report.
 
 Domain reports must be independent of the manager's final report, which is waiting for them. Waiting in the opposite direction creates a cycle. Adapters retain the ResourceRef needed by each actual worker until access ends, not merely until the provider returns Cancelled.
 

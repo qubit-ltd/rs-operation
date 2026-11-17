@@ -23,6 +23,8 @@ use qubit_operation::DiagnosticSummary;
 use qubit_operation::EffectFact;
 use qubit_operation::EffectRecord;
 use qubit_operation::ExecutionFailure;
+use qubit_operation::ExternalProtocolFaultKind;
+use qubit_operation::ExternalProtocolPort;
 use qubit_operation::ExecutionPhase;
 use qubit_operation::ExternalBindError;
 use qubit_operation::ManagerLimits;
@@ -64,6 +66,7 @@ struct Prepared {
     summary_polls: std::sync::atomic::AtomicUsize,
     summary_kind: std::sync::atomic::AtomicUsize,
     summary_id: std::sync::Mutex<Option<OperationId>>,
+    protocol_fault_id: std::sync::Mutex<Option<OperationId>>,
     typed_outcome: std::sync::Mutex<Option<OperationOutcome<usize, ()>>>,
     settlement_ready: std::sync::atomic::AtomicBool,
     settlement_waker: std::sync::Mutex<Option<Waker>>,
@@ -145,7 +148,7 @@ impl OperationControl for Prepared {
             return Poll::Pending;
         }
         Poll::Ready(ChildRelease {
-            operation_id: self.id.lock().unwrap().expect("bound before polling"),
+            operation_id: if self.panic_flags.load(std::sync::atomic::Ordering::SeqCst) & 64 != 0 { self.protocol_fault_id.lock().unwrap().expect("fault ID set") } else { self.id.lock().unwrap().expect("bound before polling") },
             confirmed_at: None,
         })
     }
@@ -160,7 +163,7 @@ impl OperationControl for Prepared {
             *self.settlement_waker.lock().unwrap() = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        let operation_id = self.id.lock().unwrap().expect("bound before polling");
+        let operation_id = if self.panic_flags.load(std::sync::atomic::Ordering::SeqCst) & 128 != 0 { self.protocol_fault_id.lock().unwrap().expect("fault ID set") } else { self.id.lock().unwrap().expect("bound before polling") };
         let status = self
             .domain_settlement_status
             .lock()
@@ -240,6 +243,7 @@ impl Prepared {
             summary_polls: std::sync::atomic::AtomicUsize::new(0),
             summary_kind: std::sync::atomic::AtomicUsize::new(0),
             summary_id: std::sync::Mutex::new(None),
+            protocol_fault_id: std::sync::Mutex::new(None),
             typed_outcome: std::sync::Mutex::new(None),
             settlement_ready: std::sync::atomic::AtomicBool::new(true),
             settlement_waker: std::sync::Mutex::new(None),
@@ -265,6 +269,59 @@ impl Prepared {
         if let Some(waker) = self.release_waker.lock().unwrap().take() {
             waker.wake();
         }
+    }
+}
+
+#[test]
+fn test_external_protocol_fault_panics_are_queryable_and_stop_polling() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let seed = Prepared::ready_fixture();
+    let mut seed_handle = manager.try_submit_external(OperationOptions::default(), Arc::clone(&seed)).unwrap();
+    let foreign_id = seed.id.lock().unwrap().expect("seed operation is bound");
+    let _ = seed_handle.wait_outcome().unwrap();
+    seed_handle.wait_settlement().unwrap();
+    for (mask, port, mismatch) in [
+        (4, ExternalProtocolPort::Release, false),
+        (8, ExternalProtocolPort::Settlement, false),
+        (0, ExternalProtocolPort::Release, true),
+        (0, ExternalProtocolPort::Settlement, true),
+    ] {
+        let prepared = Prepared::ready_fixture();
+        prepared.panic_flags.store(mask, std::sync::atomic::Ordering::SeqCst);
+        if mismatch {
+            *prepared.protocol_fault_id.lock().unwrap() = Some(foreign_id);
+            prepared.panic_flags.store(if port == ExternalProtocolPort::Release { 64 } else { 128 }, std::sync::atomic::Ordering::SeqCst);
+        }
+        let mut handle = manager
+            .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
+            .unwrap();
+        assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
+        let observer = handle.observer();
+        let faults = observer.external_protocol_faults();
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].operation_id, handle.id());
+        assert_eq!(faults[0].port, port);
+        assert_eq!(faults[0].kind, if mismatch { ExternalProtocolFaultKind::IdentityMismatch } else { ExternalProtocolFaultKind::Panicked });
+        assert_eq!(faults[0].observed_operation_id.is_some(), mismatch);
+        assert_eq!(handle.external_protocol_faults().as_ref(), faults.as_ref());
+        assert_eq!(observer.as_async().external_protocol_faults().as_ref(), faults.as_ref());
+        let polls = match port {
+            ExternalProtocolPort::Release => prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst),
+            ExternalProtocolPort::Settlement => prepared.settlement_polls.load(std::sync::atomic::Ordering::SeqCst),
+        };
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let later_polls = match port {
+            ExternalProtocolPort::Release => prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst),
+            ExternalProtocolPort::Settlement => prepared.settlement_polls.load(std::sync::atomic::Ordering::SeqCst),
+        };
+        assert_eq!(polls, later_polls, "faulted port must stop polling");
+        assert!(matches!(
+            handle.wait_settlement_for(std::time::Duration::ZERO).unwrap(),
+            SettlementWait::Pending(_)
+        ));
+        let async_handle = handle.into_async();
+        assert_eq!(async_handle.external_protocol_faults().as_ref(), faults.as_ref());
+        assert_eq!(async_handle.observer().as_sync().external_protocol_faults().as_ref(), faults.as_ref());
     }
 }
 
@@ -383,6 +440,7 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
         summary_kind: std::sync::atomic::AtomicUsize::new(0),
         summary_id: std::sync::Mutex::new(None),
+            protocol_fault_id: std::sync::Mutex::new(None),
         typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
@@ -476,6 +534,7 @@ fn test_post_claim_bind_failure_is_accepted_and_abandoned_once() {
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
         summary_kind: std::sync::atomic::AtomicUsize::new(0),
         summary_id: std::sync::Mutex::new(None),
+            protocol_fault_id: std::sync::Mutex::new(None),
         typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
@@ -529,6 +588,7 @@ fn test_stop_during_bind_wins_before_commit_and_abandons_without_activation() {
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
         summary_kind: std::sync::atomic::AtomicUsize::new(0),
         summary_id: std::sync::Mutex::new(None),
+            protocol_fault_id: std::sync::Mutex::new(None),
         typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
@@ -601,6 +661,7 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
         summary_kind: std::sync::atomic::AtomicUsize::new(0),
         summary_id: std::sync::Mutex::new(None),
+            protocol_fault_id: std::sync::Mutex::new(None),
         typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
@@ -663,6 +724,7 @@ fn test_already_bound_claim_rolls_back_provisional_parent_child_link() {
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
         summary_kind: std::sync::atomic::AtomicUsize::new(0),
         summary_id: std::sync::Mutex::new(None),
+            protocol_fault_id: std::sync::Mutex::new(None),
         typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
@@ -726,6 +788,7 @@ fn test_dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
         summary_kind: std::sync::atomic::AtomicUsize::new(0),
         summary_id: std::sync::Mutex::new(None),
+            protocol_fault_id: std::sync::Mutex::new(None),
         typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),
@@ -1380,6 +1443,7 @@ fn test_async_manager_drives_external_activation_on_portable_executor() {
         summary_polls: std::sync::atomic::AtomicUsize::new(0),
         summary_kind: std::sync::atomic::AtomicUsize::new(0),
         summary_id: std::sync::Mutex::new(None),
+            protocol_fault_id: std::sync::Mutex::new(None),
         typed_outcome: std::sync::Mutex::new(None),
         settlement_ready: std::sync::atomic::AtomicBool::new(true),
         settlement_waker: std::sync::Mutex::new(None),

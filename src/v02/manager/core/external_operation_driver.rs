@@ -24,6 +24,31 @@ use super::OperationScope;
 use super::child_outcome_summary;
 use super::lock;
 use super::panic_message;
+use super::dispose_panic_payload;
+use crate::v02::report::ExternalProtocolFault;
+use crate::v02::report::ExternalProtocolFaultKind;
+use crate::v02::report::ExternalProtocolPort;
+use crate::v02::report::OperationId;
+
+fn record_protocol_fault(
+    state: &Arc<Mutex<Option<Arc<ExternalExecutionContext>>>>,
+    operation_id: OperationId,
+    port: ExternalProtocolPort,
+    kind: ExternalProtocolFaultKind,
+    observed_operation_id: Option<OperationId>,
+    summary: &str,
+) {
+    let context = lock(state).as_ref().cloned();
+    if let Some(context) = context {
+        context.record_protocol_fault(ExternalProtocolFault {
+            operation_id,
+            port,
+            kind,
+            observed_operation_id,
+            summary: DiagnosticSummary::new(summary),
+        });
+    }
+}
 
 /// Shared one-shot callback for publishing a typed external operation outcome.
 ///
@@ -198,18 +223,36 @@ pub async fn drive_external<T, E, P>(
             match panic::catch_unwind(AssertUnwindSafe(|| adapter.poll_release(cx))) {
                 Ok(Poll::Ready(value)) => {
                     release_polled = true;
+                    if value.operation_id != operation_id {
+                        record_protocol_fault(&execution_state, operation_id, ExternalProtocolPort::Release,
+                            ExternalProtocolFaultKind::IdentityMismatch, Some(value.operation_id), "external release identity mismatch");
+                    }
                     release = managed.confirm_input_release(value);
                 }
                 Ok(Poll::Pending) => {}
-                Err(_) => release_poll_failed = true,
+                Err(payload) => {
+                    release_poll_failed = true;
+                    record_protocol_fault(&execution_state, operation_id, ExternalProtocolPort::Release,
+                        ExternalProtocolFaultKind::Panicked, None, "external release poll panicked");
+                    dispose_panic_payload(payload);
+                }
             }
         }
         if settlement.is_none() && !settlement_poll_failed {
             match panic::catch_unwind(AssertUnwindSafe(|| adapter.poll_settlement(cx))) {
                 Ok(Poll::Ready(value)) if value.operation_id == operation_id => settlement = Some(value),
-                Ok(Poll::Ready(_)) => settlement_poll_failed = true,
+                Ok(Poll::Ready(value)) => {
+                    settlement_poll_failed = true;
+                    record_protocol_fault(&execution_state, operation_id, ExternalProtocolPort::Settlement,
+                        ExternalProtocolFaultKind::IdentityMismatch, Some(value.operation_id), "external settlement identity mismatch");
+                }
                 Ok(Poll::Pending) => {}
-                Err(_) => settlement_poll_failed = true,
+                Err(payload) => {
+                    settlement_poll_failed = true;
+                    record_protocol_fault(&execution_state, operation_id, ExternalProtocolPort::Settlement,
+                        ExternalProtocolFaultKind::Panicked, None, "external settlement poll panicked");
+                    dispose_panic_payload(payload);
+                }
             }
         }
         if typed_poll_done && !published && (!activated || summary_poll_done || typed_poll_failed) {

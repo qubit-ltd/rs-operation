@@ -54,6 +54,12 @@ impl AsyncOperationObserver {
         self.core.id()
     }
 
+    /// Returns the bounded diagnostics reported by external protocol ports.
+    /// Faults are ordered Release then Settlement and do not alter the operation outcome.
+    pub fn external_protocol_faults(&self) -> Arc<[crate::v02::report::ExternalProtocolFault]> {
+        self.core.external_protocol_faults()
+    }
+
     /// Returns the latest untyped lifecycle snapshot.
     ///
     /// # Returns
@@ -67,6 +73,12 @@ impl AsyncOperationObserver {
 
     /// Asynchronously waits for the immutable settlement report.
     ///
+    /// The observer does not own the typed outcome, but another handle or owner
+    /// can retain a [`crate::v02::resource::ResourceRef`] needed for settlement.
+    /// Release references held by success and error values before awaiting.
+    /// See [`crate::v02::operation::OperationHandle::wait_settlement`] for an
+    /// example of the shared ownership rule.
+    ///
     /// # Returns
     ///
     /// A shared settlement report after settlement completes.
@@ -77,6 +89,10 @@ impl AsyncOperationObserver {
 
     /// Waits until the deadline, returning a pending snapshot if settlement is
     /// not ready.
+    ///
+    /// Other owners, including references inside an unconsumed outcome, can
+    /// keep settlement pending. The deadline only bounds observation; it does
+    /// not prove release.
     ///
     /// The deadline must use the same clock domain as the operation context.
     ///
