@@ -318,6 +318,55 @@ mod tests {
     }
 
     #[test]
+    fn test_deadline_signal_replaces_and_cancels_timer_then_expires() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        struct PendingClock {
+            domain: ClockDomainId,
+            ticks: AtomicUsize,
+            registrations: AtomicUsize,
+            cancellations: Arc<AtomicUsize>,
+        }
+        impl ClockSource for PendingClock {
+            fn now(&self) -> MonotonicTime {
+                MonotonicTime::new(self.domain, self.ticks.load(Ordering::SeqCst) as u64)
+            }
+            fn register_deadline(&self, _at: MonotonicTime, _wake: Waker) -> Box<dyn TimerRegistration> {
+                self.registrations.fetch_add(1, Ordering::SeqCst);
+                Box::new(Registration(Arc::clone(&self.cancellations)))
+            }
+        }
+        let domain = ClockDomainId::new_unique();
+        let clock = Arc::new(PendingClock {
+            domain,
+            ticks: AtomicUsize::new(0),
+            registrations: AtomicUsize::new(0),
+            cancellations: Arc::new(AtomicUsize::new(0)),
+        });
+        let context = OperationContext::new(options(clock.clone(), domain, 10)).unwrap();
+        let mut signal = Box::pin(context.deadline_signal().unwrap());
+        let first = Waker::from(Arc::new(CountWake(AtomicUsize::new(0))));
+        let second = Waker::from(Arc::new(CountWake(AtomicUsize::new(0))));
+        assert!(matches!(signal.as_mut().poll(&mut std::task::Context::from_waker(&first)), Poll::Pending));
+        assert!(matches!(signal.as_mut().poll(&mut std::task::Context::from_waker(&first)), Poll::Pending));
+        assert_eq!(clock.registrations.load(Ordering::SeqCst), 1);
+        assert!(matches!(signal.as_mut().poll(&mut std::task::Context::from_waker(&second)), Poll::Pending));
+        assert_eq!(clock.registrations.load(Ordering::SeqCst), 2);
+        assert_eq!(clock.cancellations.load(Ordering::SeqCst), 1);
+        clock.ticks.store(10, Ordering::SeqCst);
+        assert!(matches!(signal.as_mut().poll(&mut std::task::Context::from_waker(&second)), Poll::Ready(())));
+        assert!(matches!(signal.as_mut().poll(&mut std::task::Context::from_waker(&second)), Poll::Ready(())));
+        assert_eq!(context.stop_reason(), Some(StopReason::Timeout));
+        assert_eq!(clock.cancellations.load(Ordering::SeqCst), 2);
+
+        let mut pending = Box::pin(OperationContext::new(options(clock.clone(), domain, 20)).unwrap().deadline_signal().unwrap());
+        assert!(matches!(pending.as_mut().poll(&mut std::task::Context::from_waker(&first)), Poll::Pending));
+        drop(pending);
+        assert_eq!(clock.cancellations.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
     fn test_child_deadline_cannot_extend_parent() {
         let domain = ClockDomainId::new_unique();
         let clock: Arc<dyn ClockSource> = ManualClock::new(domain, 0);

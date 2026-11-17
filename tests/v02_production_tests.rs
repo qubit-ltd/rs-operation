@@ -506,3 +506,29 @@ fn test_accepted_stop_rejects_reserved_resource_commit_and_cleanup_settles_once(
     assert!(cleanup_ran.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(settlement.resource_reports[0].resource_id, resource_id);
 }
+
+#[test]
+fn test_ended_operation_rejected_commit_retains_value_for_cleanup() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let mut operation = manager.try_submit(OperationOptions::default(), move |scope| {
+        sender.send(scope.reserve_resource().unwrap()).unwrap();
+        Ok::<_, ()>(())
+    }).unwrap();
+    let reservation = receiver.recv().unwrap();
+    assert!(matches!(operation.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
+    let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let error = match reservation.commit(CountedDrop(Arc::clone(&drops))) {
+        Ok(_) => panic!("ended scope accepted commit"),
+        Err(error) => error,
+    };
+    assert_eq!(error.reason(), ResourceManageErrorKind::ScopeEnded);
+    let (reason, value, reservation) = error.into_parts();
+    assert_eq!(reason, ResourceManageErrorKind::ScopeEnded);
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let id = reservation.retain_for_cleanup(value);
+    let settlement = operation.wait_settlement().unwrap();
+    assert!(settlement.all_released());
+    assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(settlement.resource_reports.iter().any(|report| report.resource_id == id));
+}
