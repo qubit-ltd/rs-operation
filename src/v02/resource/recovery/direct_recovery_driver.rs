@@ -100,7 +100,19 @@ impl Future for DirectRecoveryDriver {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(context))) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(result)) => {
-                this.future.take();
+                let future = this
+                    .future
+                    .take()
+                    .expect("completed future remains present");
+                if let Err(panic) = super::recovery_attempt::drop_completed_future(future) {
+                    if let Err(secondary) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(result)))
+                    {
+                        crate::v02::manager::core::dispose_panic_payload(secondary);
+                    }
+                    this.complete_unconfirmed(panic, None);
+                    return Poll::Ready(());
+                }
                 let run = this.run.as_mut().expect("direct retry run remains present");
                 run.complete(result);
                 publish_attempt(&this.observation, run.core.snapshot());

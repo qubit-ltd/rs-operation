@@ -63,6 +63,7 @@ mod tests {
     use super::RecoveryAction;
     use super::RecoveryCore;
     use super::RecoveryPhase;
+    use super::RecoveryStoreOptions;
     use super::lock;
     use crate::v02::report::CleanupFailure;
     use crate::v02::report::CleanupStage;
@@ -708,6 +709,129 @@ mod tests {
     impl RecoveryAction for PanicPollWithDrop {
         fn retry(&self, _payload: Arc<dyn std::any::Any + Send + Sync>) -> super::RecoveryFuture {
             Box::pin(PanicFutureDropProbe(Arc::clone(&self.0)))
+        }
+    }
+
+    struct ReadyDropPanic {
+        drops: Arc<AtomicUsize>,
+        action_drops: Arc<AtomicUsize>,
+        result: bool,
+    }
+
+    impl Drop for ReadyDropPanic {
+        fn drop(&mut self) {
+            self.action_drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ReadyDropPanicFuture {
+        drops: Arc<AtomicUsize>,
+        result: bool,
+    }
+
+    impl Future for ReadyDropPanicFuture {
+        type Output = Result<(), CleanupFailure>;
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.result {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(CleanupFailure {
+                    resource_id: ResourceId::new(ManagerId::new_unique(), 13, 1),
+                    stage: CleanupStage::AsyncRelease,
+                    summary: DiagnosticSummary::new("retry failed"),
+                    source: None,
+                }))
+            }
+        }
+    }
+
+    impl Drop for ReadyDropPanicFuture {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            panic!("ready future drop panic");
+        }
+    }
+
+    impl RecoveryAction for ReadyDropPanic {
+        fn retry(&self, _payload: Arc<dyn std::any::Any + Send + Sync>) -> super::RecoveryFuture {
+            Box::pin(ReadyDropPanicFuture {
+                drops: Arc::clone(&self.drops),
+                result: self.result,
+            })
+        }
+    }
+
+    struct OwnerDrop(Arc<AtomicUsize>);
+
+    impl Drop for OwnerDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_recovery_ready_drop_panic_is_unconfirmed_direct_and_in_store() {
+        for result in [true, false] {
+            for in_store in [false, true] {
+                let drops = Arc::new(AtomicUsize::new(0));
+                let owner_drops = Arc::new(AtomicUsize::new(0));
+                let action_drops = Arc::new(AtomicUsize::new(0));
+                let manager = ManagerId::new_unique();
+                let group = Arc::new(RecoveryCore::new(
+                    vec![ResourceId::new(manager, 13, 1)],
+                    Arc::new(OwnerDrop(Arc::clone(&owner_drops))),
+                    Arc::new(ReadyDropPanic {
+                        drops: Arc::clone(&drops),
+                        action_drops: Arc::clone(&action_drops),
+                        result,
+                    }),
+                ));
+                let store = if in_store {
+                    let store = super::RecoveryStore::new(RecoveryStoreOptions::default()).unwrap();
+                    assert!(store.accept(Arc::clone(&group)).is_ok());
+                    Some(store)
+                } else {
+                    None
+                };
+                let attempt = if let Some(store) = &store {
+                    store.try_retry(group.id()).unwrap()
+                } else {
+                    group.try_retry().unwrap()
+                };
+                let second_observer = attempt.as_async();
+                let (report_tx, report_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || report_tx.send(attempt.wait()).unwrap());
+                let report = report_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("recovery attempt report was not published within watchdog")
+                    .unwrap();
+                let second_report = super::block_on(second_observer.wait());
+
+                assert_eq!(report.recovery.phase, RecoveryPhase::Unconfirmed);
+                assert_eq!(second_report.recovery.phase, RecoveryPhase::Unconfirmed);
+                assert_eq!(report.recovery.phase, second_report.recovery.phase);
+                assert_eq!(report.recovery.attempts, second_report.recovery.attempts);
+                assert_eq!(report.recovery.resources, second_report.recovery.resources);
+                assert_eq!(group.snapshot().phase, RecoveryPhase::Unconfirmed);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                assert_eq!(owner_drops.load(Ordering::SeqCst), 0);
+                assert_eq!(action_drops.load(Ordering::SeqCst), 0);
+                assert!(group.try_retry().is_err());
+                if let Some(store) = store {
+                    assert!(store.contains(group.id()));
+                    let healthy = Arc::new(RecoveryCore::new(
+                        vec![ResourceId::new(ManagerId::new_unique(), 14, 1)],
+                        Arc::new(()),
+                        Arc::new(Noop),
+                    ));
+                    let healthy_id = healthy.id();
+                    assert!(store.accept(Arc::clone(&healthy)).is_ok());
+                    let healthy_report = store.try_retry(healthy_id).unwrap().wait().unwrap();
+                    assert_eq!(healthy_report.recovery.phase, RecoveryPhase::Resolved);
+                    store.request_shutdown().wait_for(Duration::from_secs(2)).unwrap();
+                }
+            }
         }
     }
 

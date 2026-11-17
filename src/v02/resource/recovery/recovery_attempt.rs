@@ -53,6 +53,27 @@ pub struct RecoveryAttempt {
     pub(in crate::v02::resource::recovery) observation: Arc<AttemptObservation>,
 }
 
+/// Drops a completed retry future inside an unwind boundary.
+///
+/// A destructor panic means the cleanup result cannot be trusted. The future
+/// has already been removed from its owner and must never be polled or dropped
+/// again.
+pub(super) fn drop_completed_future(
+    future: crate::v02::resource::recovery::RecoveryFuture,
+) -> Result<(), Box<dyn std::any::Any + Send + 'static>> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(future))) {
+        Ok(()) => Ok(()),
+        Err(panic) => Err(panic),
+    }
+}
+
+/// Disposes of a value abandoned after the completed future's Drop panicked.
+fn dispose_abandoned_result(result: Result<(), CleanupFailure>) {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(result))) {
+        crate::v02::manager::core::dispose_panic_payload(panic);
+    }
+}
+
 impl RecoveryAttempt {
     /// Blocks the current thread until this retry publishes its report.
     ///
@@ -199,8 +220,14 @@ async fn retry_catching_panic(
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future_ref.as_mut().poll(cx))) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(result)) => {
-                future.take();
-                Poll::Ready(Ok(result))
+                let completed = future.take().expect("completed future remains present");
+                match drop_completed_future(completed) {
+                    Ok(()) => Poll::Ready(Ok(result)),
+                    Err(panic) => {
+                        dispose_abandoned_result(result);
+                        Poll::Ready(Err((panic, None)))
+                    }
+                }
             }
             Err(panic) => Poll::Ready(Err((panic, future.take()))),
         }
