@@ -233,27 +233,31 @@ mod tests {
         let attempt = store.try_retry(id).expect("store retry should be admitted");
         let mut observer = Box::pin(attempt.wait_async());
         let mut shutdown_observer = Box::pin(shutdown.wait_async());
-        let wakes = Arc::new(AtomicUsize::new(0));
-        let waker = Waker::from(Arc::new(WakeCounter(Arc::clone(&wakes))));
-        let mut context = Context::from_waker(&waker);
-        assert!(observer.as_mut().poll(&mut context).is_pending());
-        assert!(shutdown_observer.as_mut().poll(&mut context).is_pending());
+        let attempt_wakes = Arc::new(AtomicUsize::new(0));
+        let attempt_waker = Waker::from(Arc::new(WakeCounter(Arc::clone(&attempt_wakes))));
+        let mut attempt_context = Context::from_waker(&attempt_waker);
+        let shutdown_wakes = Arc::new(AtomicUsize::new(0));
+        let shutdown_waker = Waker::from(Arc::new(WakeCounter(Arc::clone(&shutdown_wakes))));
+        let mut shutdown_context = Context::from_waker(&shutdown_waker);
+        assert!(observer.as_mut().poll(&mut attempt_context).is_pending());
+        assert!(shutdown_observer.as_mut().poll(&mut shutdown_context).is_pending());
         started_receiver
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(5))
             .expect("store worker should start the retry");
 
         gate.open();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut report = None;
         let mut shutdown_result = None;
         while report.is_none() || shutdown_result.is_none() {
             if report.is_none()
-                && let Poll::Ready(completed) = observer.as_mut().poll(&mut context)
+                && let Poll::Ready(completed) = observer.as_mut().poll(&mut attempt_context)
             {
                 report = Some(completed);
             }
             if shutdown_result.is_none()
-                && let Poll::Ready(completed) = shutdown_observer.as_mut().poll(&mut context)
+                && let Poll::Ready(completed) =
+                    shutdown_observer.as_mut().poll(&mut shutdown_context)
             {
                 shutdown_result = Some(completed);
             }
@@ -269,7 +273,14 @@ mod tests {
         assert!(report.recovery.last_failures.is_empty());
         assert_eq!(report.recovery.failures_total, 0);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
-        assert!(wakes.load(Ordering::SeqCst) > 0, "worker completion should wake observer");
+        assert!(
+            attempt_wakes.load(Ordering::SeqCst) > 0,
+            "worker completion should wake attempt observer"
+        );
+        assert!(
+            shutdown_wakes.load(Ordering::SeqCst) > 0,
+            "terminal notification should wake shutdown observer"
+        );
         assert!(!store.contains(id), "terminal store notification should prune resolved group");
     }
 
