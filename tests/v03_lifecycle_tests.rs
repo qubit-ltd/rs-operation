@@ -462,7 +462,9 @@ fn test_resource_valued_typed_outcome_must_be_dropped_before_settlement() {
         .try_submit_external(OperationOptions::default(), Arc::clone(&external))
         .unwrap();
     let outcome = handle.wait_outcome().unwrap();
-    polled_rx.recv().unwrap();
+    polled_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("driver should poll external settlement");
     assert!(matches!(
         handle.wait_settlement_for(std::time::Duration::ZERO).unwrap(),
         SettlementWait::Pending(_)
