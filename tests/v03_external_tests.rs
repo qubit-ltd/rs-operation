@@ -701,11 +701,11 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
         move || child_manager.try_submit_external::<usize, (), _>(OperationOptions::default(), prepared)
     });
     entered_rx.recv().expect("child bind reached final preflight");
-    close_parent_tx.send(()).unwrap();
     assert_eq!(
         parent.request_stop(StopReason::UserCancelled),
         StopRequestStatus::Accepted
     );
+    close_parent_tx.send(()).unwrap();
     let (ready, changed) = &*proceed;
     *ready.lock().unwrap() = true;
     changed.notify_all();
