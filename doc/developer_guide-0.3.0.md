@@ -510,6 +510,8 @@ Every pending poll registers the latest waker; changes to its fact must wake it.
 
 Publish a typed result once; summary, release, and settlement can become ready independently. The driver checks identity and outcome kind; mismatch becomes an execution fault. Failure of release or domain polling cannot manufacture successful cleanup and may leave settlement pending indefinitely. Panic is not a cancellation protocol.
 
+After a bounded settlement wait returns `Pending`, inspect `handle.external_protocol_faults()` or the same method on an observer. The returned snapshot holds at most one first fault per port, ordered Release then Settlement. `Panicked` identifies a panic while polling; `IdentityMismatch` includes the provider's observed operation ID. These diagnostics do not change the business outcome or prove release. Release-port faults stop release polling and keep settlement pending; settlement-port faults stop settlement polling and do not publish domain evidence.
+
 ### 12.3 Verify the entire timeline
 
 [provider_read.rs](examples-0.3.0/provider_read.rs) contains a complete simulated provider compiled as a library target; `tests/v03_external_tests.rs` executes its lifecycle demonstration. It calls no real SDK but covers every phase:
@@ -544,6 +546,7 @@ After a successful handoff to an independent store, the application must keep ow
 | Parent all_released is true, but a child needs recovery | Inspect nested children and truncation; the method does not traverse them. |
 | Business finished, new submissions remain Busy | Check unsettled root quotas, unconsumed results, group and child-path permits. |
 | Provider stopped, manager still waits | Check outcome, release, domain settlement, and wakers independently; never invent release evidence. |
+| External settlement times out | Query `external_protocol_faults()` on the handle or observer; inspect the failed port and observed identity. |
 | External submissions are full while sync workers are idle | Inspect async_executor task capacity and driver callbacks. |
 | Reservation succeeded but commit failed | Check stop/end races; recover resource and reservation and route cleanup. |
 | Effects or report details are missing | Inspect total, truncated, and overflow fields alongside application logs. |

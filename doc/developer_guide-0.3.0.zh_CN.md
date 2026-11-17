@@ -510,6 +510,8 @@ pub fn hand_off(handle: &RecoveryHandle, store: &RecoveryStore) -> Result<(), St
 
 typed 结果只发布一次，但摘要与释放、结算各自可独立就绪。驱动器核对身份和结果种类，不匹配会形成执行故障。输入释放或领域轮询失败不能伪造成功清理；错误适配器可能导致结算长期 Pending。不要用 panic 作为取消协议。
 
+限时结算观察返回 `Pending` 后，可通过 handle 或 observer 的 `external_protocol_faults()` 查询诊断。快照每个端口最多保留首次故障，顺序固定为 Release、Settlement。`Panicked` 表示轮询期间发生 panic；`IdentityMismatch` 会保留 provider 返回的实际 OperationId。诊断不会改写业务 outcome，也不代表资源已释放。释放端口故障会停止该端口轮询并使结算保持 Pending；结算端口故障也会停止轮询，且不会发布领域结算证据。
+
 ### 12.3 按时间线核对完整接入
 
 [provider_read.rs](examples-0.3.0/provider_read.rs) 包含完整模拟 provider，Cargo 作为 library target 编译；`tests/v03_external_tests.rs` 执行其生命周期演示。它不调用真实 SDK，但完整覆盖：
@@ -544,6 +546,7 @@ typed 结果只发布一次，但摘要与释放、结算各自可独立就绪�
 | 父 all_released 为 true，但子任务需恢复 | 检查 children 嵌套报告与 truncated；该方法不递归子树。 |
 | 业务已完成，新提交仍 Busy | 检查未结算根额度、未消费结果、组与子路径许可。 |
 | provider 已停止但仍等待 | 分别检查 outcome、release、domain settlement 和 waker；不能补造释放事实。 |
+| 外部结算超时 | 用 handle 或 observer 查询 `external_protocol_faults()`，检查故障端口和实际身份。 |
 | 外部提交满、同步池很空 | 检查 async_executor 的 task capacity 和驱动回调。 |
 | 预留成功、commit 失败 | 检查停止/结束竞态；从错误取回资源和预留并安排清理。 |
 | effects 或报告缺明细 | 检查 total、truncated、overflow，结合应用日志。 |

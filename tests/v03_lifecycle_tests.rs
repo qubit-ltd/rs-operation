@@ -296,7 +296,9 @@ fn test_stopped_early_outcome_waits_for_input_release_and_domain_settlement() {
         ChildOutcomeKind::Succeeded,
         "domain reports success consistently; framework stop policy publishes Stopped"
     );
-    polled_rx.recv().unwrap();
+    polled_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("driver should poll external settlement");
     assert!(matches!(
         handle.wait_settlement_for(std::time::Duration::ZERO).unwrap(),
         SettlementWait::Pending(_)

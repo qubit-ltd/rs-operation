@@ -86,6 +86,12 @@ impl<T: Send + 'static, E: Send + 'static> OperationHandle<T, E> {
         self.parts().core.id()
     }
 
+    /// Returns the bounded diagnostics reported by external protocol ports.
+    /// Faults are ordered Release then Settlement and do not alter the operation outcome.
+    pub fn external_protocol_faults(&self) -> Arc<[crate::v02::report::ExternalProtocolFault]> {
+        self.parts().core.external_protocol_faults()
+    }
+
     /// Requests the first stop reason accepted by this operation.
     ///
     /// # Parameters
@@ -168,6 +174,29 @@ impl<T: Send + 'static, E: Send + 'static> OperationHandle<T, E> {
 
     /// Blocks until the stable settlement report is published.
     ///
+    /// An unconsumed outcome can retain a [`crate::v02::resource::ResourceRef`]
+    /// and keep settlement pending. Consume the outcome, then drop any resource
+    /// references held by its success or error value and their clones before
+    /// waiting. `WouldDeadlock` only detects this operation's blocking worker;
+    /// it does not detect every resource wait cycle.
+    ///
+    /// ```
+    /// use qubit_operation::{ManagerOptions, OperationManager, OperationOptions, OperationOutcome};
+    ///
+    /// let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    /// let mut operation = manager
+    ///     .try_submit(OperationOptions::default(), |scope| {
+    ///         Ok::<_, ()>(scope.manage(String::from("leased value")).unwrap())
+    ///     })
+    ///     .unwrap();
+    /// match operation.wait_outcome().unwrap() {
+    ///     OperationOutcome::Succeeded(resource) => drop(resource),
+    ///     other => drop(other), // Errors can also retain ResourceRefs.
+    /// }
+    /// let report = operation.wait_settlement().unwrap();
+    /// assert!(report.all_released());
+    /// ```
+    ///
     /// # Returns
     ///
     /// A shared settlement report.
@@ -185,6 +214,11 @@ impl<T: Send + 'static, E: Send + 'static> OperationHandle<T, E> {
 
     /// Waits for settlement for at most `timeout`, returning the current
     /// snapshot on timeout.
+    ///
+    /// An unconsumed outcome or references retained by its success or error
+    /// value can keep settlement pending. Consume the outcome and release
+    /// those references before waiting. `WouldDeadlock` only covers detected
+    /// blocking-worker calls; timeout reports observation, not release.
     ///
     /// # Parameters
     ///

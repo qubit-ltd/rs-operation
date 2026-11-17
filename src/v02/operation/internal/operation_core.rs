@@ -26,6 +26,8 @@ use crate::v02::operation::internal::AVAILABILITY_TAKEN;
 use crate::v02::protocol::ClockSource;
 use crate::v02::protocol::Deadline;
 use crate::v02::report::ExecutionPhase;
+use crate::v02::report::ExternalProtocolFault;
+use crate::v02::report::ExternalProtocolPort;
 use crate::v02::report::OperationId;
 use crate::v02::report::OperationSnapshot;
 use crate::v02::report::OutcomeAvailability;
@@ -93,6 +95,8 @@ impl OperationCore {
                 stop: None,
                 resources: None,
                 settlement: None,
+                release_fault: None,
+                settlement_fault: None,
             }),
             availability: AtomicU8::new(AVAILABILITY_PENDING),
             changed: Notify::new(),
@@ -136,6 +140,36 @@ impl OperationCore {
             resources: facts.resources,
             settlement: facts.settlement.as_ref().map(Arc::clone),
         }
+    }
+
+    /// Records the first fault for an external protocol port.
+    pub(crate) fn record_protocol_fault(&self, fault: ExternalProtocolFault) {
+        let mut facts = lock(&self.facts);
+        let slot = match fault.port {
+            ExternalProtocolPort::Release => &mut facts.release_fault,
+            ExternalProtocolPort::Settlement => &mut facts.settlement_fault,
+        };
+        if slot.is_none() {
+            *slot = Some(fault);
+            drop(facts);
+            self.notify_change();
+        }
+    }
+
+    /// Returns the recorded external protocol faults in stable port order.
+    pub(crate) fn external_protocol_faults(&self) -> Arc<[ExternalProtocolFault]> {
+        let faults = {
+            let facts = lock(&self.facts);
+            let mut faults = Vec::with_capacity(2);
+            if let Some(fault) = &facts.release_fault {
+                faults.push(fault.clone());
+            }
+            if let Some(fault) = &facts.settlement_fault {
+                faults.push(fault.clone());
+            }
+            faults
+        };
+        Arc::from(faults)
     }
 
     /// Reads the outcome availability marker for observers.
@@ -425,7 +459,35 @@ mod tests {
 
     use super::OperationCore;
     use crate::v02::report::OperationId;
+    use crate::v02::report::ExternalProtocolFault;
+    use crate::v02::report::ExternalProtocolFaultKind;
+    use crate::v02::report::ExternalProtocolPort;
+    use crate::v02::report::DiagnosticSummary;
     use crate::v02::report::SettlementReport;
+
+    #[test]
+    fn test_external_protocol_fault_slots_are_bounded_ordered_and_first_wins() {
+        let id = OperationId::new_unique();
+        let core = OperationCore::new(id);
+        assert!(core.external_protocol_faults().is_empty());
+        let fault = |port, summary: &'static str| ExternalProtocolFault {
+            operation_id: id,
+            port,
+            kind: ExternalProtocolFaultKind::IdentityMismatch,
+            observed_operation_id: None,
+            summary: DiagnosticSummary::new(summary),
+        };
+        core.record_protocol_fault(fault(ExternalProtocolPort::Settlement, "settlement first"));
+        core.record_protocol_fault(fault(ExternalProtocolPort::Settlement, "settlement second"));
+        core.record_protocol_fault(fault(ExternalProtocolPort::Release, "release first"));
+        core.record_protocol_fault(fault(ExternalProtocolPort::Release, "release second"));
+        let faults = core.external_protocol_faults();
+        assert_eq!(faults.len(), 2);
+        assert_eq!(faults[0].port, ExternalProtocolPort::Release);
+        assert_eq!(faults[0].summary.as_str(), "release first");
+        assert_eq!(faults[1].port, ExternalProtocolPort::Settlement);
+        assert_eq!(faults[1].summary.as_str(), "settlement first");
+    }
     use crate::v02::report::SettlementStatus;
     use crate::v02::report::SettlementWait;
 
