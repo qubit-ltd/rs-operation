@@ -511,12 +511,17 @@ fn test_accepted_stop_rejects_reserved_resource_commit_and_cleanup_settles_once(
 fn test_ended_operation_rejected_commit_retains_value_for_cleanup() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let (sender, receiver) = mpsc::channel();
-    let mut operation = manager.try_submit(OperationOptions::default(), move |scope| {
-        sender.send(scope.reserve_resource().unwrap()).unwrap();
-        Ok::<_, ()>(())
-    }).unwrap();
+    let mut operation = manager
+        .try_submit(OperationOptions::default(), move |scope| {
+            sender.send(scope.reserve_resource().unwrap()).unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
     let reservation = receiver.recv().unwrap();
-    assert!(matches!(operation.wait_outcome().unwrap(), OperationOutcome::Succeeded(())));
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
     let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let error = match reservation.commit(CountedDrop(Arc::clone(&drops))) {
         Ok(_) => panic!("ended scope accepted commit"),
@@ -530,7 +535,12 @@ fn test_ended_operation_rejected_commit_retains_value_for_cleanup() {
     let settlement = operation.wait_settlement().unwrap();
     assert!(settlement.all_released());
     assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert!(settlement.resource_reports.iter().any(|report| report.resource_id == id));
+    assert!(
+        settlement
+            .resource_reports
+            .iter()
+            .any(|report| report.resource_id == id)
+    );
 }
 
 #[test]
@@ -550,10 +560,7 @@ fn test_operation_reservation_commits_custom_cleanup_while_open() {
             Ok::<_, ()>(())
         })
         .unwrap();
-    assert!(matches!(
-        completion.outcome,
-        OperationOutcome::Succeeded(())
-    ));
+    assert!(matches!(completion.outcome, OperationOutcome::Succeeded(())));
     assert!(completion.settlement.all_released());
     assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst));
 }

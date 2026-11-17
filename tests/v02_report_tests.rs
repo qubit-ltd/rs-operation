@@ -8,12 +8,25 @@
 
 use qubit_operation::ClockDomainId;
 use qubit_operation::DiagnosticSummary;
+use qubit_operation::GroupBindingError;
 use qubit_operation::ManagerLimits;
 use qubit_operation::ManagerOptions;
 use qubit_operation::OperationOptions;
 use qubit_operation::RunError;
 use qubit_operation::ScopeLimits;
 use qubit_operation::SubmitError;
+
+#[test]
+fn test_display_identifies_each_group_binding_failure() {
+    for (error, expected) in [
+        (GroupBindingError::WrongManager, "WrongManager"),
+        (GroupBindingError::Closed, "Closed"),
+        (GroupBindingError::ScopeEnded, "ScopeEnded"),
+        (GroupBindingError::CapacityExceeded, "CapacityExceeded"),
+    ] {
+        assert_eq!(error.to_string(), expected);
+    }
+}
 
 #[test]
 fn test_diagnostic_summary_truncates_only_at_utf8_boundaries() {

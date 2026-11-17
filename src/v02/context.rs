@@ -348,22 +348,48 @@ mod tests {
         let mut signal = Box::pin(context.deadline_signal().unwrap());
         let first = Waker::from(Arc::new(CountWake(AtomicUsize::new(0))));
         let second = Waker::from(Arc::new(CountWake(AtomicUsize::new(0))));
-        assert!(matches!(signal.as_mut().poll(&mut std::task::Context::from_waker(&first)), Poll::Pending));
-        assert!(matches!(signal.as_mut().poll(&mut std::task::Context::from_waker(&first)), Poll::Pending));
-        assert_eq!(clock.registrations.load(Ordering::SeqCst), 1);
-        assert!(matches!(signal.as_mut().poll(&mut std::task::Context::from_waker(&second)), Poll::Pending));
-        assert_eq!(clock.registrations.load(Ordering::SeqCst), 2);
-        assert_eq!(clock.cancellations.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            signal.as_mut().poll(&mut std::task::Context::from_waker(&first)),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            signal.as_mut().poll(&mut std::task::Context::from_waker(&first)),
+            Poll::Pending
+        ));
+        // `will_wake` may return false even for the same task.
+        let registrations = clock.registrations.load(Ordering::SeqCst);
+        assert!((1..=2).contains(&registrations));
+        assert_eq!(clock.cancellations.load(Ordering::SeqCst), registrations - 1);
+        assert!(matches!(
+            signal.as_mut().poll(&mut std::task::Context::from_waker(&second)),
+            Poll::Pending
+        ));
+        assert_eq!(clock.registrations.load(Ordering::SeqCst), registrations + 1);
+        assert_eq!(clock.cancellations.load(Ordering::SeqCst), registrations);
         clock.ticks.store(10, Ordering::SeqCst);
-        assert!(matches!(signal.as_mut().poll(&mut std::task::Context::from_waker(&second)), Poll::Ready(())));
-        assert!(matches!(signal.as_mut().poll(&mut std::task::Context::from_waker(&second)), Poll::Ready(())));
+        assert!(matches!(
+            signal.as_mut().poll(&mut std::task::Context::from_waker(&second)),
+            Poll::Ready(())
+        ));
+        assert!(matches!(
+            signal.as_mut().poll(&mut std::task::Context::from_waker(&second)),
+            Poll::Ready(())
+        ));
         assert_eq!(context.stop_reason(), Some(StopReason::Timeout));
-        assert_eq!(clock.cancellations.load(Ordering::SeqCst), 2);
+        assert_eq!(clock.cancellations.load(Ordering::SeqCst), registrations + 1);
 
-        let mut pending = Box::pin(OperationContext::new(options(clock.clone(), domain, 20)).unwrap().deadline_signal().unwrap());
-        assert!(matches!(pending.as_mut().poll(&mut std::task::Context::from_waker(&first)), Poll::Pending));
+        let mut pending = Box::pin(
+            OperationContext::new(options(clock.clone(), domain, 20))
+                .unwrap()
+                .deadline_signal()
+                .unwrap(),
+        );
+        assert!(matches!(
+            pending.as_mut().poll(&mut std::task::Context::from_waker(&first)),
+            Poll::Pending
+        ));
         drop(pending);
-        assert_eq!(clock.cancellations.load(Ordering::SeqCst), 3);
+        assert_eq!(clock.cancellations.load(Ordering::SeqCst), registrations + 2);
     }
 
     #[test]

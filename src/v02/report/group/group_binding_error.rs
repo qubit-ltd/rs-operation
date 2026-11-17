@@ -50,20 +50,3 @@ impl fmt::Display for GroupBindingError {
     }
 }
 impl Error for GroupBindingError {}
-
-#[cfg(test)]
-mod tests {
-    use super::GroupBindingError;
-
-    #[test]
-    fn display_identifies_each_binding_failure() {
-        for (error, expected) in [
-            (GroupBindingError::WrongManager, "WrongManager"),
-            (GroupBindingError::Closed, "Closed"),
-            (GroupBindingError::ScopeEnded, "ScopeEnded"),
-            (GroupBindingError::CapacityExceeded, "CapacityExceeded"),
-        ] {
-            assert_eq!(error.to_string(), expected);
-        }
-    }
-}
