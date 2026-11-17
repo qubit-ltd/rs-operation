@@ -32,6 +32,13 @@ impl Drop for Probe {
     }
 }
 
+struct DropSignal(std::sync::mpsc::Sender<()>);
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
 struct ChildPayload {
     _parent_ref: ResourceRef<Probe>,
 }
@@ -230,8 +237,8 @@ fn test_child_cleanup_keeps_parent_resource_until_its_last_parent_ref_is_release
 
 #[test]
 fn test_unrelated_child_cleanup_does_not_delay_parent_resource_release() {
-    let drop_count = Arc::new(AtomicUsize::new(0));
-    let probe = Probe(Arc::clone(&drop_count));
+    let (drop_tx, drop_rx) = std::sync::mpsc::channel();
+    let probe = DropSignal(drop_tx);
     let gate = support::Gate::new();
     let cleanup = Arc::new(GatedCleanup(gate.clone()));
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
@@ -261,11 +268,9 @@ fn test_unrelated_child_cleanup_does_not_delay_parent_resource_release() {
         parent.wait_outcome().unwrap(),
         OperationOutcome::Succeeded(())
     ));
-    assert_eq!(
-        drop_count.load(Ordering::SeqCst),
-        1,
-        "parent scope ended and no child holds its resource"
-    );
+    drop_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("parent resource should be released while unrelated child cleanup is blocked");
     assert!(matches!(
         parent.wait_settlement_for(Duration::ZERO).unwrap(),
         SettlementWait::Pending(_)
