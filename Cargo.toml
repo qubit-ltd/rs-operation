@@ -124,3 +124,5 @@ crate-type = ["lib"]
 name = "guide_leased_temp"
 path = "doc/examples-0.3.0/leased_temp.rs"
 crate-type = ["lib"]
+
+[workspace]
