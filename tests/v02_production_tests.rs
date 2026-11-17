@@ -532,3 +532,28 @@ fn test_ended_operation_rejected_commit_retains_value_for_cleanup() {
     assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(settlement.resource_reports.iter().any(|report| report.resource_id == id));
 }
+
+#[test]
+fn test_operation_reservation_commits_custom_cleanup_while_open() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cleaned_in_body = Arc::clone(&cleaned);
+    let completion = manager
+        .run_and_settle(OperationOptions::default(), move |scope| {
+            let resource = scope
+                .reserve_resource()
+                .unwrap()
+                .commit_with(String::from("managed"), MarkerCleanup(cleaned_in_body))
+                .unwrap_or_else(|_| panic!("open operation rejected commit"));
+            assert_eq!(&*resource, "managed");
+            drop(resource);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    assert!(matches!(
+        completion.outcome,
+        OperationOutcome::Succeeded(())
+    ));
+    assert!(completion.settlement.all_released());
+    assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst));
+}
