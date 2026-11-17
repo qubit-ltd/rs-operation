@@ -464,7 +464,7 @@ pub fn hand_off(handle: &RecoveryHandle, store: &RecoveryStore) -> Result<(), St
 }
 ```
 
-`RecoveryStore` 在应用恢复服务启动时用 `RecoveryStore::new(RecoveryStoreOptions::default())` 创建。移交成功才有 receipt，store 接管重试路径；移交失败没有凭据，原 handle 仍可用。不要收到错误后丢弃唯一的责任入口。
+`RecoveryStore` 在应用恢复服务启动时用 `RecoveryStore::new(RecoveryStoreOptions::default())` 创建。应在首次调用 `transfer_to` 前选定长期存活的 store；接收成功后，该 store 永久拥有恢复组的重试路径，即使重试使 phase 回到 `Pending` 或 `Unconfirmed` 也不会改变归属。首次移交失败没有 receipt，原 handle 仍可用；已被接收的组不能再交给第二个 store。后续在原 store 中重试，并在未解决责任期间保持该 store 存活。丢弃 store 不会把责任退回 handle。
 
 | RecoveryPhase | 应用决策 |
 | --- | --- |
@@ -475,6 +475,8 @@ pub fn hand_off(handle: &RecoveryHandle, store: &RecoveryStore) -> Result<(), St
 | `Unconfirmed` | 状态无法确认且无自动动作，保留责任并升级处理。 |
 
 `RetryError` 区分 `AlreadyRunning`、`AlreadyResolved`、`NoCapacity`、`ExecutorUnavailable`。普通失败可回到 Pending；panic 或直接驱动 future 的中断可成为 Unconfirmed，不能承诺每个失败都能自动重试。
+
+完成后的 retry future 在返回 `Ready` 后还会被显式析构。若最终析构 panic，即使 poll 返回成功也不信任该结果：恢复组进入 `Unconfirmed`，保留 owner 和 action，并发布 attempt 报告。放弃的结果值会在单独的 unwind 边界内释放，避免其错误值清理再次阻断报告发布。
 
 直接驱动模式中，第一个等待者推进清理；丢弃正在驱动的 Pending future 会保留未完成动作并记录 Unconfirmed。若已派发到 store worker，取消观察不停止 worker。不要为了重试超时而立即创建第二个清理动作；先确认已有 attempt 和资源状态。
 

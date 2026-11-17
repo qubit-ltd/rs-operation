@@ -464,7 +464,7 @@ pub fn hand_off(handle: &RecoveryHandle, store: &RecoveryStore) -> Result<(), St
 }
 ```
 
-Create a `RecoveryStore` at recovery-service startup with `RecoveryStore::new(RecoveryStoreOptions::default())`. Only accepted transfers produce receipts and give the store the retry route. A failed transfer leaves the original handle usable; do not discard the only route to responsibility on error.
+Create a `RecoveryStore` at recovery-service startup with `RecoveryStore::new(RecoveryStoreOptions::default())`. Choose the long-lived store before the first `transfer_to`: once accepted, that store permanently owns the recovery group's route, even when a retry returns the group to `Pending` or `Unconfirmed`. A failed transfer produces no receipt and leaves the handle usable; a second store cannot accept a group already accepted elsewhere. Continue retries through the original store, and keep it alive while it owns unresolved responsibility. Dropping the store does not return responsibility to the handle.
 
 | RecoveryPhase | Application decision |
 | --- | --- |
@@ -475,6 +475,8 @@ Create a `RecoveryStore` at recovery-service startup with `RecoveryStore::new(Re
 | `Unconfirmed` | State is unresolved with no automatic action; retain responsibility and escalate. |
 
 `RetryError` distinguishes `AlreadyRunning`, `AlreadyResolved`, `NoCapacity`, and `ExecutorUnavailable`. Ordinary failures can return to Pending. Panic or cancellation of a directly driven future can become Unconfirmed; not every failure can be retried automatically.
+
+The completed retry future is also explicitly dropped after it returns `Ready`. If that final destructor panics, the result is not trusted, even when polling returned success: the recovery becomes `Unconfirmed`, keeps its owner and action, and publishes the attempt report. The dropped result is disposed behind a separate unwind boundary so cleanup of its error value cannot prevent report publication.
 
 In direct mode, the first waiter drives cleanup. Dropping that pending driving future retains the unfinished action and records Unconfirmed. Once a store worker owns execution, cancelling observation does not stop it. Do not start a second cleanup merely because observation timed out; determine the existing attempt's and resource's state first.
 

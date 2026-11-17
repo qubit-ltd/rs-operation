@@ -305,9 +305,11 @@ Unconfirmed may disable automatic retry and cause later ExecutorUnavailable. Rep
 
 ### 10.2 Acceptance receipts and the previous owner
 
-RecoveryStore validates state, identity, group contents, and capacity before issuing a receipt and taking over the retry route. Failure produces no receipt and leaves the original handle. Retry through an old handle can route to the accepted store; store.try_retry(id) is the explicit store entry point.
+RecoveryStore validates state, identity, group contents, and capacity before issuing a receipt and taking over the retry route. A successful first acceptance permanently assigns the group to that store independently of phase; retries returning to Pending or Unconfirmed do not make it transferable again. A second store receives AlreadyTransferred without changing the original membership or route. Choose a long-lived store before the first transfer and perform subsequent retries there. A pre-acceptance failure produces no receipt and leaves the handle available. Retry through an old handle routes to the accepted store; store.try_retry(id) is the explicit store entry point. Dropping the store does not return responsibility to the handle.
 
 Transfer means accepted responsibility, not resource release. The store independently limits groups, resources, and cleanup concurrency. Closing admission does not automatically retry every unresolved group. There is no persistence guarantee; crash recovery requires an application protocol.
+
+A completed recovery future is explicitly dropped inside a panic boundary after it returns Ready. If that final destructor panics, its result is not trusted: the group becomes Unconfirmed, retains its owner and action, and publishes the attempt report. The returned value is also disposed behind an unwind boundary. This conservative result applies even when poll returned success because the destructor may still perform required cleanup.
 
 ### 10.3 Bounded history independent of ownership
 

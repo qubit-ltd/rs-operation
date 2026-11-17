@@ -305,9 +305,11 @@ Unconfirmed 可能禁用自动重试，后续返回 ExecutorUnavailable。因为
 
 ### 10.2 接收回执与旧责任方
 
-RecoveryStore 验证状态、身份、资源组和容量后才返回 receipt，并接管重试路径。失败没有回执，原 handle 保留。旧 handle 的 retry 请求可路由至已接管 store；store.try_retry(id) 提供显式入口。
+RecoveryStore 验证状态、身份、资源组和容量后才返回 receipt，并接管重试路径。首次成功接收后，恢复组归属永久绑定该 store，独立于 phase；重试回到 Pending 或 Unconfirmed 不会再次允许转移。第二个 store 返回 AlreadyTransferred，不会改变原成员关系或路由。首次移交前应选定长期存活的 store，并在其中继续重试。接收前的失败没有回执，原 handle 仍可用。旧 handle 的 retry 请求可路由至已接管 store；store.try_retry(id) 提供显式入口。丢弃 store 不会把责任退回 handle。
 
 移交的含义是接收方持有责任，不是释放资源。store 有独立组数、资源数和清理并发限制，关闭准入不会自动发起所有未解决组的重试。没有持久存储保证，崩溃后恢复属于应用协议。
+
+恢复 future 返回 Ready 后，会在 panic 边界内显式析构。若最终析构 panic，结果不可信：恢复组进入 Unconfirmed，保留 owner 和 action，并发布 attempt 报告。放弃的返回值也在 unwind 边界内释放。即使 poll 返回成功也采用这一保守结果，因为析构本身仍可能承担必要清理。
 
 ### 10.3 有界历史与 owner 分离
 
