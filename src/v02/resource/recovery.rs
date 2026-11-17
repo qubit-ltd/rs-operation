@@ -206,6 +206,73 @@ mod tests {
         assert!(wakes.load(Ordering::SeqCst) > 0, "completion should wake the pending observer");
     }
 
+    #[test]
+    fn test_recovery_finalization_store_worker_publishes_after_history_drop_panic() {
+        let resource_id = ResourceId::new(ManagerId::new_unique(), 21, 1);
+        let (started, started_receiver) = std::sync::mpsc::channel();
+        let gate = Arc::new(Gate {
+            state: Mutex::new((false, None)),
+            started,
+        });
+        let core = Arc::new(RecoveryCore::new(
+            vec![resource_id],
+            Arc::new(()),
+            Arc::new(GateAction(Arc::clone(&gate))),
+        ));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let failed = core.try_retry().expect("initial retry should be admitted");
+        failed.finish(Err(failure_with_panicking_source(resource_id, &drops)));
+        drop(failed.wait().expect("initial report should be available"));
+        drop(failed);
+
+        let store = super::RecoveryStore::new(super::RecoveryStoreOptions::default())
+            .expect("recovery store should start");
+        let id = core.id();
+        assert!(store.accept(Arc::clone(&core)).is_ok(), "store should accept group");
+        let shutdown = store.request_shutdown();
+        let attempt = store.try_retry(id).expect("store retry should be admitted");
+        let mut observer = Box::pin(attempt.wait_async());
+        let mut shutdown_observer = Box::pin(shutdown.wait_async());
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(WakeCounter(Arc::clone(&wakes))));
+        let mut context = Context::from_waker(&waker);
+        assert!(observer.as_mut().poll(&mut context).is_pending());
+        assert!(shutdown_observer.as_mut().poll(&mut context).is_pending());
+        started_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("store worker should start the retry");
+
+        gate.open();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut report = None;
+        let mut shutdown_result = None;
+        while report.is_none() || shutdown_result.is_none() {
+            if report.is_none()
+                && let Poll::Ready(completed) = observer.as_mut().poll(&mut context)
+            {
+                report = Some(completed);
+            }
+            if shutdown_result.is_none()
+                && let Poll::Ready(completed) = shutdown_observer.as_mut().poll(&mut context)
+            {
+                shutdown_result = Some(completed);
+            }
+            assert!(std::time::Instant::now() < deadline, "store observer was not notified");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let report = report.expect("attempt report should be published");
+
+        shutdown_result
+            .expect("terminal store notification should finish shutdown")
+            .unwrap();
+        assert_eq!(report.recovery.phase, RecoveryPhase::Resolved);
+        assert!(report.recovery.last_failures.is_empty());
+        assert_eq!(report.recovery.failures_total, 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(wakes.load(Ordering::SeqCst) > 0, "worker completion should wake observer");
+        assert!(!store.contains(id), "terminal store notification should prune resolved group");
+    }
+
     struct Probe(Arc<AtomicUsize>);
     impl Drop for Probe {
         fn drop(&mut self) {
