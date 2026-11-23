@@ -19,6 +19,7 @@ use super::OperationHandle;
 use super::OperationManager;
 use super::OperationOptions;
 use super::SubmitError;
+use crate::v02::resource::RecoveryHandle;
 
 /// A bounded submission group with its own admission and shutdown boundary.
 ///
@@ -122,6 +123,25 @@ impl OperationGroup {
     #[inline]
     pub fn snapshot(&self) -> GroupSnapshot {
         self.core.public_snapshot()
+    }
+
+    /// Returns a point-in-time snapshot of unresolved recovery handles owned
+    /// by this group.
+    ///
+    /// The snapshot includes recoveries created by operations submitted
+    /// directly to this group and its descendants. Handles are unique by
+    /// recovery identity and remain available until they are resolved or
+    /// transferred to another recovery owner. Each call returns a new snapshot
+    /// of the group's current recovery ledger.
+    ///
+    /// # Returns
+    ///
+    /// A complete list of unresolved recovery handles currently owned by this
+    /// group.
+    #[must_use = "inspect the group's unresolved recovery handles"]
+    #[inline]
+    pub fn recovery_handles_snapshot(&self) -> Vec<RecoveryHandle> {
+        self.core.recovery_handles_snapshot()
     }
 
     /// Stops direct group submissions while allowing already accepted
@@ -360,6 +380,7 @@ impl OperationGroup {
 mod tests {
     use std::future::Future;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::task::Context;
     use std::task::Poll;
     use std::task::Waker;
@@ -492,6 +513,51 @@ mod tests {
         let transfer = recovery.transfer_to(&store).unwrap();
         assert_eq!(transfer.recovery, recovery.id());
         assert!(store.contains(recovery.id()));
+        assert!(matches!(
+            shutdown.wait_for(std::time::Duration::from_secs(2)).unwrap(),
+            ShutdownWait::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn test_group_recovery_snapshot_includes_direct_child_recovery_after_handle_drop() {
+        let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+        let group = manager.group(GroupOptions { capacity: 2 }).unwrap();
+        let recovery_id = Arc::new(Mutex::new(None));
+        let expected_recovery_id = Arc::clone(&recovery_id);
+
+        let parent = group
+            .run_and_settle(OperationOptions::default(), move |scope| {
+                let child = scope
+                    .manager()
+                    .run_and_settle(OperationOptions::default(), |child_scope| {
+                        let resources = child_scope
+                            .resource_scope(ResourceScopeOptions { capacity: 1 })
+                            .unwrap();
+                        let resource = resources.manage_with(23usize, Arc::new(FailCleanup)).unwrap();
+                        drop(resource);
+                        Ok::<_, ()>(())
+                    })
+                    .unwrap();
+                assert_eq!(child.settlement.recovery_count, 1);
+                *expected_recovery_id.lock().unwrap() = Some(child.settlement.recoveries[0].id());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert!(parent.settlement.all_released());
+
+        let sync_snapshot = group.recovery_handles_snapshot();
+        assert_eq!(sync_snapshot.len(), 1);
+        assert_eq!(sync_snapshot[0].id(), recovery_id.lock().unwrap().unwrap());
+
+        let async_snapshot = group.as_async().recovery_handles_snapshot();
+        assert_eq!(async_snapshot.len(), 1);
+        assert_eq!(async_snapshot[0].id(), sync_snapshot[0].id());
+
+        let shutdown = group.request_shutdown(ShutdownMode::Drain);
+        let store = RecoveryStore::new(RecoveryStoreOptions::default()).unwrap();
+        sync_snapshot[0].transfer_to(&store).unwrap();
+        assert!(group.recovery_handles_snapshot().is_empty());
         assert!(matches!(
             shutdown.wait_for(std::time::Duration::from_secs(2)).unwrap(),
             ShutdownWait::Completed(_)

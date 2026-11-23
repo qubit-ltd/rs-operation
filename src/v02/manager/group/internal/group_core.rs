@@ -23,6 +23,7 @@ use crate::v02::report::ResourceScopeId;
 use crate::v02::report::ShutdownMode;
 use crate::v02::report::ShutdownSnapshot;
 use crate::v02::report::StopReason;
+use crate::v02::resource::RecoveryHandle;
 
 /// Shared local admission state inherited by every operation submitted from
 /// this group and by manager views bound to those operations.
@@ -531,6 +532,16 @@ impl GroupCore {
             recovery_groups: recovery_count,
             service_resources,
         }
+    }
+
+    /// Clones the currently unresolved recovery handles owned by this group.
+    ///
+    /// The group ledger is keyed by recovery identity, so the result is
+    /// identity-deduplicated and is not limited by per-operation diagnostic
+    /// retention.
+    #[must_use]
+    pub(crate) fn recovery_handles_snapshot(&self) -> Vec<RecoveryHandle> {
+        lock(&self.state).recoveries.values().cloned().collect()
     }
 
     /// Returns whether admission is open and how many operations are active.

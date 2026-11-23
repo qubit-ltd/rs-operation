@@ -13,6 +13,7 @@ use super::GroupSnapshot;
 use super::OperationGroup;
 use super::OperationOptions;
 use super::SubmitError;
+use crate::v02::resource::RecoveryHandle;
 
 /// Async submission view over the same group target and local lifecycle state.
 ///
@@ -77,6 +78,25 @@ impl AsyncOperationGroup {
     #[inline]
     pub fn snapshot(&self) -> GroupSnapshot {
         self.group.snapshot()
+    }
+
+    /// Returns a point-in-time snapshot of unresolved recovery handles owned
+    /// by this group.
+    ///
+    /// The snapshot includes recoveries created by operations submitted
+    /// directly to this group and its descendants. Handles are unique by
+    /// recovery identity and remain available until they are resolved or
+    /// transferred to another recovery owner. Each call returns a new snapshot
+    /// of the group's current recovery ledger.
+    ///
+    /// # Returns
+    ///
+    /// A complete list of unresolved recovery handles currently owned by this
+    /// group.
+    #[must_use = "inspect the group's unresolved recovery handles"]
+    #[inline]
+    pub fn recovery_handles_snapshot(&self) -> Vec<RecoveryHandle> {
+        self.group.recovery_handles_snapshot()
     }
 
     /// Attempts to submit an async operation without waiting for capacity.
