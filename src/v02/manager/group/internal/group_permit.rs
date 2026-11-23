@@ -11,7 +11,8 @@ use std::sync::Arc;
 use super::super::GroupCore;
 use super::super::lock;
 
-/// Tracks one group operation through settlement and its optional capacity slot.
+/// Tracks one group operation through settlement and its optional capacity
+/// slot.
 ///
 /// Settlement releases the unsettled count; dropping the permit returns any
 /// reserved capacity slot and wakes group waiters.
@@ -21,7 +22,8 @@ pub(crate) struct GroupPermit {
     pub(super) group: Arc<GroupCore>,
     /// Whether this submission reserved capacity beyond its parent.
     pub(super) capacity_reserved: bool,
-    /// Whether settlement already removed this operation from the unsettled count.
+    /// Whether settlement already removed this operation from the unsettled
+    /// count.
     pub(super) settlement_released: bool,
 }
 
@@ -38,7 +40,8 @@ impl GroupPermit {
 }
 
 impl Drop for GroupPermit {
-    /// Returns any capacity slot and unsettled reservation not already released.
+    /// Returns any capacity slot and unsettled reservation not already
+    /// released.
     ///
     /// # Parameters
     ///

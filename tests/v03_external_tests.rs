@@ -2079,7 +2079,9 @@ fn test_group_unsettled_count_covers_claimed_external_bind_before_registration()
     let group = manager.group(qubit_operation::GroupOptions { capacity: 1 }).unwrap();
     let group_manager = manager.with_group(&group).unwrap();
     let prepared = Prepared::ready_fixture();
-    prepared.settlement_ready.store(false, std::sync::atomic::Ordering::SeqCst);
+    prepared
+        .settlement_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     let (bind_entered_tx, bind_entered_rx) = std::sync::mpsc::channel();
     let proceed = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     *prepared.bind_gate.lock().unwrap() = Some(BindGate {
@@ -2091,7 +2093,9 @@ fn test_group_unsettled_count_covers_claimed_external_bind_before_registration()
         let prepared = Arc::clone(&prepared);
         move || group_manager.try_submit_external(OperationOptions::default(), prepared)
     });
-    recv_bounded(&bind_entered_rx, "external bind preflight", || format!("{:?}", group.snapshot()));
+    recv_bounded(&bind_entered_rx, "external bind preflight", || {
+        format!("{:?}", group.snapshot())
+    });
     assert_eq!(group.unsettled_operation_count(), 1);
 
     let draining = group.request_shutdown(ShutdownMode::Drain);
