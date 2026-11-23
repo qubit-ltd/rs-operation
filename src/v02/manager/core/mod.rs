@@ -36,6 +36,7 @@ pub(crate) use internal::ManagerCore;
 pub(crate) use internal::ManagerPhase;
 pub(crate) use internal::OperationJob;
 use internal::RunnerParts;
+pub(crate) use internal::ScopeAdmissionPolicy;
 pub(crate) use internal::SubmissionLease;
 pub(crate) use internal::SubmissionPermit;
 pub(crate) use internal::SubmissionPort;

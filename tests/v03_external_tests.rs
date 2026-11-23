@@ -802,7 +802,9 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
     prepared.release_inputs();
     let report = match handle.wait_settlement_for(std::time::Duration::from_secs(5)).unwrap() {
         SettlementWait::Ready(report) => report,
-        SettlementWait::Pending(snapshot) => panic!("settlement watchdog expired; snapshot={snapshot:?}"),
+        SettlementWait::Pending(snapshot) => {
+            panic!("settlement watchdog expired; snapshot={snapshot:?}")
+        }
     };
     assert_eq!(
         prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst),
@@ -1946,6 +1948,7 @@ fn test_parent_authorized_external_child_rejects_root_view_and_returns_prepared(
 fn test_parent_external_child_reuses_draining_group_slot() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let group = manager.group(qubit_operation::GroupOptions { capacity: 1 }).unwrap();
+    let busy_group = manager.group(qubit_operation::GroupOptions { capacity: 1 }).unwrap();
     let foreign_closed_group = manager.group(qubit_operation::GroupOptions { capacity: 1 }).unwrap();
     let (parent_manager_tx, parent_manager_rx) = std::sync::mpsc::channel();
     let (finish_parent_tx, finish_parent_rx) = std::sync::mpsc::channel();
@@ -1957,7 +1960,18 @@ fn test_parent_external_child_reuses_draining_group_slot() {
         })
         .unwrap();
     let parent_manager = recv_bounded(&parent_manager_rx, "parent manager", || "waiting".to_owned());
+    let parent_with_busy_group = parent_manager.with_group(&busy_group).unwrap();
     let parent_with_foreign_group = parent_manager.with_group(&foreign_closed_group).unwrap();
+    let (busy_started_tx, busy_started_rx) = std::sync::mpsc::channel();
+    let (finish_busy_tx, finish_busy_rx) = std::sync::mpsc::channel();
+    let mut busy_operation = busy_group
+        .submit(OperationOptions::default(), move |_| {
+            busy_started_tx.send(()).unwrap();
+            finish_busy_rx.recv().unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    recv_bounded(&busy_started_rx, "new-group capacity holder", || "waiting".to_owned());
 
     let draining = group.request_shutdown(ShutdownMode::Drain);
     assert!(!group.snapshot().accepting);
@@ -1982,18 +1996,58 @@ fn test_parent_external_child_reuses_draining_group_slot() {
     assert_eq!(reason, AdmissionError::Closed);
     assert!(Arc::ptr_eq(&returned, &rejected_prepared));
 
+    let busy_prepared = Prepared::ready_fixture();
+    let error = match parent_with_busy_group
+        .as_async()
+        .try_submit_external_as_child(OperationOptions::default(), Arc::clone(&busy_prepared))
+    {
+        Ok(_) => panic!("a full newly attached group must reject admission"),
+        Err(error) => error,
+    };
+    let (reason, returned) = error.into_parts();
+    assert_eq!(reason, AdmissionError::Busy);
+    assert!(Arc::ptr_eq(&returned, &busy_prepared));
+    assert_eq!(group.snapshot().active_operations, 1);
+    finish_busy_tx.send(()).unwrap();
+    let _ = busy_operation.wait_outcome().unwrap();
+    busy_operation.wait_settlement().unwrap();
+
     let prepared = Prepared::ready_fixture();
+    prepared
+        .settlement_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     prepared.panic_flags.store(256, std::sync::atomic::Ordering::SeqCst);
     let mut child = parent_manager
         .as_async()
         .try_submit_external_as_child(OperationOptions::default(), Arc::clone(&prepared))
         .expect("accepted parent can submit external child during group drain");
     assert!(matches!(
-        block_on_bounded(child.wait_outcome(), "parent external child outcome", || "child running".to_owned())
-            .unwrap(),
+        block_on_bounded(child.wait_outcome(), "parent external child outcome", || {
+            "child running".to_owned()
+        })
+        .unwrap(),
         OperationOutcome::Succeeded(7)
     ));
-    block_on_bounded(child.wait_settlement(), "parent external child settlement", || "child settling".to_owned());
+    let mut concurrent_child = parent_manager
+        .as_async()
+        .try_submit_external_as_child(OperationOptions::default(), Prepared::ready_fixture())
+        .expect("accepted parent can submit concurrent external children");
+    assert!(matches!(
+        block_on_bounded(concurrent_child.wait_outcome(), "concurrent child outcome", || {
+            "child running".to_owned()
+        })
+        .unwrap(),
+        OperationOutcome::Succeeded(7)
+    ));
+    block_on_bounded(
+        concurrent_child.wait_settlement(),
+        "concurrent child settlement",
+        || "child settling".to_owned(),
+    );
+    prepared.release_settlement();
+    block_on_bounded(child.wait_settlement(), "parent external child settlement", || {
+        "child settling".to_owned()
+    });
     let recoveries = group.recovery_handles_snapshot();
     assert_eq!(recoveries.len(), 1);
     let recovery_store = qubit_operation::RecoveryStore::new(qubit_operation::RecoveryStoreOptions::default()).unwrap();

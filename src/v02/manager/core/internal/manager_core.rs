@@ -18,6 +18,7 @@ use super::super::map_context_error;
 use super::ExecutionKind;
 use super::ManagerPhase;
 use super::OperationJob;
+use super::ScopeAdmissionPolicy;
 use super::SubmissionLease;
 use super::SubmissionPermit;
 use super::SubmissionPort;
@@ -253,7 +254,14 @@ impl ManagerCore {
     where
         F: Send + 'static,
     {
-        self.reserve_scope_with_preflight(target, options, execution, body, |_| Ok(()), false, false)
+        self.reserve_scope_with_preflight(
+            target,
+            options,
+            execution,
+            body,
+            |_| Ok(()),
+            ScopeAdmissionPolicy::default(),
+        )
     }
 
     /// Reserves a scope while running a one-shot identity claim after
@@ -294,8 +302,7 @@ impl ManagerCore {
         execution: ExecutionKind,
         body: F,
         preflight: C,
-        allow_claimed_after_close: bool,
-        reuse_parent_groups: bool,
+        admission: ScopeAdmissionPolicy,
     ) -> Result<(F, OperationId, Arc<ScopeCore>, SubmissionReservation), SubmitError<F>>
     where
         F: Send + 'static,
@@ -316,10 +323,10 @@ impl ManagerCore {
                 (Some((*id, scope)), groups)
             }
         };
-        if reuse_parent_groups && parent.is_none() {
+        if admission.reuse_parent_groups && parent.is_none() {
             return Err(SubmitError::new(AdmissionError::ScopeEnded, body));
         }
-        let reused_groups = if reuse_parent_groups {
+        let reused_groups = if admission.reuse_parent_groups {
             parent
                 .as_ref()
                 .map(|(_, scope)| scope.groups().to_vec())
@@ -331,7 +338,7 @@ impl ManagerCore {
             groups,
             &reused_groups,
             parent.is_some(),
-            reuse_parent_groups,
+            admission.reuse_parent_groups,
         ) {
             Ok(permits) => permits,
             Err(reason) => return Err(SubmitError::new(reason, body)),
@@ -374,11 +381,11 @@ impl ManagerCore {
         });
         // Reserve the parent relationship before bind, while keeping foreign
         // code outside locks. This lets parent shutdown see pending work.
-        let provisional_parent = allow_claimed_after_close
+        let provisional_parent = admission.allow_claimed_after_close
             && parent.as_ref().is_some_and(|(_, parent_scope)| {
                 parent_scope.reserve_child(id, Arc::downgrade(&scope_core), scope_core.options().requirement)
             });
-        if allow_claimed_after_close && parent.is_some() && !provisional_parent {
+        if admission.allow_claimed_after_close && parent.is_some() && !provisional_parent {
             return Err(SubmitError::new(AdmissionError::ScopeEnded, body));
         }
         if let Err(reason) = preflight(id) {
@@ -401,7 +408,7 @@ impl ManagerCore {
         self.track_resource_recoveries(&permit.resource_scope, groups.clone());
         {
             let mut state = lock(&self.state);
-            let allowed = allow_claimed_after_close
+            let allowed = admission.allow_claimed_after_close
                 || match (state.phase, parent_id) {
                     (ManagerPhase::Open, _) => true,
                     (ManagerPhase::Draining, Some(_)) => true,
@@ -423,8 +430,8 @@ impl ManagerCore {
                 groups,
                 id,
                 Arc::downgrade(&scope_core),
-                parent_id.is_some() || allow_claimed_after_close,
-                allow_claimed_after_close,
+                parent_id.is_some() || admission.allow_claimed_after_close,
+                admission.allow_claimed_after_close,
                 || {
                     if !provisional_parent
                         && let Some((_, parent_scope)) = parent.as_ref()
@@ -443,7 +450,7 @@ impl ManagerCore {
             #[cfg(test)]
             state.relationships.push((id, parent_id));
         }
-        let group_cancelled = allow_claimed_after_close
+        let group_cancelled = admission.allow_claimed_after_close
             && groups
                 .iter()
                 .any(|group| group.mode() == crate::v02::report::ShutdownMode::Cancel);

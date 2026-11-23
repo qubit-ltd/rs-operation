@@ -38,6 +38,7 @@ use super::OperationScope;
 use super::OutcomeSlot;
 use super::PanicSummary;
 use super::RunnerParts;
+use super::ScopeAdmissionPolicy;
 use super::StopControl;
 use super::SubmissionTarget;
 use super::SubmitError;
@@ -113,6 +114,26 @@ impl AsyncOperationManager {
     /// Newly attached groups still require their own admission capacity. A
     /// root view, ended parent, or cancelled group rejects the submission and
     /// returns the original prepared operation.
+    ///
+    /// # Type Parameters
+    ///
+    /// - `T`: Successful value produced by the external task.
+    /// - `E`: Error value produced by the external task.
+    /// - `P`: Prepared external task implementation.
+    ///
+    /// # Parameters
+    ///
+    /// - `options`: Admission and resource settings for the operation.
+    /// - `prepared`: Task that the manager binds and drives on its bounded
+    ///   async executor.
+    ///
+    /// # Returns
+    ///
+    /// A handle for the accepted operation, or the original task if rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original task with the admission error when it is rejected.
     pub fn try_submit_external_as_child<T, E, P>(
         &self,
         options: OperationOptions,
@@ -126,6 +147,29 @@ impl AsyncOperationManager {
         self.try_submit_external_with_reuse(options, prepared, true)
     }
 
+    /// Builds the external driver while selecting whether parent-owned group
+    /// slots may be reused during admission.
+    ///
+    /// # Type Parameters
+    ///
+    /// - `T`: Successful value produced by the external task.
+    /// - `E`: Error value produced by the external task.
+    /// - `P`: Prepared external task implementation.
+    ///
+    /// # Parameters
+    ///
+    /// - `options`: Admission and resource settings for the operation.
+    /// - `prepared`: Task that the manager binds and drives.
+    /// - `reuse_parent_groups`: Whether groups held by the parent may reuse the
+    ///   parent's existing admission slots.
+    ///
+    /// # Returns
+    ///
+    /// A handle for the accepted operation, or the original task if rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original task with the admission error when it is rejected.
     fn try_submit_external_with_reuse<T, E, P>(
         &self,
         options: OperationOptions,
@@ -336,8 +380,10 @@ impl AsyncOperationManager {
             ExecutionKind::Async,
             runner,
             preflight,
-            true,
-            reuse_parent_groups,
+            ScopeAdmissionPolicy {
+                allow_claimed_after_close: true,
+                reuse_parent_groups,
+            },
         ) {
             Ok(result) => result,
             Err(error) => {

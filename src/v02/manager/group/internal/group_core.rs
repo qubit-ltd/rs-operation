@@ -93,6 +93,11 @@ impl GroupCore {
             .map(|mut permits| permits.pop().expect("one group produces one permit"))
     }
 
+    #[cfg(test)]
+    pub(crate) fn reserve_many(groups: &[Arc<Self>], descendant: bool) -> Result<Vec<GroupPermit>, AdmissionError> {
+        Self::reserve_many_reusing(groups, &[], descendant, false)
+    }
+
     /// Atomically reserves membership in every distinct group.
     ///
     /// Group state locks are acquired in stable `GroupId` order. Every mode,
@@ -108,12 +113,15 @@ impl GroupCore {
     ///
     /// # Returns
     ///
-    /// One permit per distinct group, ordered by group identifier.
+    /// One permit per distinct group that is not reused from the parent,
+    /// ordered by group identifier. Reused groups remain covered by the
+    /// parent's existing permit.
     ///
     /// # Errors
     ///
     /// Returns the first admission reason if any group rejects the request;
     /// no group is reserved in that case.
+    ///
     /// Reserves new groups while borrowing the active slots held by an
     /// accepted parent for groups that parent already owns.
     pub(crate) fn reserve_many_reusing(

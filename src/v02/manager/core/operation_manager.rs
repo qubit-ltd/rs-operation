@@ -35,6 +35,7 @@ use super::OperationScope;
 use super::OutcomeSlot;
 use super::PanicSummary;
 use super::RunnerParts;
+use super::ScopeAdmissionPolicy;
 use super::ScopeCore;
 use super::StopControl;
 use super::SubmissionTarget;
@@ -610,8 +611,10 @@ impl OperationManager {
             ExecutionKind::Sync,
             runner,
             preflight,
-            external_mode,
-            false,
+            ScopeAdmissionPolicy {
+                allow_claimed_after_close: external_mode,
+                reuse_parent_groups: false,
+            },
         ) {
             Ok(result) => result,
             Err(error) => {

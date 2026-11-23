@@ -19,6 +19,7 @@ use super::ExecutionKind;
 use super::ManagerCore;
 use super::OperationJob;
 use super::OperationManager;
+use super::ScopeAdmissionPolicy;
 use super::ScopeCore;
 use super::SubmissionLease;
 use super::SubmissionPermit;
@@ -976,8 +977,7 @@ fn test_preflight_rejection_returns_body_before_scope_registration() {
         ExecutionKind::Sync,
         17usize,
         |_| Err(AdmissionError::AlreadyBound),
-        false,
-        false,
+        ScopeAdmissionPolicy::default(),
     );
     let error = match rejected {
         Ok(_) => panic!("preflight rejection must roll back reservation"),
