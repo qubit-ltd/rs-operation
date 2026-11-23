@@ -103,6 +103,40 @@ impl AsyncOperationManager {
         E: Send + 'static,
         P: crate::v02::adapter::PreparedExternalOperation<T, E>,
     {
+        self.try_submit_external_with_reuse(options, prepared, false)
+    }
+
+    /// Attempts to submit a prepared external operation as a child of this
+    /// parent-scoped manager view, reusing the active group slots held by the
+    /// parent for groups it already owns.
+    ///
+    /// Newly attached groups still require their own admission capacity. A
+    /// root view, ended parent, or cancelled group rejects the submission and
+    /// returns the original prepared operation.
+    pub fn try_submit_external_as_child<T, E, P>(
+        &self,
+        options: OperationOptions,
+        prepared: Arc<P>,
+    ) -> Result<AsyncOperationHandle<T, E>, SubmitError<Arc<P>>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        P: crate::v02::adapter::PreparedExternalOperation<T, E>,
+    {
+        self.try_submit_external_with_reuse(options, prepared, true)
+    }
+
+    fn try_submit_external_with_reuse<T, E, P>(
+        &self,
+        options: OperationOptions,
+        prepared: Arc<P>,
+        reuse_parent_groups: bool,
+    ) -> Result<AsyncOperationHandle<T, E>, SubmitError<Arc<P>>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+        P: crate::v02::adapter::PreparedExternalOperation<T, E>,
+    {
         let bind_result: ExternalBindResult = Arc::new(Mutex::new(None));
         let managed_control: Arc<Mutex<Option<Arc<ManagedOperationControl>>>> = Arc::new(Mutex::new(None));
         let execution_context: Arc<Mutex<Option<Arc<ExternalExecutionContext>>>> = Arc::new(Mutex::new(None));
@@ -162,6 +196,7 @@ impl AsyncOperationManager {
             options,
             runner,
             preflight,
+            reuse_parent_groups,
             ExternalSubmissionState {
                 external_control: None,
                 confirm_input_release: false,
@@ -206,6 +241,7 @@ impl AsyncOperationManager {
         options: OperationOptions,
         body: F,
         preflight: C,
+        reuse_parent_groups: bool,
         external_state: ExternalSubmissionState<T, E>,
     ) -> Result<AsyncOperationHandle<T, E>, (AdmissionError, F)>
     where
@@ -301,6 +337,7 @@ impl AsyncOperationManager {
             runner,
             preflight,
             true,
+            reuse_parent_groups,
         ) {
             Ok(result) => result,
             Err(error) => {

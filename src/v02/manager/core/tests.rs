@@ -977,6 +977,7 @@ fn test_preflight_rejection_returns_body_before_scope_registration() {
         17usize,
         |_| Err(AdmissionError::AlreadyBound),
         false,
+        false,
     );
     let error = match rejected {
         Ok(_) => panic!("preflight rejection must roll back reservation"),

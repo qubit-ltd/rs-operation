@@ -681,6 +681,11 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
         }
         *self.activation_thread.lock().unwrap() = std::thread::current().name().map(str::to_owned);
         *self.captured_manager.lock().unwrap() = Some(scope.manager());
+        if self.panic_flags.load(std::sync::atomic::Ordering::SeqCst) & 256 != 0 {
+            let _resource = scope
+                .manage(DropPanicsOnDrop(Arc::clone(&self.payload_drop_attempts)))
+                .expect("test recovery resource should be admitted");
+        }
         if let Some(started) = self.child_started_tx.lock().unwrap().take() {
             let parent = Arc::clone(&self);
             let child = scope
@@ -1920,4 +1925,130 @@ fn test_async_manager_drives_external_activation_on_portable_executor() {
             prepared.settlement_polls.load(std::sync::atomic::Ordering::SeqCst)
         )
     });
+}
+
+#[test]
+fn test_parent_authorized_external_child_rejects_root_view_and_returns_prepared() {
+    let manager = AsyncOperationManager::new(ManagerOptions::default()).unwrap();
+    let prepared = Prepared::ready_fixture();
+
+    let error = match manager.try_submit_external_as_child(OperationOptions::default(), Arc::clone(&prepared)) {
+        Ok(_) => panic!("root manager has no parent group permits to borrow"),
+        Err(error) => error,
+    };
+    let (reason, returned) = error.into_parts();
+
+    assert_eq!(reason, AdmissionError::ScopeEnded);
+    assert!(Arc::ptr_eq(&returned, &prepared));
+}
+
+#[test]
+fn test_parent_external_child_reuses_draining_group_slot() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(qubit_operation::GroupOptions { capacity: 1 }).unwrap();
+    let foreign_closed_group = manager.group(qubit_operation::GroupOptions { capacity: 1 }).unwrap();
+    let (parent_manager_tx, parent_manager_rx) = std::sync::mpsc::channel();
+    let (finish_parent_tx, finish_parent_rx) = std::sync::mpsc::channel();
+    let mut parent = group
+        .submit(OperationOptions::default(), move |scope| {
+            parent_manager_tx.send(scope.manager()).unwrap();
+            finish_parent_rx.recv().unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    let parent_manager = recv_bounded(&parent_manager_rx, "parent manager", || "waiting".to_owned());
+    let parent_with_foreign_group = parent_manager.with_group(&foreign_closed_group).unwrap();
+
+    let draining = group.request_shutdown(ShutdownMode::Drain);
+    assert!(!group.snapshot().accepting);
+    let parent_manager = parent_manager
+        .with_group(&group)
+        .expect("rebinding a parent-owned group is idempotent during drain");
+    foreign_closed_group.close_admission();
+    assert!(matches!(
+        parent_manager.with_group(&foreign_closed_group),
+        Err(qubit_operation::GroupBindingError::Closed)
+    ));
+
+    let rejected_prepared = Prepared::ready_fixture();
+    let error = match parent_with_foreign_group
+        .as_async()
+        .try_submit_external_as_child(OperationOptions::default(), Arc::clone(&rejected_prepared))
+    {
+        Ok(_) => panic!("a closed newly attached group must still reject admission"),
+        Err(error) => error,
+    };
+    let (reason, returned) = error.into_parts();
+    assert_eq!(reason, AdmissionError::Closed);
+    assert!(Arc::ptr_eq(&returned, &rejected_prepared));
+
+    let prepared = Prepared::ready_fixture();
+    prepared.panic_flags.store(256, std::sync::atomic::Ordering::SeqCst);
+    let mut child = parent_manager
+        .as_async()
+        .try_submit_external_as_child(OperationOptions::default(), Arc::clone(&prepared))
+        .expect("accepted parent can submit external child during group drain");
+    assert!(matches!(
+        block_on_bounded(child.wait_outcome(), "parent external child outcome", || "child running".to_owned())
+            .unwrap(),
+        OperationOutcome::Succeeded(7)
+    ));
+    block_on_bounded(child.wait_settlement(), "parent external child settlement", || "child settling".to_owned());
+    let recoveries = group.recovery_handles_snapshot();
+    assert_eq!(recoveries.len(), 1);
+    let recovery_store = qubit_operation::RecoveryStore::new(qubit_operation::RecoveryStoreOptions::default()).unwrap();
+    recoveries[0].transfer_to(&recovery_store).unwrap();
+    assert!(group.recovery_handles_snapshot().is_empty());
+
+    finish_parent_tx.send(()).unwrap();
+    let _ = parent.wait_outcome().unwrap();
+    parent.wait_settlement().unwrap();
+    let _shutdown_report = draining.wait().unwrap();
+    assert_eq!(group.snapshot().active_operations, 0);
+
+    let prepared_after_end = Prepared::ready_fixture();
+    let error = match parent_manager
+        .as_async()
+        .try_submit_external_as_child(OperationOptions::default(), Arc::clone(&prepared_after_end))
+    {
+        Ok(_) => panic!("ended parent must reject external children"),
+        Err(error) => error,
+    };
+    let (reason, returned) = error.into_parts();
+    assert_eq!(reason, AdmissionError::ScopeEnded);
+    assert!(Arc::ptr_eq(&returned, &prepared_after_end));
+}
+
+#[test]
+fn test_cancelled_parent_external_child_returns_prepared_operation() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(qubit_operation::GroupOptions { capacity: 1 }).unwrap();
+    let (parent_manager_tx, parent_manager_rx) = std::sync::mpsc::channel();
+    let (finish_parent_tx, finish_parent_rx) = std::sync::mpsc::channel();
+    let mut parent = group
+        .submit(OperationOptions::default(), move |scope| {
+            parent_manager_tx.send(scope.manager()).unwrap();
+            let _ = finish_parent_rx.recv();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    let parent_manager = recv_bounded(&parent_manager_rx, "parent manager", || "waiting".to_owned());
+    let cancelling = group.request_shutdown(ShutdownMode::Cancel);
+
+    let prepared = Prepared::ready_fixture();
+    let error = match parent_manager
+        .as_async()
+        .try_submit_external_as_child(OperationOptions::default(), Arc::clone(&prepared))
+    {
+        Ok(_) => panic!("cancelled parent scope must reject external children"),
+        Err(error) => error,
+    };
+    let (reason, returned) = error.into_parts();
+    assert_eq!(reason, AdmissionError::Stopped);
+    assert!(Arc::ptr_eq(&returned, &prepared));
+
+    finish_parent_tx.send(()).unwrap();
+    let _ = parent.wait_outcome().unwrap();
+    parent.wait_settlement().unwrap();
+    let _shutdown_report = cancelling.wait().unwrap();
 }

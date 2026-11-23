@@ -89,7 +89,7 @@ impl GroupCore {
     /// reservation.
     #[cfg(test)]
     pub(crate) fn reserve(self: &Arc<Self>, descendant: bool) -> Result<GroupPermit, AdmissionError> {
-        Self::reserve_many(std::slice::from_ref(self), descendant)
+        Self::reserve_many_reusing(std::slice::from_ref(self), &[], descendant, false)
             .map(|mut permits| permits.pop().expect("one group produces one permit"))
     }
 
@@ -114,7 +114,14 @@ impl GroupCore {
     ///
     /// Returns the first admission reason if any group rejects the request;
     /// no group is reserved in that case.
-    pub(crate) fn reserve_many(groups: &[Arc<Self>], descendant: bool) -> Result<Vec<GroupPermit>, AdmissionError> {
+    /// Reserves new groups while borrowing the active slots held by an
+    /// accepted parent for groups that parent already owns.
+    pub(crate) fn reserve_many_reusing(
+        groups: &[Arc<Self>],
+        reused: &[Arc<Self>],
+        descendant: bool,
+        strict_reuse: bool,
+    ) -> Result<Vec<GroupPermit>, AdmissionError> {
         let mut ordered = groups.to_vec();
         ordered.sort_unstable_by_key(|group| group.id);
         ordered.dedup_by_key(|group| group.id);
@@ -127,22 +134,27 @@ impl GroupCore {
             if state.mode == ShutdownMode::Cancel {
                 return Err(AdmissionError::Stopped);
             }
-            if !state.accepting && !descendant {
+            let inherited = reused.iter().any(|existing| existing.id == group.id);
+            if !state.accepting && (!descendant || (strict_reuse && !inherited)) {
                 return Err(AdmissionError::Closed);
             }
-            if state.active >= group.capacity {
+            if !inherited && state.active >= group.capacity {
                 return Err(AdmissionError::Busy);
             }
         }
-        for state in &mut states {
+        let mut permits = Vec::new();
+        for (group, state) in ordered.iter().zip(states.iter_mut()) {
+            if reused.iter().any(|existing| existing.id == group.id) {
+                continue;
+            }
             state.active += 1;
+            permits.push(GroupPermit {
+                group: Arc::clone(group),
+                released: false,
+            });
         }
         drop(states);
-
-        Ok(ordered
-            .into_iter()
-            .map(|group| GroupPermit { group, released: false })
-            .collect())
+        Ok(permits)
     }
 
     /// Checks whether a submission can retry group admission without reserving

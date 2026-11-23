@@ -97,6 +97,12 @@ impl OperationManager {
                 return Err(crate::v02::report::GroupBindingError::ScopeEnded);
             }
         }
+        if let SubmissionTarget::Parent { scope, .. } = &self.target {
+            let scope = scope.upgrade().expect("parent scope was validated above");
+            if scope.groups().iter().any(|item| Arc::ptr_eq(item, &group.group_core())) {
+                return Ok(self.clone());
+            }
+        }
         if !group.snapshot().accepting {
             return Err(crate::v02::report::GroupBindingError::Closed);
         }
@@ -605,6 +611,7 @@ impl OperationManager {
             runner,
             preflight,
             external_mode,
+            false,
         ) {
             Ok(result) => result,
             Err(error) => {

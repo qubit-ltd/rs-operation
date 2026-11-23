@@ -253,7 +253,7 @@ impl ManagerCore {
     where
         F: Send + 'static,
     {
-        self.reserve_scope_with_preflight(target, options, execution, body, |_| Ok(()), false)
+        self.reserve_scope_with_preflight(target, options, execution, body, |_| Ok(()), false, false)
     }
 
     /// Reserves a scope while running a one-shot identity claim after
@@ -295,6 +295,7 @@ impl ManagerCore {
         body: F,
         preflight: C,
         allow_claimed_after_close: bool,
+        reuse_parent_groups: bool,
     ) -> Result<(F, OperationId, Arc<ScopeCore>, SubmissionReservation), SubmitError<F>>
     where
         F: Send + 'static,
@@ -315,7 +316,23 @@ impl ManagerCore {
                 (Some((*id, scope)), groups)
             }
         };
-        let group_permits = match crate::v02::manager::group::GroupCore::reserve_many(groups, parent.is_some()) {
+        if reuse_parent_groups && parent.is_none() {
+            return Err(SubmitError::new(AdmissionError::ScopeEnded, body));
+        }
+        let reused_groups = if reuse_parent_groups {
+            parent
+                .as_ref()
+                .map(|(_, scope)| scope.groups().to_vec())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let group_permits = match crate::v02::manager::group::GroupCore::reserve_many_reusing(
+            groups,
+            &reused_groups,
+            parent.is_some(),
+            reuse_parent_groups,
+        ) {
             Ok(permits) => permits,
             Err(reason) => return Err(SubmitError::new(reason, body)),
         };
