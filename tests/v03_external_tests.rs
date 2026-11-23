@@ -2074,6 +2074,71 @@ fn test_parent_external_child_reuses_draining_group_slot() {
 }
 
 #[test]
+fn test_group_unsettled_count_covers_claimed_external_bind_before_registration() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(qubit_operation::GroupOptions { capacity: 1 }).unwrap();
+    let group_manager = manager.with_group(&group).unwrap();
+    let prepared = Prepared::ready_fixture();
+    prepared.settlement_ready.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (bind_entered_tx, bind_entered_rx) = std::sync::mpsc::channel();
+    let proceed = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    *prepared.bind_gate.lock().unwrap() = Some(BindGate {
+        entered: bind_entered_tx,
+        proceed: Arc::clone(&proceed),
+    });
+
+    let submit = std::thread::spawn({
+        let prepared = Arc::clone(&prepared);
+        move || group_manager.try_submit_external(OperationOptions::default(), prepared)
+    });
+    recv_bounded(&bind_entered_rx, "external bind preflight", || format!("{:?}", group.snapshot()));
+    assert_eq!(group.unsettled_operation_count(), 1);
+
+    let draining = group.request_shutdown(ShutdownMode::Drain);
+    assert_eq!(group.unsettled_operation_count(), 1);
+    let (ready, changed) = &*proceed;
+    *ready.lock().unwrap() = true;
+    changed.notify_all();
+    let group_for_snapshot = group.clone();
+    let mut handle = join_bounded(submit, "claimed external submission after group drain", move || {
+        format!("{:?}", group_for_snapshot.snapshot())
+    })
+    .unwrap();
+    assert_eq!(group.unsettled_operation_count(), 1);
+
+    prepared.release_settlement();
+    handle.wait_settlement().unwrap();
+    assert_eq!(group.unsettled_operation_count(), 0);
+    assert_eq!(group.snapshot().active_operations, 1);
+    assert!(matches!(handle.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
+    let _shutdown_report = draining.wait().unwrap();
+}
+
+#[test]
+fn test_group_unsettled_count_rolls_back_rejected_external_preflight() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(qubit_operation::GroupOptions { capacity: 1 }).unwrap();
+    let group_manager = manager.with_group(&group).unwrap();
+    let prepared = Prepared::ready_fixture();
+    let mut first = group_manager
+        .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
+        .unwrap();
+    first.wait_settlement().unwrap();
+    assert_eq!(group.unsettled_operation_count(), 0);
+    assert!(matches!(first.wait_outcome().unwrap(), OperationOutcome::Succeeded(7)));
+
+    let rejected = group_manager.try_submit_external(OperationOptions::default(), Arc::clone(&prepared));
+    let error = match rejected {
+        Ok(_) => panic!("already-bound external task must be rejected"),
+        Err(error) => error,
+    };
+    let (reason, returned) = error.into_parts();
+    assert_eq!(reason, AdmissionError::AlreadyBound);
+    assert!(Arc::ptr_eq(&returned, &prepared));
+    assert_eq!(group.unsettled_operation_count(), 0);
+}
+
+#[test]
 fn test_cancelled_parent_external_child_returns_prepared_operation() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let group = manager.group(qubit_operation::GroupOptions { capacity: 1 }).unwrap();

@@ -80,6 +80,27 @@ impl AsyncOperationGroup {
         self.group.snapshot()
     }
 
+    /// Returns the number of group operations whose settlement has not
+    /// completed.
+    ///
+    /// The count includes accepted reservations that are still in submission
+    /// preflight, even before their operation scopes are registered. It drops
+    /// when settlement completes, independently of whether the typed outcome
+    /// has been observed.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Group view whose unsettled operation count is read.
+    ///
+    /// # Returns
+    ///
+    /// The current count of unsettled group operations.
+    #[must_use = "inspect unsettled group operations"]
+    #[inline]
+    pub fn unsettled_operation_count(&self) -> usize {
+        self.group.unsettled_operation_count()
+    }
+
     /// Returns a point-in-time snapshot of unresolved recovery handles owned
     /// by this group.
     ///

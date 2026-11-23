@@ -25,6 +25,8 @@ pub(super) struct GroupState {
     pub(super) accepting: bool,
     /// Number of operations currently holding group capacity.
     pub(super) active: usize,
+    /// Number of group submissions reserved but not yet settled.
+    pub(super) unsettled_operations: usize,
     /// Shutdown policy applied to current and future operations.
     pub(super) mode: ShutdownMode,
     /// Weak references to registered operation scopes used for cancellation.

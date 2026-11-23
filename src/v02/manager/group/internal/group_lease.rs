@@ -16,8 +16,8 @@ use super::super::lock;
 use crate::v02::manager::core::SubmissionLease;
 use crate::v02::operation::OutcomeDelivery;
 
-/// Keeps a group capacity permit until both outcome and settlement are
-/// complete.
+/// Tracks settlement while retaining any new group capacity until both the
+/// outcome and settlement are complete.
 #[must_use = "retain the lease until the operation outcome and settlement finish"]
 pub(crate) struct GroupLease {
     /// Underlying lifecycle lease that receives every operation event.
@@ -73,6 +73,9 @@ impl SubmissionLease for GroupLease {
     #[inline]
     fn settlement_finished(&self) {
         self.inner.settlement_finished();
+        if let Some(permit) = lock(&self.permit).as_mut() {
+            permit.settlement_finished();
+        }
         self.settlement.store(true, Ordering::Release);
         self.maybe_release();
     }

@@ -27,6 +27,75 @@ fn test_with_group_returns_same_constraint_view_and_deduplicates() {
 }
 
 #[test]
+fn test_unsettled_operation_count_ignores_unobserved_settled_outcome() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
+    let async_group = group.as_async();
+    assert_eq!(group.unsettled_operation_count(), 0);
+    assert_eq!(async_group.unsettled_operation_count(), 0);
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let mut operation = group
+        .try_submit(Default::default(), move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok::<_, ()>(17usize)
+        })
+        .unwrap();
+    started_rx.recv().unwrap();
+    assert_eq!(group.unsettled_operation_count(), 1);
+    assert_eq!(async_group.unsettled_operation_count(), 1);
+
+    release_tx.send(()).unwrap();
+    operation.wait_settlement().unwrap();
+    assert_eq!(group.unsettled_operation_count(), 0);
+    assert_eq!(async_group.unsettled_operation_count(), 0);
+    assert_eq!(group.snapshot().active_operations, 1);
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        qubit_operation::OperationOutcome::Succeeded(17)
+    ));
+}
+
+#[test]
+fn test_unsettled_operation_count_tracks_borrowed_child_separately() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(GroupOptions { capacity: 2 }).unwrap();
+    let (child_started_tx, child_started_rx) = std::sync::mpsc::channel();
+    let (release_child_tx, release_child_rx) = std::sync::mpsc::channel();
+    let (child_settled_tx, child_settled_rx) = std::sync::mpsc::channel();
+    let (release_parent_tx, release_parent_rx) = std::sync::mpsc::channel();
+    let mut parent = group
+        .try_submit(Default::default(), move |scope| {
+            let child = scope
+                .manager()
+                .try_submit(Default::default(), move |_| {
+                    child_started_tx.send(()).unwrap();
+                    release_child_rx.recv().unwrap();
+                    Ok::<_, ()>(23usize)
+                })
+                .unwrap();
+            child.wait_settlement().unwrap();
+            child_settled_tx.send(()).unwrap();
+            release_parent_rx.recv().unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+
+    child_started_rx.recv().unwrap();
+    assert_eq!(group.unsettled_operation_count(), 2);
+    release_child_tx.send(()).unwrap();
+    child_settled_rx.recv().unwrap();
+    assert_eq!(group.unsettled_operation_count(), 1);
+
+    release_parent_tx.send(()).unwrap();
+    parent.wait_settlement().unwrap();
+    assert_eq!(group.unsettled_operation_count(), 0);
+    assert!(parent.wait_outcome().is_ok());
+}
+
+#[test]
 fn test_distinct_groups_both_track_a_bound_operation() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let first = manager.group(GroupOptions { capacity: 2 }).unwrap();

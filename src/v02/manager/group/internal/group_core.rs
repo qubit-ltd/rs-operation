@@ -60,6 +60,7 @@ impl GroupCore {
             state: Mutex::new(GroupState {
                 accepting: true,
                 active: 0,
+                unsettled_operations: 0,
                 mode: ShutdownMode::Drain,
                 scopes: std::collections::HashMap::new(),
                 queued: std::collections::HashSet::new(),
@@ -101,10 +102,10 @@ impl GroupCore {
     /// Atomically reserves membership in every distinct group.
     ///
     /// Group state locks are acquired in stable `GroupId` order. Every mode,
-    /// closure, and capacity check completes before any active count changes;
-    /// all locks remain held until every count has been incremented. Single
-    /// group reservations use this same path, so they cannot observe a partial
-    /// multi-group reservation.
+    /// closure, and capacity check completes before any active or unsettled
+    /// count changes; all locks remain held until every count has been
+    /// incremented. Single group reservations use this same path, so they
+    /// cannot observe a partial multi-group reservation.
     ///
     /// # Parameters
     ///
@@ -113,9 +114,9 @@ impl GroupCore {
     ///
     /// # Returns
     ///
-    /// One permit per distinct group that is not reused from the parent,
-    /// ordered by group identifier. Reused groups remain covered by the
-    /// parent's existing permit.
+    /// One permit per distinct group, ordered by group identifier. A permit
+    /// reserves an unsettled operation count for every group and reserves
+    /// capacity only for groups not reused from the parent.
     ///
     /// # Errors
     ///
@@ -152,13 +153,15 @@ impl GroupCore {
         }
         let mut permits = Vec::new();
         for (group, state) in ordered.iter().zip(states.iter_mut()) {
-            if reused.iter().any(|existing| existing.id == group.id) {
-                continue;
+            let inherited = reused.iter().any(|existing| existing.id == group.id);
+            if !inherited {
+                state.active += 1;
             }
-            state.active += 1;
+            state.unsettled_operations += 1;
             permits.push(GroupPermit {
                 group: Arc::clone(group),
-                released: false,
+                capacity_reserved: !inherited,
+                settlement_released: false,
             });
         }
         drop(states);
@@ -354,6 +357,23 @@ impl GroupCore {
     /// - `self`: Group core whose settled scope is removed.
     pub(crate) fn settlement_finished(&self, id: OperationId) {
         lock(&self.state).scopes.remove(&id);
+    }
+
+    /// Returns the number of admitted group submissions that have not settled.
+    ///
+    /// This includes reservations that have not yet been registered in the
+    /// scope map, such as an external submission paused in its bind preflight.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Group whose unsettled operation reservations are counted.
+    ///
+    /// # Returns
+    ///
+    /// The number of group operations whose settlement has not completed.
+    #[must_use]
+    pub(crate) fn unsettled_operation_count(&self) -> usize {
+        lock(&self.state).unsettled_operations
     }
 
     /// Removes an operation scope and its queued marker after failed setup.
