@@ -6,6 +6,8 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
+use std::panic::AssertUnwindSafe;
+use std::panic::catch_unwind;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -1189,10 +1191,15 @@ impl ManagerCore {
         let group_callbacks = groups.iter().map(Arc::downgrade).collect::<Vec<_>>();
         scope.set_recovery_callback(Arc::new(
             move |handle: crate::v02::resource::RecoveryHandle, active: bool| {
-                for group in group_callbacks.iter().filter_map(Weak::upgrade) {
-                    group.recovery_changed(handle.clone(), active);
-                }
+                let groups = group_callbacks.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+                let mut replaced = groups
+                    .iter()
+                    .filter_map(|group| group.record_recovery_change(handle.clone(), active))
+                    .collect::<Vec<_>>();
                 let Some(manager) = manager.upgrade() else {
+                    for group in groups {
+                        let _ = catch_unwind(AssertUnwindSafe(|| group.notify_recovery_change()));
+                    }
                     return;
                 };
                 let id = handle.id();
@@ -1204,9 +1211,15 @@ impl ManagerCore {
                         state.recoveries.remove(&id)
                     }
                 };
-                drop(removed);
-                manager.shutdown_changed.notify_all();
-                manager.shutdown_notify.notify_waiters();
+                replaced.extend(removed);
+                // Both ledgers now contain the recovery. A waker panic must
+                // not turn confirmed registration into an unconfirmed one.
+                for group in groups {
+                    let _ = catch_unwind(AssertUnwindSafe(|| group.notify_recovery_change()));
+                }
+                let _ = catch_unwind(AssertUnwindSafe(|| manager.shutdown_changed.notify_all()));
+                let _ = catch_unwind(AssertUnwindSafe(|| manager.shutdown_notify.notify_waiters()));
+                drop(replaced);
             },
         ));
     }

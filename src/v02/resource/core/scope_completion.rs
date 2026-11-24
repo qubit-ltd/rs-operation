@@ -50,6 +50,7 @@ impl ScopeCompletion {
                 resources: Vec::new(),
                 failures: Vec::new(),
                 recoveries: Vec::new(),
+                pending_recovery_publications: 0,
                 recovery_callback: None,
                 transfers: Vec::new(),
                 transfers_total: 0,
@@ -115,7 +116,9 @@ impl ScopeCompletion {
         let existing = {
             let mut state = lock(&self.state);
             state.recovery_callback = Some(Arc::clone(&callback));
-            state.recoveries.clone()
+            let existing = state.recoveries.clone();
+            state.pending_recovery_publications = state.pending_recovery_publications.saturating_add(existing.len());
+            existing
         };
         for handle in existing {
             let terminal = Arc::clone(&callback);
@@ -126,6 +129,8 @@ impl ScopeCompletion {
                 }
             }));
             callback(handle, true);
+            self.release_recovery_publication();
+            self.publish_if_ready();
         }
     }
 
@@ -284,7 +289,7 @@ impl ScopeCompletion {
         failure: Option<CleanupFailure>,
         recovery: Option<crate::v02::resource::recovery::RecoveryHandle>,
     ) {
-        let (callback, report, recovery_callback) = {
+        let (recovery_callback, publish_recovery) = {
             let mut state = lock(&self.state);
             if !state.seen.insert(resource_id) {
                 return;
@@ -303,11 +308,10 @@ impl ScopeCompletion {
                     .clone()
                     .map(|callback| (callback, handle.clone()))
             });
-            if Self::ready(&state) {
-                (state.callback.take(), Some(Self::report(&state)), recovery_callback)
-            } else {
-                (None, None, recovery_callback)
+            if recovery_callback.is_some() {
+                state.pending_recovery_publications = state.pending_recovery_publications.saturating_add(1);
             }
+            (recovery_callback, recovery.is_some())
         };
         if let Some((callback, handle)) = recovery_callback {
             let terminal = Arc::clone(&callback);
@@ -318,13 +322,14 @@ impl ScopeCompletion {
                 }
             }));
             callback(handle, true);
-        }
-        if recovery.is_some() {
+            if publish_recovery {
+                self.advance_progress(ResourceProgress::Unconfirmed);
+            }
+            self.release_recovery_publication();
+        } else if publish_recovery {
             self.advance_progress(ResourceProgress::Unconfirmed);
         }
-        if let (Some(callback), Some(report)) = (callback, report) {
-            let _ = panic::catch_unwind(AssertUnwindSafe(|| callback(report)));
-        }
+        self.publish_if_ready();
     }
 
     /// Advances progress when the requested phase ranks after the current one.
@@ -363,7 +368,30 @@ impl ScopeCompletion {
     /// `true` once the expected count is sealed and all expected owners report.
     #[must_use = "the completion readiness state should be used"]
     fn ready(state: &ScopeCompletionState) -> bool {
-        state.expected.is_some_and(|expected| state.completed >= expected)
+        state.expected.is_some_and(|expected| state.completed >= expected) && state.pending_recovery_publications == 0
+    }
+
+    /// Releases one successfully returned recovery publication and checks
+    /// whether that makes the scope ready to publish its final report.
+    fn release_recovery_publication(&self) {
+        let mut state = lock(&self.state);
+        state.pending_recovery_publications = state.pending_recovery_publications.saturating_sub(1);
+    }
+
+    /// Publishes the final report when all owners and recovery observers are
+    /// complete. The callback runs after releasing the state lock.
+    fn publish_if_ready(&self) {
+        let (callback, report) = {
+            let mut state = lock(&self.state);
+            if Self::ready(&state) {
+                (state.callback.take(), Some(Self::report(&state)))
+            } else {
+                (None, None)
+            }
+        };
+        if let (Some(callback), Some(report)) = (callback, report) {
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| callback(report)));
+        }
     }
 
     /// Builds an immutable snapshot of the accumulated scope outcomes.
@@ -454,12 +482,18 @@ fn progress_rank(progress: ResourceProgress) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Condvar;
+    use std::sync::Mutex;
     use std::sync::mpsc;
+    use std::time::Duration;
 
     use super::ScopeCompletion;
     use crate::v02::report::CleanupEvidence;
     use crate::v02::report::ManagerId;
     use crate::v02::report::ResourceId;
+    use crate::v02::report::ResourceProgress;
+    use crate::v02::resource::recovery::RecoveryCore;
+    use crate::v02::resource::recovery::RecoveryHandle;
 
     #[test]
     fn test_callback_installed_after_empty_scope_seal_runs_immediately() {
@@ -503,5 +537,159 @@ mod tests {
 
         assert_eq!(receiver.recv().unwrap(), (1, 0));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_scope_report_waits_for_recovery_registration() {
+        let completion = ScopeCompletion::new();
+        let (report_sender, report_receiver) = mpsc::channel();
+        completion.set_callback(Box::new(move |report| report_sender.send(report).unwrap()));
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        completion.set_progress_callback(std::sync::Arc::new(move |progress| {
+            progress_sender.send(progress).unwrap();
+        }));
+        assert_eq!(progress_receiver.recv().unwrap(), ResourceProgress::ScopeOpen);
+        completion.seal(2);
+
+        let entered = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        let release = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        let entered_callback = std::sync::Arc::clone(&entered);
+        let release_callback = std::sync::Arc::clone(&release);
+        completion.set_recovery_callback(std::sync::Arc::new(move |_, present| {
+            assert!(present);
+            let (lock, condition) = &*entered_callback;
+            *lock.lock().unwrap() = true;
+            condition.notify_all();
+            let (lock, condition) = &*release_callback;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = condition.wait(released).unwrap();
+            }
+        }));
+
+        let first_id = ResourceId::new(ManagerId::new_unique(), 1, 1);
+        let second_id = ResourceId::new(ManagerId::new_unique(), 2, 1);
+        let recovery = RecoveryHandle::new(std::sync::Arc::new(RecoveryCore::new_unconfirmed(
+            vec![first_id],
+            std::sync::Arc::new(()),
+        )));
+        let completing = std::sync::Arc::clone(&completion);
+        let first = std::thread::spawn(move || {
+            completing.complete(
+                first_id,
+                None,
+                Some(crate::v02::report::CleanupFailure {
+                    resource_id: first_id,
+                    stage: crate::v02::report::CleanupStage::Drop,
+                    summary: crate::v02::report::DiagnosticSummary::new("cleanup failed"),
+                    source: None,
+                }),
+                Some(recovery),
+            );
+        });
+
+        let (lock, condition) = &*entered;
+        let mut callback_entered = lock.lock().unwrap();
+        while !*callback_entered {
+            let (next, timeout) = condition
+                .wait_timeout(callback_entered, Duration::from_secs(2))
+                .unwrap();
+            callback_entered = next;
+            assert!(!timeout.timed_out(), "recovery registration callback did not start");
+        }
+        drop(callback_entered);
+
+        completion.complete(second_id, None, None, None);
+        assert!(matches!(report_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        let (lock, condition) = &*release;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+        first.join().unwrap();
+
+        let report = report_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(progress_receiver.recv().unwrap(), ResourceProgress::Unconfirmed);
+        assert_eq!(report.recoveries.len(), 1);
+        assert_eq!(report.failures.len(), 1);
+    }
+
+    #[test]
+    fn test_panicking_recovery_registration_keeps_scope_unsettled() {
+        let completion = ScopeCompletion::new();
+        let (report_sender, report_receiver) = mpsc::channel();
+        completion.set_callback(Box::new(move |report| report_sender.send(report).unwrap()));
+        completion.seal(1);
+        completion.set_recovery_callback(std::sync::Arc::new(|_, _| panic!("registration failed")));
+
+        let id = ResourceId::new(ManagerId::new_unique(), 1, 1);
+        let recovery = RecoveryHandle::new(std::sync::Arc::new(RecoveryCore::new_unconfirmed(
+            vec![id],
+            std::sync::Arc::new(()),
+        )));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            completion.complete(id, None, None, Some(recovery));
+        }));
+
+        assert!(result.is_err());
+        assert!(matches!(report_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let state = super::lock(&completion.state);
+        assert_eq!(state.pending_recovery_publications, 1);
+        assert_eq!(state.recoveries.len(), 1);
+    }
+
+    #[test]
+    fn test_late_recovery_observer_registration_blocks_scope_report() {
+        let completion = ScopeCompletion::new();
+        let (report_sender, report_receiver) = mpsc::channel();
+        completion.set_callback(Box::new(move |report| report_sender.send(report).unwrap()));
+        completion.seal(2);
+
+        let first_id = ResourceId::new(ManagerId::new_unique(), 1, 1);
+        let second_id = ResourceId::new(ManagerId::new_unique(), 2, 1);
+        let recovery = RecoveryHandle::new(std::sync::Arc::new(RecoveryCore::new_unconfirmed(
+            vec![first_id],
+            std::sync::Arc::new(()),
+        )));
+        completion.complete(first_id, None, None, Some(recovery));
+
+        let entered = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        let release = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        let entered_callback = std::sync::Arc::clone(&entered);
+        let release_callback = std::sync::Arc::clone(&release);
+        let installing = std::sync::Arc::clone(&completion);
+        let installer = std::thread::spawn(move || {
+            installing.set_recovery_callback(std::sync::Arc::new(move |_, present| {
+                assert!(present);
+                let (lock, condition) = &*entered_callback;
+                *lock.lock().unwrap() = true;
+                condition.notify_all();
+                let (lock, condition) = &*release_callback;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }));
+        });
+
+        let (lock, condition) = &*entered;
+        let mut callback_entered = lock.lock().unwrap();
+        while !*callback_entered {
+            let (next, timeout) = condition
+                .wait_timeout(callback_entered, Duration::from_secs(2))
+                .unwrap();
+            callback_entered = next;
+            assert!(!timeout.timed_out(), "existing recovery observer did not start");
+        }
+        drop(callback_entered);
+
+        completion.complete(second_id, None, None, None);
+        assert!(matches!(report_receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let (lock, condition) = &*release;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+        installer.join().unwrap();
+
+        let report = report_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(report.recoveries.len(), 1);
     }
 }

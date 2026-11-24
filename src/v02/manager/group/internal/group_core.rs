@@ -688,23 +688,34 @@ impl GroupCore {
         self.notify.notify_waiters();
     }
 
-    /// Adds or removes a recovery handle from the group shutdown accounting.
+    /// Adds or removes a recovery handle from the group shutdown ledger.
     ///
     /// # Parameters
     ///
     /// - `handle`: Recovery handle whose active state changed.
     /// - `active`: Whether the handle should remain counted as active recovery.
-    /// - `self`: Group core whose recovery accounting is updated.
-    pub(crate) fn recovery_changed(&self, handle: crate::v02::resource::RecoveryHandle, active: bool) {
-        let removed = {
+    /// - `self`: Group core whose recovery ledger is updated.
+    ///
+    /// # Returns
+    ///
+    /// The replaced or removed handle, if one was present.
+    pub(crate) fn record_recovery_change(
+        &self,
+        handle: crate::v02::resource::RecoveryHandle,
+        active: bool,
+    ) -> Option<crate::v02::resource::RecoveryHandle> {
+        {
             let mut state = lock(&self.state);
             if active {
                 state.recoveries.insert(handle.id(), handle)
             } else {
                 state.recoveries.remove(&handle.id())
             }
-        };
-        drop(removed);
+        }
+    }
+
+    /// Wakes group observers after its recovery ledger has been updated.
+    pub(crate) fn notify_recovery_change(&self) {
         self.changed.notify_all();
         self.notify.notify_waiters();
     }

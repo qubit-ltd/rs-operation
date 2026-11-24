@@ -38,6 +38,9 @@ pub(in crate::v02::resource::core) struct ScopeCompletionState {
     pub(in crate::v02::resource::core) failures: Vec<CleanupFailure>,
     /// Recovery handles retained for resources whose cleanup is unresolved.
     pub(in crate::v02::resource::core) recoveries: Vec<crate::v02::resource::recovery::RecoveryHandle>,
+    /// Recovery observer publications that have been claimed but have not
+    /// returned successfully yet.
+    pub(in crate::v02::resource::core) pending_recovery_publications: usize,
     /// Observer notified when recovery handles appear or reach a terminal
     /// state.
     pub(in crate::v02::resource::core) recovery_callback:
