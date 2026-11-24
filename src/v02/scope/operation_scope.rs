@@ -7,9 +7,10 @@
 // =============================================================================
 
 use std::sync::Arc;
-use std::sync::Weak;
 
+use super::OperationResourceAuthority;
 use super::ScopeCore;
+use super::operation_resource_authority::reserve_resource_for_core;
 use crate::v02::context::OperationContext;
 use crate::v02::manager::core::ManagerCore;
 use crate::v02::manager::core::OperationManager;
@@ -40,59 +41,6 @@ pub struct OperationScope {
     pub(crate) core: Arc<ScopeCore>,
     /// Manager coordinator used for submissions made from this body.
     manager: Arc<ManagerCore>,
-}
-
-/// Weak resource-registration authority that does not keep an operation alive.
-///
-/// Clone this value when a resource may be needed later, such as after passing
-/// through a layer that might not perform any I/O. A reservation is acquired
-/// only when [`reserve_resource`](Self::reserve_resource) is called.
-#[derive(Clone)]
-pub struct OperationResourceAuthority {
-    core: Weak<ScopeCore>,
-}
-
-impl OperationResourceAuthority {
-    /// Reserves capacity and cleanup storage while the operation is active.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ScopeEnded` if the operation is no longer available,
-    /// `Stopped` if its lifecycle gate rejects registration, or
-    /// `CapacityExceeded` if no resource slot is available.
-    pub fn reserve_resource(
-        &self,
-    ) -> Result<
-        crate::v02::resource::ResourceReservation,
-        crate::v02::resource::ResourceCapacityError,
-    > {
-        let Some(core) = self.core.upgrade() else {
-            return Err(crate::v02::resource::ResourceCapacityError::ScopeEnded);
-        };
-        reserve_resource_for_core(core)
-    }
-}
-
-fn reserve_resource_for_core(
-    core: Arc<ScopeCore>,
-) -> Result<
-    crate::v02::resource::ResourceReservation,
-    crate::v02::resource::ResourceCapacityError,
-> {
-    let result = core.with_resource_lifecycle(|| core.resource_scope().reserve());
-    match result {
-        Ok(Ok(reservation)) => Ok(reservation.bind_operation_scope(core)),
-        Ok(Err(error)) => Err(error),
-        Err(crate::v02::report::ResourceManageErrorKind::ScopeEnded) => {
-            Err(crate::v02::resource::ResourceCapacityError::ScopeEnded)
-        }
-        Err(crate::v02::report::ResourceManageErrorKind::Stopped) => {
-            Err(crate::v02::resource::ResourceCapacityError::Stopped)
-        }
-        Err(crate::v02::report::ResourceManageErrorKind::CapacityExceeded) => {
-            unreachable!("lifecycle gate only rejects stop or scope end")
-        }
-    }
 }
 
 impl OperationScope {
@@ -138,9 +86,7 @@ impl OperationScope {
     /// resource capacity until its `reserve_resource` method is called.
     #[must_use]
     pub fn resource_authority(&self) -> OperationResourceAuthority {
-        OperationResourceAuthority {
-            core: Arc::downgrade(&self.core),
-        }
+        OperationResourceAuthority::new(&self.core)
     }
 
     /// Creates an owned manager view bound to this operation's direct children.
