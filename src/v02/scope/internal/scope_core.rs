@@ -96,8 +96,6 @@ pub(crate) struct ScopeCore {
     children_changed: Notify,
     /// Child, resource, stop, and completion state guarded as one snapshot.
     state: Mutex<ScopeState>,
-    /// Progress aggregated from attached resource scopes.
-    resource_progress: Mutex<HashMap<ResourceScopeId, ResourceProgress>>,
     /// Weak link used to publish aggregate resource progress to the operation.
     operation_core: Mutex<Option<Weak<OperationCore>>>,
 }
@@ -137,7 +135,6 @@ impl ScopeCore {
             resource_scope: resource_scope.internal_clone(),
             groups,
             children_changed: Notify::new(),
-            resource_progress: Mutex::new(HashMap::new()),
             operation_core: Mutex::new(None),
             state: Mutex::new(ScopeState {
                 open: true,
@@ -153,6 +150,8 @@ impl ScopeCore {
                 effect_permits: Vec::new(),
                 effect_overflow: 0,
                 resources: Vec::new(),
+                active_resource_scopes: HashMap::new(),
+                resource_progress: HashMap::new(),
                 pending_resource_scopes: 0,
                 resource_reports: Vec::new(),
                 resource_reports_total: 0,
@@ -470,7 +469,8 @@ impl ScopeCore {
     ///   progress.
     pub(crate) fn bind_operation_core(&self, operation: &Arc<OperationCore>) {
         *lock(&self.operation_core) = Some(Arc::downgrade(operation));
-        let progress = lock(&self.resource_progress)
+        let progress = lock(&self.state)
+            .resource_progress
             .values()
             .copied()
             .max_by_key(|progress| resource_progress_rank(*progress));
@@ -1091,7 +1091,9 @@ impl ScopeCore {
                 return None;
             }
             state.open = false;
-            Some(take(&mut state.resources))
+            let mut resources = take(&mut state.resources);
+            resources.extend(state.active_resource_scopes.values_mut().filter_map(Option::take));
+            Some(resources)
         });
         let Some(resources) = resources else {
             return;
@@ -1115,17 +1117,25 @@ impl ScopeCore {
     /// * `id` — identity of the resource scope reporting progress.
     /// * `progress` — the reported cleanup progress state.
     fn record_resource_progress(&self, id: ResourceScopeId, progress: ResourceProgress) {
-        let progress = {
-            let mut values = lock(&self.resource_progress);
-            values.insert(id, progress);
-            values
+        let operation = {
+            let mut state = lock(&self.state);
+            if !state.active_resource_scopes.contains_key(&id) {
+                return;
+            }
+            state.resource_progress.insert(id, progress);
+            let aggregate = state
+                .resource_progress
                 .values()
                 .copied()
-                .max_by_key(|progress| resource_progress_rank(*progress))
+                .max_by_key(|progress| resource_progress_rank(*progress));
+            let operation = lock(&self.operation_core).as_ref().and_then(Weak::upgrade);
+            if let Some(operation) = operation.as_ref() {
+                operation.update_resource_progress(aggregate);
+            }
+            operation
         };
-        let operation = lock(&self.operation_core).as_ref().and_then(Weak::upgrade);
         if let Some(operation) = operation {
-            operation.set_resource_progress(progress);
+            operation.notify_change();
         }
     }
 
@@ -1151,7 +1161,9 @@ impl ScopeCore {
                 return Err(resource_scope);
             }
             state.pending_resource_scopes = state.pending_resource_scopes.saturating_add(1);
-            state.resources.push(Box::new(resource_scope.internal_clone()));
+            state
+                .active_resource_scopes
+                .insert(resource_scope.id(), Some(Box::new(resource_scope.internal_clone())));
         }
         let weak = Arc::downgrade(self);
         let progress_scope = Arc::downgrade(self);
@@ -1163,7 +1175,7 @@ impl ScopeCore {
         }));
         resource_scope.set_settlement_callback(Box::new(move |report| {
             if let Some(scope) = weak.upgrade() {
-                scope.record_resource_scope_report(report);
+                scope.record_resource_scope_report(resource_scope_id, report);
             }
             drop(permit);
         }));
@@ -1176,10 +1188,14 @@ impl ScopeCore {
     /// # Parameters
     ///
     /// * `report` — completed resource scope report to aggregate.
-    fn record_resource_scope_report(&self, report: ResourceScopeReport) {
-        let callback = {
+    fn record_resource_scope_report(&self, id: ResourceScopeId, report: ResourceScopeReport) {
+        let (callback, owner, operation) = {
             let mut state = lock(&self.state);
-            state.pending_resource_scopes = state.pending_resource_scopes.saturating_sub(1);
+            let Some(owner) = state.active_resource_scopes.remove(&id) else {
+                return;
+            };
+            state.resource_progress.remove(&id);
+            state.pending_resource_scopes -= 1;
             state.resource_reports_total = state.resource_reports_total.saturating_add(report.resources.len());
             for resource in report.resources.iter().cloned() {
                 if state.resource_reports.len() < self.diagnostic_limit {
@@ -1213,8 +1229,21 @@ impl ScopeCore {
                 }
             }
             state.transfers_truncated |= report.transfers_truncated;
-            Self::take_settlement_callback(&mut state)
+            let progress = state
+                .resource_progress
+                .values()
+                .copied()
+                .max_by_key(|progress| resource_progress_rank(*progress));
+            let operation = lock(&self.operation_core).as_ref().and_then(Weak::upgrade);
+            if let Some(operation) = operation.as_ref() {
+                operation.update_resource_progress(progress);
+            }
+            (Self::take_settlement_callback(&mut state), owner, operation)
         };
+        drop(owner);
+        if let Some(operation) = operation {
+            operation.notify_change();
+        }
         self.children_changed.notify_waiters();
         invoke_callback(callback);
     }
@@ -1430,6 +1459,7 @@ mod lifecycle_tests {
     use super::ScopeCore;
     use super::ScopeCoreInit;
     use super::ScopeResourceOwner;
+    use super::lock;
     use crate::v02::context::OperationContext;
     use crate::v02::manager::capacity::ManagerCapacityPools;
     use crate::v02::manager::capacity::ScopeCapacity;
@@ -1445,7 +1475,9 @@ mod lifecycle_tests {
     use crate::v02::report::OperationOptions;
     use crate::v02::report::OperationOutcome;
     use crate::v02::report::ResourceManageErrorKind;
+    use crate::v02::report::ResourceProgress;
     use crate::v02::report::ResourceScopeId;
+    use crate::v02::report::ResourceScopeReport;
     use crate::v02::report::ScopeLimits;
     use crate::v02::report::SettlementReport;
     use crate::v02::report::SettlementStatus;
@@ -1585,6 +1617,110 @@ mod lifecycle_tests {
                 assert_eq!(super::lock(&scope.state).pending_resource_scopes, 1);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_settled_resource_scopes_retire_owner_and_progress_state() {
+        let manager_id = ManagerId::new_unique();
+        let manager_capacity = ManagerCapacityPools::new(ManagerLimits::default());
+        let capacity = Arc::new(ScopeCapacity::root(&manager_capacity, 1, ScopeLimits::default()));
+        let root_resources = ResourceScope::new(
+            manager_id,
+            ResourceScopeId::new_unique(),
+            Arc::clone(&capacity),
+            Arc::new(NoCleanup),
+        );
+        let manager = ManagerCore::for_test().0;
+        let core = ScopeCore::new(ScopeCoreInit {
+            id: OperationId::new_unique(),
+            manager: Arc::downgrade(&manager),
+            parent: None,
+            context: OperationContext::new(ContextOptions::default()).unwrap(),
+            options: OperationOptions::default(),
+            diagnostic_limit: 8,
+            capacity,
+            resource_scope: root_resources,
+            groups: Vec::new(),
+        });
+        let initial_pending = lock(&core.state).pending_resource_scopes;
+
+        for _ in 0..512 {
+            let id = ResourceScopeId::new_unique();
+            let capacity = Arc::new(core.capacity().resource_scope_for(id, 1));
+            let resources = ResourceScope::new(ManagerId::new_unique(), id, capacity, Arc::new(NoCleanup));
+            assert!(core.attach_resource_scope(resources.internal_clone()).is_ok());
+            core.record_resource_progress(id, ResourceProgress::Cleaning);
+            assert_eq!(lock(&core.state).active_resource_scopes.len(), 2);
+            resources.end();
+
+            let state = lock(&core.state);
+            assert_eq!(state.active_resource_scopes.len(), 1);
+            assert!(!state.resource_progress.contains_key(&id));
+            assert_eq!(state.pending_resource_scopes, initial_pending);
+            drop(state);
+
+            // A late progress event must not recreate retired history.
+            core.record_resource_progress(id, ResourceProgress::Unconfirmed);
+            assert!(!lock(&core.state).resource_progress.contains_key(&id));
+        }
+    }
+
+    #[test]
+    fn test_closed_parent_keeps_pending_progress_until_single_terminal_event() {
+        let manager_id = ManagerId::new_unique();
+        let manager_capacity = ManagerCapacityPools::new(ManagerLimits::default());
+        let capacity = Arc::new(ScopeCapacity::root(&manager_capacity, 1, ScopeLimits::default()));
+        let root_resources = ResourceScope::new(
+            manager_id,
+            ResourceScopeId::new_unique(),
+            Arc::clone(&capacity),
+            Arc::new(NoCleanup),
+        );
+        let manager = ManagerCore::for_test().0;
+        let core = ScopeCore::new(ScopeCoreInit {
+            id: OperationId::new_unique(),
+            manager: Arc::downgrade(&manager),
+            parent: None,
+            context: OperationContext::new(ContextOptions::default()).unwrap(),
+            options: OperationOptions::default(),
+            diagnostic_limit: 8,
+            capacity,
+            resource_scope: root_resources,
+            groups: Vec::new(),
+        });
+        let id = ResourceScopeId::new_unique();
+        let resources = ResourceScope::new(
+            ManagerId::new_unique(),
+            id,
+            Arc::new(core.capacity().resource_scope_for(id, 1)),
+            Arc::new(NoCleanup),
+        );
+        assert!(core.attach_resource_scope(resources.internal_clone()).is_ok());
+        // Model the close path having moved the owner out for lock-free end,
+        // while the resource scope itself still owes its terminal callback.
+        lock(&core.state).active_resource_scopes.get_mut(&id).unwrap().take();
+        core.end();
+        let pending = lock(&core.state).pending_resource_scopes;
+        core.record_resource_progress(id, ResourceProgress::Cleaning);
+        assert!(lock(&core.state).resource_progress.contains_key(&id));
+
+        let report = ResourceScopeReport {
+            resources: Arc::from([]),
+            failures: Arc::from([]),
+            recoveries: Arc::from([]),
+            transfers: Arc::from([]),
+            transfers_total: 0,
+            transfers_truncated: false,
+        };
+        core.record_resource_scope_report(id, report.clone());
+        core.record_resource_scope_report(id, report);
+        let state = lock(&core.state);
+        assert_eq!(state.pending_resource_scopes, pending - 1);
+        assert!(!state.active_resource_scopes.contains_key(&id));
+        assert!(!state.resource_progress.contains_key(&id));
+        drop(state);
+        core.record_resource_progress(id, ResourceProgress::Unconfirmed);
+        assert!(!lock(&core.state).resource_progress.contains_key(&id));
     }
 
     #[test]

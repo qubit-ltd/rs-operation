@@ -21,6 +21,8 @@ use crate::v02::report::EffectRecord;
 use crate::v02::report::OperationId;
 use crate::v02::report::RecoveryHandle;
 use crate::v02::report::ResourceCleanupReport;
+use crate::v02::report::ResourceProgress;
+use crate::v02::report::ResourceScopeId;
 use crate::v02::report::SettlementReport;
 use crate::v02::report::TransferReceipt;
 
@@ -46,6 +48,10 @@ pub(super) struct ScopeState {
     pub(super) required_failure: Option<ChildFailureSummary>,
     /// Resource owners ended when this scope closes.
     pub(super) resources: Vec<Box<dyn ScopeResourceOwner>>,
+    /// Resource-scope owners retained only until their terminal callback.
+    pub(super) active_resource_scopes: HashMap<ResourceScopeId, Option<Box<dyn ScopeResourceOwner>>>,
+    /// Progress from currently active resource scopes.
+    pub(super) resource_progress: HashMap<ResourceScopeId, ResourceProgress>,
     /// Attached resource scopes whose settlement callbacks have not run.
     pub(super) pending_resource_scopes: usize,
     /// Bounded retained resource cleanup evidence.

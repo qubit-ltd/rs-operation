@@ -227,8 +227,21 @@ impl OperationCore {
     /// - `self`: The core whose resource progress is updated.
     /// - `resources`: Current resource progress, or `None` when unavailable.
     pub(crate) fn set_resource_progress(&self, resources: Option<ResourceProgress>) {
-        lock(&self.facts).resources = resources;
+        self.update_resource_progress(resources);
         self.notify_change();
+    }
+
+    /// Updates the resource fact without waking observers.
+    ///
+    /// Scope callers use this while serializing publication with terminal
+    /// resource events, then notify after releasing the scope-state lock.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: The core whose resource progress fact is updated.
+    /// - `resources`: Current resource progress, or `None` when unavailable.
+    pub(crate) fn update_resource_progress(&self, resources: Option<ResourceProgress>) {
+        lock(&self.facts).resources = resources;
     }
 
     /// Marks an outcome available unless a terminal availability state won.
@@ -335,7 +348,7 @@ impl OperationCore {
     /// # Parameters
     ///
     /// - `self`: The core whose waiters are notified.
-    pub(in crate::v02::operation) fn notify_change(&self) {
+    pub(crate) fn notify_change(&self) {
         self.changed.notify_waiters();
         self.changed_blocking.notify_all();
     }
