@@ -106,6 +106,14 @@ struct BindGate {
     proceed: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
+struct ReleaseOutcomeOnDrop(Arc<Prepared>);
+
+impl Drop for ReleaseOutcomeOnDrop {
+    fn drop(&mut self) {
+        self.0.release_outcome();
+    }
+}
+
 impl OperationControl for Prepared {
     fn request_stop(&self, _: StopReason) {
         self.panic_if_requested(PANIC_PAYLOAD_STOP);
@@ -1261,6 +1269,12 @@ fn test_callback_panics_are_captured_and_activation_panic_is_not_abandoned() {
 fn test_external_payload_request_stop_and_outcome_poll_panics_are_captured() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let stop_panics = Prepared::ready_fixture();
+    stop_panics
+        .outcome_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let _release_outcome_on_drop = ReleaseOutcomeOnDrop(Arc::clone(&stop_panics));
+    let (driver_waiting_tx, driver_waiting_rx) = std::sync::mpsc::channel();
+    *stop_panics.driver_waiting_tx.lock().unwrap() = Some(driver_waiting_tx);
     stop_panics.panic_flags.store(1, std::sync::atomic::Ordering::SeqCst);
     stop_panics
         .panic_payload_flags
@@ -1268,10 +1282,19 @@ fn test_external_payload_request_stop_and_outcome_poll_panics_are_captured() {
     let stop_handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&stop_panics))
         .unwrap();
+    recv_bounded(&driver_waiting_rx, "external outcome poll pending", || {
+        format!(
+            "activated={}, outcome_polls={}",
+            stop_panics.activated.load(std::sync::atomic::Ordering::SeqCst),
+            stop_panics.outcome_polls.load(std::sync::atomic::Ordering::SeqCst)
+        )
+    });
+    assert_eq!(stop_panics.activated.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(
         stop_handle.request_stop(StopReason::UserCancelled),
         StopRequestStatus::Accepted
     );
+    stop_panics.release_outcome();
     let (outcome, settlement) = wait_handle_bounded(stop_handle);
     assert!(matches!(outcome, OperationOutcome::Stopped(_)));
     assert_eq!(settlement.status, SettlementStatus::Released);
