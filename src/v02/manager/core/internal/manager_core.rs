@@ -334,10 +334,14 @@ impl ManagerCore {
         } else {
             Vec::new()
         };
+        let parent_memberships = parent
+            .as_ref()
+            .map(|(_, scope)| scope.groups().to_vec())
+            .unwrap_or_default();
         let group_permits = match crate::v02::manager::group::GroupCore::reserve_many_reusing(
             groups,
             &reused_groups,
-            parent.is_some(),
+            &parent_memberships,
             admission.reuse_parent_groups,
         ) {
             Ok(permits) => permits,
@@ -430,7 +434,7 @@ impl ManagerCore {
                 groups,
                 id,
                 Arc::downgrade(&scope_core),
-                parent_id.is_some() || admission.allow_claimed_after_close,
+                &parent_memberships,
                 admission.allow_claimed_after_close,
                 || {
                     if !provisional_parent
@@ -1270,7 +1274,12 @@ impl ManagerCore {
             }
             let mut group_available = true;
             for group in groups {
-                group_available &= group.retry_admission(descendant)?;
+                let parent_member = parent
+                    .as_ref()
+                    .is_some_and(|scope| {
+                        scope.groups().iter().any(|member| Arc::ptr_eq(member, group))
+                    });
+                group_available &= group.retry_admission(parent_member)?;
             }
 
             let capacity_result = std::future::poll_fn(|context| {

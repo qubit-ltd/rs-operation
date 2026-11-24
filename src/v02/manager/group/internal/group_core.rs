@@ -90,13 +90,15 @@ impl GroupCore {
     /// reservation.
     #[cfg(test)]
     pub(crate) fn reserve(self: &Arc<Self>, descendant: bool) -> Result<GroupPermit, AdmissionError> {
-        Self::reserve_many_reusing(std::slice::from_ref(self), &[], descendant, false)
+        let memberships = if descendant { std::slice::from_ref(self) } else { &[] };
+        Self::reserve_many_reusing(std::slice::from_ref(self), &[], memberships, false)
             .map(|mut permits| permits.pop().expect("one group produces one permit"))
     }
 
     #[cfg(test)]
     pub(crate) fn reserve_many(groups: &[Arc<Self>], descendant: bool) -> Result<Vec<GroupPermit>, AdmissionError> {
-        Self::reserve_many_reusing(groups, &[], descendant, false)
+        let memberships = if descendant { groups } else { &[] };
+        Self::reserve_many_reusing(groups, &[], memberships, false)
     }
 
     /// Atomically reserves membership in every distinct group.
@@ -110,7 +112,7 @@ impl GroupCore {
     /// # Parameters
     ///
     /// - `groups`: Group cores whose admission slots are reserved together.
-    /// - `descendant`: Whether the submission descends from accepted work.
+    /// - `parent_memberships`: Groups already containing the submitting parent.
     ///
     /// # Returns
     ///
@@ -128,7 +130,7 @@ impl GroupCore {
     pub(crate) fn reserve_many_reusing(
         groups: &[Arc<Self>],
         reused: &[Arc<Self>],
-        descendant: bool,
+        parent_memberships: &[Arc<Self>],
         strict_reuse: bool,
     ) -> Result<Vec<GroupPermit>, AdmissionError> {
         let mut ordered = groups.to_vec();
@@ -144,7 +146,10 @@ impl GroupCore {
                 return Err(AdmissionError::Stopped);
             }
             let inherited = reused.iter().any(|existing| existing.id == group.id);
-            if !state.accepting && (!descendant || (strict_reuse && !inherited)) {
+            let parent_member = parent_memberships
+                .iter()
+                .any(|existing| existing.id == group.id);
+            if !state.accepting && (!parent_member || (strict_reuse && !inherited)) {
                 return Err(AdmissionError::Closed);
             }
             if !inherited && state.active >= group.capacity {
@@ -175,12 +180,12 @@ impl GroupCore {
     ///
     /// - `self`: Group whose current admission state is checked.
     /// - `descendant`: Whether the submission belongs to accepted parent work.
-    pub(crate) fn retry_admission(&self, descendant: bool) -> Result<bool, AdmissionError> {
+    pub(crate) fn retry_admission(&self, parent_member: bool) -> Result<bool, AdmissionError> {
         let state = lock(&self.state);
         if state.mode == ShutdownMode::Cancel {
             return Err(AdmissionError::Stopped);
         }
-        if !state.accepting && !descendant {
+        if !state.accepting && !parent_member {
             return Err(AdmissionError::Closed);
         }
         Ok(state.active < self.capacity)
@@ -252,7 +257,15 @@ impl GroupCore {
     where
         F: FnOnce() -> Result<(), AdmissionError>,
     {
-        Self::register_scope_many_with_claimed(groups, id, scope, descendant, false, commit_parent)
+        let memberships = if descendant { groups } else { &[] };
+        Self::register_scope_many_with_claimed(
+            groups,
+            id,
+            scope,
+            memberships,
+            false,
+            commit_parent,
+        )
     }
 
     /// Registers an adapter claim that completed during the final admission
@@ -268,7 +281,7 @@ impl GroupCore {
     /// * `groups` — groups that must register the operation atomically.
     /// * `id` — identifier shared by the operation's group memberships.
     /// * `scope` — weak reference to the operation scope to register.
-    /// * `descendant` — whether closed groups still admit this descendant.
+    /// * `parent_memberships` — groups already containing the submitting parent.
     /// * `claimed` — whether final admission preflight already claimed it.
     /// * `commit_parent` — callback that commits the parent link.
     ///
@@ -280,7 +293,7 @@ impl GroupCore {
         groups: &[Arc<Self>],
         id: OperationId,
         scope: Weak<crate::v02::scope::ScopeCore>,
-        descendant: bool,
+        parent_memberships: &[Arc<Self>],
         claimed: bool,
         commit_parent: F,
     ) -> Result<(), AdmissionError>
@@ -294,11 +307,14 @@ impl GroupCore {
         for group in &ordered {
             states.push(lock(&group.state));
         }
-        for state in &states {
+        for (group, state) in ordered.iter().zip(states.iter()) {
             if state.mode == ShutdownMode::Cancel && !claimed {
                 return Err(AdmissionError::Stopped);
             }
-            if !state.accepting && !descendant && !claimed {
+            let parent_member = parent_memberships
+                .iter()
+                .any(|existing| existing.id == group.id);
+            if !state.accepting && !parent_member && !claimed {
                 return Err(AdmissionError::Closed);
             }
         }
@@ -781,6 +797,74 @@ mod tests {
     }
 
     #[test]
+    fn test_closed_group_admission_requires_parent_membership_per_group() {
+        let parent_group = GroupCore::new(2);
+        let external_group = GroupCore::new(2);
+        external_group.close();
+
+        assert!(matches!(
+            GroupCore::reserve_many_reusing(
+                &[Arc::clone(&parent_group), Arc::clone(&external_group)],
+                &[],
+                std::slice::from_ref(&parent_group),
+                false,
+            ),
+            Err(AdmissionError::Closed)
+        ));
+        assert_eq!(parent_group.public_snapshot().active_operations, 0);
+        assert_eq!(parent_group.unsettled_operation_count(), 0);
+
+        let permits = GroupCore::reserve_many_reusing(
+            std::slice::from_ref(&external_group),
+            &[],
+            std::slice::from_ref(&external_group),
+            false,
+        )
+        .expect("a true member of the closed group may reserve a descendant");
+        assert_eq!(external_group.unsettled_operation_count(), 1);
+        drop(permits);
+    }
+
+    #[test]
+    fn test_registration_rechecks_closed_groups_atomically() {
+        let open_group = GroupCore::new(2);
+        let closing_group = GroupCore::new(2);
+        let unrelated_parent_group = GroupCore::new(2);
+        let groups = [Arc::clone(&open_group), Arc::clone(&closing_group)];
+        let permits = GroupCore::reserve_many_reusing(&groups, &[], &[], false).unwrap();
+        closing_group.close();
+
+        assert!(matches!(
+            GroupCore::register_scope_many_with_claimed(
+                &groups,
+                OperationId::new_unique(),
+                Weak::new(),
+                std::slice::from_ref(&unrelated_parent_group),
+                false,
+                || Ok(()),
+            ),
+            Err(AdmissionError::Closed)
+        ));
+        assert_eq!(open_group.shutdown_snapshot().queued_operations, 0);
+        assert_eq!(closing_group.shutdown_snapshot().queued_operations, 0);
+        assert_eq!(open_group.unsettled_operation_count(), 1);
+        assert_eq!(closing_group.unsettled_operation_count(), 1);
+
+        GroupCore::register_scope_many_with_claimed(
+            &groups,
+            OperationId::new_unique(),
+            Weak::new(),
+            &[],
+            true,
+            || Ok(()),
+        )
+        .expect("a pre-close reservation with a provisional claim remains admissible");
+        assert_eq!(open_group.shutdown_snapshot().queued_operations, 1);
+        assert_eq!(closing_group.shutdown_snapshot().queued_operations, 1);
+        drop(permits);
+    }
+
+    #[test]
     fn test_canceled_later_group_prevents_partial_scope_registration() {
         let first = GroupCore::new(1);
         let later = GroupCore::new(1);
@@ -811,7 +895,7 @@ mod tests {
             &[Arc::clone(&first), Arc::clone(&later)],
             claimed_operation,
             Weak::new(),
-            false,
+            &[],
             true,
             || Ok(()),
         )
