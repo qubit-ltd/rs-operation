@@ -126,6 +126,36 @@ fn test_cached_parent_group_view_rejects_closed_foreign_group_and_keeps_true_des
 }
 
 #[test]
+fn test_with_group_rejects_view_after_parent_scope_ends() {
+    use std::sync::mpsc;
+
+    use qubit_operation::OperationOutcome;
+
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(GroupOptions { capacity: 2 }).unwrap();
+    let (view_tx, view_rx) = mpsc::channel();
+    let mut parent = manager
+        .try_submit(Default::default(), move |scope| {
+            view_tx.send(scope.manager()).unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+
+    assert!(matches!(
+        parent.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    parent.wait_settlement().unwrap();
+    let parent_view = view_rx.recv().unwrap();
+    drop(parent);
+
+    assert!(matches!(
+        parent_view.with_group(&group),
+        Err(GroupBindingError::ScopeEnded)
+    ));
+}
+
+#[test]
 fn test_with_group_returns_same_constraint_view_and_deduplicates() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let group = manager.group(GroupOptions { capacity: 1 }).unwrap();

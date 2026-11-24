@@ -46,6 +46,12 @@ use super::lock;
 use super::panic_message;
 use crate::v02::scope::ExecutionContextGuard;
 
+#[cfg(test)]
+thread_local! {
+    static WITH_GROUP_AFTER_PARENT_OPEN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 /// A synchronous submission view over a shared manager coordinator.
 ///
 /// Each view keeps one submission target, so admission and resource limits
@@ -90,19 +96,29 @@ impl OperationManager {
         if !Arc::ptr_eq(&self.core, &group.manager_core()) {
             return Err(crate::v02::report::GroupBindingError::WrongManager);
         }
-        if let SubmissionTarget::Parent { scope, .. } = &self.target {
-            let Some(scope) = scope.upgrade() else {
-                return Err(crate::v02::report::GroupBindingError::ScopeEnded);
-            };
-            if !scope.is_open() {
-                return Err(crate::v02::report::GroupBindingError::ScopeEnded);
+        let parent_scope = match &self.target {
+            SubmissionTarget::Root { .. } => None,
+            SubmissionTarget::Parent { scope, .. } => {
+                let scope = scope
+                    .upgrade()
+                    .ok_or(crate::v02::report::GroupBindingError::ScopeEnded)?;
+                if !scope.is_open() {
+                    return Err(crate::v02::report::GroupBindingError::ScopeEnded);
+                }
+                #[cfg(test)]
+                WITH_GROUP_AFTER_PARENT_OPEN_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                    }
+                });
+                Some(scope)
             }
-        }
-        if let SubmissionTarget::Parent { scope, .. } = &self.target {
-            let scope = scope.upgrade().expect("parent scope was validated above");
-            if scope.groups().iter().any(|item| Arc::ptr_eq(item, &group.group_core())) {
-                return Ok(self.clone());
-            }
+        };
+        if parent_scope
+            .as_ref()
+            .is_some_and(|scope| scope.groups().iter().any(|item| Arc::ptr_eq(item, &group.group_core())))
+        {
+            return Ok(self.clone());
         }
         if !group.snapshot().accepting {
             return Err(crate::v02::report::GroupBindingError::Closed);
@@ -859,5 +875,59 @@ impl OperationManager {
         F: FnOnce(OperationScope) + Send + 'static,
     {
         self.core.submit_scope(&self.target, options, body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::OperationManager;
+    use super::WITH_GROUP_AFTER_PARENT_OPEN_HOOK;
+    use crate::v02::report::GroupOptions;
+    use crate::v02::report::ManagerOptions;
+    use crate::v02::report::OperationOutcome;
+
+    #[test]
+    fn test_with_group_keeps_parent_alive_after_open_check() {
+        let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+        let group = manager.group(GroupOptions { capacity: 2 }).unwrap();
+        let (view_tx, view_rx) = mpsc::channel();
+        let (finish_parent_tx, finish_parent_rx) = mpsc::channel();
+        let mut parent = manager
+            .try_submit(Default::default(), move |scope| {
+                view_tx.send(scope.manager()).unwrap();
+                finish_parent_rx.recv().unwrap();
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        let parent_view = view_rx.recv().unwrap();
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (continue_binding_tx, continue_binding_rx) = mpsc::channel();
+        let binding_group = group.clone();
+        let binding = std::thread::spawn(move || {
+            WITH_GROUP_AFTER_PARENT_OPEN_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    checked_tx.send(()).unwrap();
+                    continue_binding_rx.recv().unwrap();
+                }));
+            });
+            parent_view.with_group(&binding_group)
+        });
+
+        checked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("binding should reach the post-open interleaving point");
+        finish_parent_tx.send(()).unwrap();
+        assert!(matches!(
+            parent.wait_outcome().unwrap(),
+            OperationOutcome::Succeeded(())
+        ));
+        parent.wait_settlement().unwrap();
+        drop(parent);
+        continue_binding_tx.send(()).unwrap();
+
+        assert!(binding.join().unwrap().is_ok());
     }
 }
