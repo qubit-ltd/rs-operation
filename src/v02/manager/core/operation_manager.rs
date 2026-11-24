@@ -90,19 +90,25 @@ impl OperationManager {
         if !Arc::ptr_eq(&self.core, &group.manager_core()) {
             return Err(crate::v02::report::GroupBindingError::WrongManager);
         }
-        if let SubmissionTarget::Parent { scope, .. } = &self.target {
-            let Some(scope) = scope.upgrade() else {
-                return Err(crate::v02::report::GroupBindingError::ScopeEnded);
-            };
-            if !scope.is_open() {
-                return Err(crate::v02::report::GroupBindingError::ScopeEnded);
+        let parent_scope = match &self.target {
+            SubmissionTarget::Root { .. } => None,
+            SubmissionTarget::Parent { scope, .. } => {
+                let scope = scope
+                    .upgrade()
+                    .ok_or(crate::v02::report::GroupBindingError::ScopeEnded)?;
+                if !scope.is_open() {
+                    return Err(crate::v02::report::GroupBindingError::ScopeEnded);
+                }
+                Some(scope)
             }
-        }
-        if let SubmissionTarget::Parent { scope, .. } = &self.target {
-            let scope = scope.upgrade().expect("parent scope was validated above");
-            if scope.groups().iter().any(|item| Arc::ptr_eq(item, &group.group_core())) {
-                return Ok(self.clone());
-            }
+        };
+        if parent_scope.as_ref().is_some_and(|scope| {
+            scope
+                .groups()
+                .iter()
+                .any(|item| Arc::ptr_eq(item, &group.group_core()))
+        }) {
+            return Ok(self.clone());
         }
         if !group.snapshot().accepting {
             return Err(crate::v02::report::GroupBindingError::Closed);
