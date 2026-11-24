@@ -1178,10 +1178,12 @@ impl ScopeCore {
             }
         }));
         resource_scope.set_settlement_callback(Box::new(move |report| {
+            // Return hierarchical capacity before publishing terminal scope
+            // settlement, whose waiters may immediately reuse that capacity.
+            drop(permit);
             if let Some(scope) = weak.upgrade() {
                 scope.record_resource_scope_report(resource_scope_id, report);
             }
-            drop(permit);
         }));
         Ok(())
     }
@@ -1457,6 +1459,7 @@ mod lifecycle_tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::Weak;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -1622,6 +1625,67 @@ mod lifecycle_tests {
                 assert_eq!(super::lock(&scope.state).pending_resource_scopes, 1);
             })
             .unwrap();
+    }
+
+    #[test]
+    fn test_parent_settlement_observes_resource_scope_permit_returned() {
+        let manager_id = ManagerId::new_unique();
+        let manager_capacity = ManagerCapacityPools::new(ManagerLimits::default());
+        let capacity = Arc::new(ScopeCapacity::root(
+            &manager_capacity,
+            1,
+            ScopeLimits {
+                resource_scopes: 1,
+                ..ScopeLimits::default()
+            },
+        ));
+        let root_resources = ResourceScope::new(
+            manager_id,
+            ResourceScopeId::new_unique(),
+            Arc::clone(&capacity),
+            Arc::new(NoCleanup),
+        );
+        let manager = ManagerCore::for_test().0;
+        let core = ScopeCore::new(ScopeCoreInit {
+            id: OperationId::new_unique(),
+            manager: Arc::downgrade(&manager),
+            parent: None,
+            context: OperationContext::new(ContextOptions::default()).unwrap(),
+            options: OperationOptions::default(),
+            diagnostic_limit: 8,
+            capacity,
+            resource_scope: root_resources,
+            groups: Vec::new(),
+        });
+        let id = ResourceScopeId::new_unique();
+        let resources = ResourceScope::new(
+            ManagerId::new_unique(),
+            id,
+            Arc::new(core.capacity().resource_scope_for(id, 1)),
+            Arc::new(NoCleanup),
+        );
+        let permit = core.capacity().resource_scope_permits().unwrap();
+        assert!(
+            core.attach_resource_scope_with_permit(resources.internal_clone(), permit)
+                .is_ok()
+        );
+
+        let permit_available_at_settlement = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&permit_available_at_settlement);
+        let settlement_core = Arc::clone(&core);
+        core.on_settlement_ready(move || {
+            observed.store(
+                settlement_core.capacity().resource_scope_permits().is_ok(),
+                Ordering::SeqCst,
+            );
+        });
+        core.end();
+        resources.end();
+
+        assert!(
+            permit_available_at_settlement.load(Ordering::SeqCst),
+            "parent settlement must not publish before its resource-scope permit is returned"
+        );
     }
 
     #[test]
