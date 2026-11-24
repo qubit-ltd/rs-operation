@@ -18,6 +18,7 @@ pub(crate) use internal::ScopeCore;
 pub(crate) use internal::ScopeCoreInit;
 pub(crate) use internal::is_waiting_on_group;
 pub(crate) use internal::is_waiting_on_manager;
+pub use operation_scope::OperationResourceAuthority;
 pub use operation_scope::OperationScope;
 
 #[cfg(test)]

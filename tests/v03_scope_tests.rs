@@ -575,6 +575,39 @@ fn test_resource_scope_reservations_commit_values_and_preserve_unreserved_owner(
 }
 
 #[test]
+fn test_weak_resource_authority_commits_first_read_and_expires_after_settlement() {
+    use std::sync::Mutex;
+
+    use qubit_operation::ResourceCapacityError;
+
+    let saved = Arc::new(Mutex::new(None));
+    let saved_body = Arc::clone(&saved);
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let mut handle = manager
+        .try_submit(Default::default(), move |scope| {
+            let authority = scope.resource_authority();
+            let reference = authority
+                .reserve_resource()
+                .expect("active operation must allow reservation")
+                .commit(String::from("first read"))
+                .unwrap_or_else(|_| panic!("reserved resource must commit"));
+            assert_eq!(&*reference, "first read");
+            drop(reference);
+            *saved_body.lock().unwrap() = Some(authority);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    let _ = handle.wait_outcome().unwrap();
+    handle.wait_settlement().unwrap();
+
+    let authority = saved.lock().unwrap().take().unwrap();
+    assert!(matches!(
+        authority.reserve_resource(),
+        Err(ResourceCapacityError::ScopeEnded)
+    ));
+}
+
+#[test]
 fn test_group_binding_rejects_another_manager_and_does_not_mutate_original_view() {
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let other_manager = OperationManager::new(ManagerOptions::default()).unwrap();

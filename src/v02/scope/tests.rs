@@ -95,3 +95,26 @@ fn test_stopped_operation_scope_rejects_resource_admission_with_original_value()
         })
         .unwrap();
 }
+
+#[test]
+fn test_weak_resource_authority_reserves_lazily_and_expires_with_scope() {
+    let saved = Arc::new(Mutex::new(None));
+    let saved_body = Arc::clone(&saved);
+    let (_, manager) = ManagerCore::for_test();
+    manager
+        .try_submit_body(move |scope| {
+            let authority = scope.resource_authority();
+            assert!(matches!(
+                authority.reserve_resource(),
+                Err(ResourceCapacityError::CapacityExceeded)
+            ));
+            *saved_body.lock().unwrap() = Some(authority);
+        })
+        .unwrap();
+
+    let authority = saved.lock().unwrap().take().unwrap();
+    assert!(matches!(
+        authority.reserve_resource(),
+        Err(ResourceCapacityError::ScopeEnded)
+    ));
+}

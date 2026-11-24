@@ -143,4 +143,5 @@ pub use v02::resource::ResourceRef;
 pub use v02::resource::ResourceReservation;
 pub use v02::resource::ResourceScope;
 pub use v02::resource::ServiceResourceScope;
+pub use v02::scope::OperationResourceAuthority;
 pub use v02::scope::OperationScope;
