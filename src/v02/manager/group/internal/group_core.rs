@@ -146,9 +146,7 @@ impl GroupCore {
                 return Err(AdmissionError::Stopped);
             }
             let inherited = reused.iter().any(|existing| existing.id == group.id);
-            let parent_member = parent_memberships
-                .iter()
-                .any(|existing| existing.id == group.id);
+            let parent_member = parent_memberships.iter().any(|existing| existing.id == group.id);
             if !state.accepting && (!parent_member || (strict_reuse && !inherited)) {
                 return Err(AdmissionError::Closed);
             }
@@ -258,14 +256,7 @@ impl GroupCore {
         F: FnOnce() -> Result<(), AdmissionError>,
     {
         let memberships = if descendant { groups } else { &[] };
-        Self::register_scope_many_with_claimed(
-            groups,
-            id,
-            scope,
-            memberships,
-            false,
-            commit_parent,
-        )
+        Self::register_scope_many_with_claimed(groups, id, scope, memberships, false, commit_parent)
     }
 
     /// Registers an adapter claim that completed during the final admission
@@ -281,7 +272,8 @@ impl GroupCore {
     /// * `groups` — groups that must register the operation atomically.
     /// * `id` — identifier shared by the operation's group memberships.
     /// * `scope` — weak reference to the operation scope to register.
-    /// * `parent_memberships` — groups already containing the submitting parent.
+    /// * `parent_memberships` — groups already containing the submitting
+    ///   parent.
     /// * `claimed` — whether final admission preflight already claimed it.
     /// * `commit_parent` — callback that commits the parent link.
     ///
@@ -311,9 +303,7 @@ impl GroupCore {
             if state.mode == ShutdownMode::Cancel && !claimed {
                 return Err(AdmissionError::Stopped);
             }
-            let parent_member = parent_memberships
-                .iter()
-                .any(|existing| existing.id == group.id);
+            let parent_member = parent_memberships.iter().any(|existing| existing.id == group.id);
             if !state.accepting && !parent_member && !claimed {
                 return Err(AdmissionError::Closed);
             }
@@ -850,14 +840,9 @@ mod tests {
         assert_eq!(open_group.unsettled_operation_count(), 1);
         assert_eq!(closing_group.unsettled_operation_count(), 1);
 
-        GroupCore::register_scope_many_with_claimed(
-            &groups,
-            OperationId::new_unique(),
-            Weak::new(),
-            &[],
-            true,
-            || Ok(()),
-        )
+        GroupCore::register_scope_many_with_claimed(&groups, OperationId::new_unique(), Weak::new(), &[], true, || {
+            Ok(())
+        })
         .expect("a pre-close reservation with a provisional claim remains admissible");
         assert_eq!(open_group.shutdown_snapshot().queued_operations, 1);
         assert_eq!(closing_group.shutdown_snapshot().queued_operations, 1);

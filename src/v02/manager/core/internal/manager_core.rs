@@ -1276,9 +1276,7 @@ impl ManagerCore {
             for group in groups {
                 let parent_member = parent
                     .as_ref()
-                    .is_some_and(|scope| {
-                        scope.groups().iter().any(|member| Arc::ptr_eq(member, group))
-                    });
+                    .is_some_and(|scope| scope.groups().iter().any(|member| Arc::ptr_eq(member, group)));
                 group_available &= group.retry_admission(parent_member)?;
             }
 
