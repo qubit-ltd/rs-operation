@@ -6,11 +6,123 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
+use std::future::Future;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
+
 use qubit_operation::GroupBindingError;
 use qubit_operation::GroupOptions;
 use qubit_operation::ManagerCreateError;
 use qubit_operation::ManagerOptions;
 use qubit_operation::OperationManager;
+
+struct ThreadWake(std::thread::Thread);
+
+impl Wake for ThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+#[test]
+fn test_cached_parent_group_view_rejects_closed_foreign_group_and_keeps_true_descendants() {
+    use std::sync::mpsc;
+
+    use qubit_operation::AdmissionError;
+    use qubit_operation::OperationOutcome;
+    use qubit_operation::ShutdownMode;
+
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let parent_group = manager.group(GroupOptions { capacity: 4 }).unwrap();
+    let foreign_group = manager.group(GroupOptions { capacity: 4 }).unwrap();
+    let foreign_group_for_parent = foreign_group.clone();
+    let (view_ready_tx, view_ready_rx) = mpsc::channel();
+    let (continue_tx, continue_rx) = mpsc::channel();
+    let (results_tx, results_rx) = mpsc::channel();
+
+    let mut parent = parent_group
+        .try_submit(Default::default(), move |scope| {
+            let parent_manager = scope.manager();
+            let cached_view = parent_manager.with_group(&foreign_group_for_parent).unwrap();
+            view_ready_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+
+            let sync_rejection = match cached_view.try_submit(Default::default(), |_| Ok::<_, ()>(())) {
+                Ok(_) => panic!("a closed foreign group accepted a cached sync view"),
+                Err(error) => error.reason(),
+            };
+            let async_rejection = match cached_view
+                .as_async()
+                .try_submit(Default::default(), |_| async { Ok::<_, ()>(()) })
+            {
+                Ok(_) => panic!("a closed foreign group accepted a cached async view"),
+                Err(error) => error.reason(),
+            };
+
+            let mut sync_child = parent_manager
+                .try_submit(Default::default(), |_| Ok::<_, ()>(17usize))
+                .expect("the parent remains a member of its draining group");
+            assert!(matches!(
+                sync_child.wait_outcome().unwrap(),
+                OperationOutcome::Succeeded(17)
+            ));
+            sync_child.wait_settlement().unwrap();
+
+            let mut async_child = parent_manager
+                .as_async()
+                .try_submit(Default::default(), |_| async { Ok::<_, ()>(23usize) })
+                .expect("the async parent view also remains a member of its draining group");
+            assert!(matches!(
+                block_on(async_child.wait_outcome()).unwrap(),
+                OperationOutcome::Succeeded(23)
+            ));
+            block_on(async_child.wait_settlement());
+
+            results_tx.send((sync_rejection, async_rejection)).unwrap();
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+
+    view_ready_rx.recv().unwrap();
+    let parent_shutdown = parent_group.request_shutdown(ShutdownMode::Drain);
+    let foreign_shutdown = foreign_group.request_shutdown(ShutdownMode::Drain);
+    continue_tx.send(()).unwrap();
+
+    let (sync_rejection, async_rejection) = results_rx.recv().unwrap();
+    assert_eq!(sync_rejection, AdmissionError::Closed);
+    assert_eq!(async_rejection, AdmissionError::Closed);
+    assert_eq!(parent_group.snapshot().active_operations, 1);
+    assert_eq!(parent_group.unsettled_operation_count(), 1);
+    assert_eq!(foreign_group.snapshot().active_operations, 0);
+    assert_eq!(foreign_group.unsettled_operation_count(), 0);
+
+    assert!(matches!(
+        parent.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    parent.wait_settlement().unwrap();
+    let _parent_shutdown_report = parent_shutdown.wait().unwrap();
+    let _foreign_shutdown_report = foreign_shutdown.wait().unwrap();
+}
 
 #[test]
 fn test_with_group_returns_same_constraint_view_and_deduplicates() {
