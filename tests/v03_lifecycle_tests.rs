@@ -237,11 +237,11 @@ impl PreparedExternalOperation<usize, ()> for External {
             return Poll::Pending;
         }
         drop(waker);
+        self.outcome_published.store(true, Ordering::SeqCst);
+        self.phase.store(2, Ordering::SeqCst);
         if let Some(signal) = self.typed_poll_ready.lock().unwrap().take() {
             let _ = signal.send(());
         }
-        self.outcome_published.store(true, Ordering::SeqCst);
-        self.phase.store(2, Ordering::SeqCst);
         Poll::Ready(OperationOutcome::Succeeded(42))
     }
 }

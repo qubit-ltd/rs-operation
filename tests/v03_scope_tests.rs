@@ -53,6 +53,7 @@ fn test_cached_parent_group_view_rejects_closed_foreign_group_and_keeps_true_des
 
     let manager = OperationManager::new(ManagerOptions::default()).unwrap();
     let parent_group = manager.group(GroupOptions { capacity: 4 }).unwrap();
+    let parent_group_for_parent = parent_group.clone();
     let foreign_group = manager.group(GroupOptions { capacity: 4 }).unwrap();
     let foreign_group_for_parent = foreign_group.clone();
     let (view_ready_tx, view_ready_rx) = mpsc::channel();
@@ -97,6 +98,10 @@ fn test_cached_parent_group_view_rejects_closed_foreign_group_and_keeps_true_des
             ));
             block_on(async_child.wait_settlement());
 
+            assert_eq!(parent_group_for_parent.snapshot().active_operations, 1);
+            assert_eq!(parent_group_for_parent.unsettled_operation_count(), 1);
+            assert_eq!(foreign_group_for_parent.snapshot().active_operations, 0);
+            assert_eq!(foreign_group_for_parent.unsettled_operation_count(), 0);
             results_tx.send((sync_rejection, async_rejection)).unwrap();
             Ok::<_, ()>(())
         })
@@ -110,10 +115,6 @@ fn test_cached_parent_group_view_rejects_closed_foreign_group_and_keeps_true_des
     let (sync_rejection, async_rejection) = results_rx.recv().unwrap();
     assert_eq!(sync_rejection, AdmissionError::Closed);
     assert_eq!(async_rejection, AdmissionError::Closed);
-    assert_eq!(parent_group.snapshot().active_operations, 1);
-    assert_eq!(parent_group.unsettled_operation_count(), 1);
-    assert_eq!(foreign_group.snapshot().active_operations, 0);
-    assert_eq!(foreign_group.unsettled_operation_count(), 0);
 
     assert!(matches!(
         parent.wait_outcome().unwrap(),
