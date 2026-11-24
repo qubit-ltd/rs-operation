@@ -114,12 +114,10 @@ impl OperationManager {
                 Some(scope)
             }
         };
-        if parent_scope.as_ref().is_some_and(|scope| {
-            scope
-                .groups()
-                .iter()
-                .any(|item| Arc::ptr_eq(item, &group.group_core()))
-        }) {
+        if parent_scope
+            .as_ref()
+            .is_some_and(|scope| scope.groups().iter().any(|item| Arc::ptr_eq(item, &group.group_core())))
+        {
             return Ok(self.clone());
         }
         if !group.snapshot().accepting {
@@ -892,7 +890,7 @@ mod tests {
     use crate::v02::report::OperationOutcome;
 
     #[test]
-    fn with_group_keeps_parent_alive_after_open_check() {
+    fn test_with_group_keeps_parent_alive_after_open_check() {
         let manager = OperationManager::new(ManagerOptions::default()).unwrap();
         let group = manager.group(GroupOptions { capacity: 2 }).unwrap();
         let (view_tx, view_rx) = mpsc::channel();
