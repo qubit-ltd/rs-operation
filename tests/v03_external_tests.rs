@@ -79,6 +79,7 @@ struct Prepared {
     outcome_ready: std::sync::atomic::AtomicBool,
     outcome_waker: std::sync::Mutex<Option<Waker>>,
     outcome_polls: std::sync::atomic::AtomicUsize,
+    outcome_ready_gate: std::sync::Mutex<Option<BindGate>>,
     panic_snapshot: std::sync::atomic::AtomicBool,
     panic_activate: std::sync::atomic::AtomicBool,
     panic_flags: std::sync::atomic::AtomicUsize,
@@ -278,6 +279,7 @@ impl Prepared {
             outcome_ready: std::sync::atomic::AtomicBool::new(true),
             outcome_waker: std::sync::Mutex::new(None),
             outcome_polls: std::sync::atomic::AtomicUsize::new(0),
+            outcome_ready_gate: std::sync::Mutex::new(None),
             panic_snapshot: std::sync::atomic::AtomicBool::new(false),
             panic_activate: std::sync::atomic::AtomicBool::new(false),
             panic_flags: std::sync::atomic::AtomicUsize::new(0),
@@ -729,13 +731,21 @@ impl PreparedExternalOperation<usize, ()> for Prepared {
             }
             return Poll::Pending;
         }
-        Poll::Ready(
-            self.typed_outcome
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or(OperationOutcome::Succeeded(7)),
-        )
+        let outcome = self
+            .typed_outcome
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or(OperationOutcome::Succeeded(7));
+        if let Some(gate) = self.outcome_ready_gate.lock().unwrap().take() {
+            let _ = gate.entered.send(());
+            let (ready, changed) = &*gate.proceed;
+            let mut ready = ready.lock().unwrap();
+            while !*ready {
+                ready = changed.wait(ready).unwrap();
+            }
+        }
+        Poll::Ready(outcome)
     }
 }
 
@@ -759,6 +769,7 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
         outcome_ready: std::sync::atomic::AtomicBool::new(false),
         outcome_waker: std::sync::Mutex::new(None),
         outcome_polls: std::sync::atomic::AtomicUsize::new(0),
+        outcome_ready_gate: std::sync::Mutex::new(None),
         panic_snapshot: std::sync::atomic::AtomicBool::new(false),
         panic_activate: std::sync::atomic::AtomicBool::new(false),
         panic_flags: std::sync::atomic::AtomicUsize::new(0),
@@ -779,14 +790,20 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
         driver_waiting_tx: std::sync::Mutex::new(None),
         child_handle: std::sync::Mutex::new(None),
     });
+    let (driver_waiting_tx, driver_waiting_rx) = std::sync::mpsc::channel();
+    *prepared.driver_waiting_tx.lock().unwrap() = Some(driver_waiting_tx);
+    let (outcome_ready_tx, outcome_ready_rx) = std::sync::mpsc::channel();
+    let outcome_ready_proceed = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    *prepared.outcome_ready_gate.lock().unwrap() = Some(BindGate {
+        entered: outcome_ready_tx,
+        proceed: Arc::clone(&outcome_ready_proceed),
+    });
     let handle = manager
         .try_submit_external(OperationOptions::default(), Arc::clone(&prepared))
         .expect("external task should be admitted");
-    wait_for_counter(
-        "typed outcome poll",
-        || prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst),
-        || format!("{:?}", handle.observer().snapshot()),
-    );
+    driver_waiting_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("driver must reach the initial Pending outcome poll");
     assert_eq!(
         handle.request_stop(StopReason::UserCancelled),
         StopRequestStatus::Accepted
@@ -794,7 +811,17 @@ fn test_accepted_external_task_is_bound_activated_and_delivers_its_unique_outcom
     prepared.release_outcome();
     let (handle, outcome) = wait_outcome_return_handle_bounded(handle, "stopped external outcome");
     assert!(matches!(outcome, OperationOutcome::Stopped(_)));
+    outcome_ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("driver must reach the Ready outcome poll");
     let outcome_polls_after_ready = prepared.outcome_polls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        outcome_polls_after_ready >= 2,
+        "Pending and Ready polls must both be observed"
+    );
+    let (ready, changed) = &*outcome_ready_proceed;
+    *ready.lock().unwrap() = true;
+    changed.notify_all();
     assert_eq!(prepared.activated.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     let polls_without_release = prepared.release_polls.load(std::sync::atomic::Ordering::SeqCst);
@@ -852,6 +879,7 @@ fn test_post_claim_bind_failure_is_accepted_and_abandoned_once() {
         outcome_ready: std::sync::atomic::AtomicBool::new(true),
         outcome_waker: std::sync::Mutex::new(None),
         outcome_polls: std::sync::atomic::AtomicUsize::new(0),
+        outcome_ready_gate: std::sync::Mutex::new(None),
         panic_snapshot: std::sync::atomic::AtomicBool::new(false),
         panic_activate: std::sync::atomic::AtomicBool::new(false),
         panic_flags: std::sync::atomic::AtomicUsize::new(0),
@@ -909,6 +937,7 @@ fn test_stop_during_bind_wins_before_commit_and_abandons_without_activation() {
         outcome_ready: std::sync::atomic::AtomicBool::new(true),
         outcome_waker: std::sync::Mutex::new(None),
         outcome_polls: std::sync::atomic::AtomicUsize::new(0),
+        outcome_ready_gate: std::sync::Mutex::new(None),
         panic_snapshot: std::sync::atomic::AtomicBool::new(false),
         panic_activate: std::sync::atomic::AtomicBool::new(false),
         panic_flags: std::sync::atomic::AtomicUsize::new(0),
@@ -992,6 +1021,7 @@ fn test_parent_close_during_bind_keeps_claimed_child_tracked_and_stopped() {
         outcome_ready: std::sync::atomic::AtomicBool::new(true),
         outcome_waker: std::sync::Mutex::new(None),
         outcome_polls: std::sync::atomic::AtomicUsize::new(0),
+        outcome_ready_gate: std::sync::Mutex::new(None),
         panic_snapshot: std::sync::atomic::AtomicBool::new(false),
         panic_activate: std::sync::atomic::AtomicBool::new(false),
         panic_flags: std::sync::atomic::AtomicUsize::new(0),
@@ -1062,6 +1092,7 @@ fn test_already_bound_claim_rolls_back_provisional_parent_child_link() {
         outcome_ready: std::sync::atomic::AtomicBool::new(true),
         outcome_waker: std::sync::Mutex::new(None),
         outcome_polls: std::sync::atomic::AtomicUsize::new(0),
+        outcome_ready_gate: std::sync::Mutex::new(None),
         panic_snapshot: std::sync::atomic::AtomicBool::new(false),
         panic_activate: std::sync::atomic::AtomicBool::new(false),
         panic_flags: std::sync::atomic::AtomicUsize::new(0),
@@ -1133,6 +1164,7 @@ fn test_dropping_handle_does_not_drop_driver_owner_or_release_obligation() {
         outcome_ready: std::sync::atomic::AtomicBool::new(true),
         outcome_waker: std::sync::Mutex::new(None),
         outcome_polls: std::sync::atomic::AtomicUsize::new(0),
+        outcome_ready_gate: std::sync::Mutex::new(None),
         panic_snapshot: std::sync::atomic::AtomicBool::new(false),
         panic_activate: std::sync::atomic::AtomicBool::new(false),
         panic_flags: std::sync::atomic::AtomicUsize::new(0),
@@ -1882,6 +1914,7 @@ fn test_async_manager_drives_external_activation_on_portable_executor() {
         outcome_ready: std::sync::atomic::AtomicBool::new(true),
         outcome_waker: std::sync::Mutex::new(None),
         outcome_polls: std::sync::atomic::AtomicUsize::new(0),
+        outcome_ready_gate: std::sync::Mutex::new(None),
         panic_snapshot: std::sync::atomic::AtomicBool::new(false),
         panic_activate: std::sync::atomic::AtomicBool::new(false),
         panic_flags: std::sync::atomic::AtomicUsize::new(0),
