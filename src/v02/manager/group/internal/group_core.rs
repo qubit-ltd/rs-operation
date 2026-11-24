@@ -704,13 +704,11 @@ impl GroupCore {
         handle: crate::v02::resource::RecoveryHandle,
         active: bool,
     ) -> Option<crate::v02::resource::RecoveryHandle> {
-        {
-            let mut state = lock(&self.state);
-            if active {
-                state.recoveries.insert(handle.id(), handle)
-            } else {
-                state.recoveries.remove(&handle.id())
-            }
+        let mut state = lock(&self.state);
+        if active && handle.core.is_scope_owned() {
+            state.recoveries.insert(handle.id(), handle)
+        } else {
+            state.recoveries.remove(&handle.id())
         }
     }
 
@@ -729,8 +727,22 @@ mod tests {
 
     use super::GroupCore;
     use crate::v02::report::AdmissionError;
+    use crate::v02::report::ManagerId;
     use crate::v02::report::OperationId;
+    use crate::v02::report::ResourceId;
     use crate::v02::report::ShutdownMode;
+    use crate::v02::resource::RecoveryHandle;
+    use crate::v02::resource::recovery::RecoveryAction;
+    use crate::v02::resource::recovery::RecoveryCore;
+    use crate::v02::resource::recovery::RecoveryFuture;
+    use crate::v02::resource::recovery::RecoveryPayload;
+
+    struct ResolveRecovery;
+    impl RecoveryAction for ResolveRecovery {
+        fn retry(&self, _payload: RecoveryPayload) -> RecoveryFuture {
+            Box::pin(async { Ok(()) })
+        }
+    }
 
     #[test]
     fn test_reservation_observes_capacity_close_and_cancel_transitions() {
@@ -748,6 +760,31 @@ mod tests {
         group.begin_shutdown(ShutdownMode::Cancel);
         assert_eq!(group.mode(), ShutdownMode::Cancel);
         assert!(matches!(group.reserve(true), Err(AdmissionError::Stopped)));
+    }
+
+    #[test]
+    fn test_late_active_recovery_registration_does_not_restore_resolved_group_entry() {
+        let group = GroupCore::new(1);
+        let resource = ResourceId::new(ManagerId::new_unique(), 1, 1);
+        let recovery = RecoveryHandle::new(Arc::new(RecoveryCore::new(
+            vec![resource],
+            Arc::new(()),
+            Arc::new(ResolveRecovery),
+        )));
+        let terminal_group = Arc::clone(&group);
+        let terminal_recovery = recovery.clone();
+        recovery.core.set_terminal_callback(Arc::new(move |active| {
+            let _ = terminal_group.record_recovery_change(terminal_recovery.clone(), active);
+        }));
+
+        let _replaced = group.record_recovery_change(recovery.clone(), true);
+        assert_eq!(group.shutdown_snapshot().recovery_groups, 1);
+        recovery.try_retry().unwrap().wait().unwrap();
+        assert_eq!(recovery.snapshot().phase, crate::v02::report::RecoveryPhase::Resolved);
+        assert_eq!(group.shutdown_snapshot().recovery_groups, 0);
+
+        let _replaced = group.record_recovery_change(recovery, true);
+        assert_eq!(group.shutdown_snapshot().recovery_groups, 0);
     }
 
     #[test]

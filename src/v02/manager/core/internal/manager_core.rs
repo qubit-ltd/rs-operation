@@ -1112,6 +1112,26 @@ impl ManagerCore {
         lock(&self.state).recoveries.len()
     }
 
+    /// Adds or removes a recovery handle from the manager ledger.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Manager whose recovery ledger is updated.
+    /// - `handle`: Recovery whose scope ownership is recorded.
+    /// - `active`: Whether the scope should retain the recovery.
+    fn record_recovery_change(
+        &self,
+        handle: crate::v02::resource::RecoveryHandle,
+        active: bool,
+    ) -> Option<crate::v02::resource::RecoveryHandle> {
+        let mut state = lock(&self.state);
+        if active && handle.core.is_scope_owned() {
+            state.recoveries.insert(handle.id(), handle)
+        } else {
+            state.recoveries.remove(&handle.id())
+        }
+    }
+
     /// Counts tracked recovery handles that still require confirmation.
     ///
     /// # Returns
@@ -1202,15 +1222,7 @@ impl ManagerCore {
                     }
                     return;
                 };
-                let id = handle.id();
-                let removed = {
-                    let mut state = lock(&manager.state);
-                    if active {
-                        state.recoveries.insert(id, handle)
-                    } else {
-                        state.recoveries.remove(&id)
-                    }
-                };
+                let removed = manager.record_recovery_change(handle, active);
                 replaced.extend(removed);
                 // Both ledgers now contain the recovery. A waker panic must
                 // not turn confirmed registration into an unconfirmed one.
@@ -1362,5 +1374,51 @@ impl ManagerCore {
         );
         let root = core.root_view();
         (core, root)
+    }
+}
+
+#[cfg(test)]
+mod recovery_ledger_tests {
+    use std::sync::Arc;
+
+    use super::ManagerCore;
+    use crate::v02::report::ManagerId;
+    use crate::v02::report::ResourceId;
+    use crate::v02::resource::RecoveryHandle;
+    use crate::v02::resource::recovery::RecoveryAction;
+    use crate::v02::resource::recovery::RecoveryCore;
+    use crate::v02::resource::recovery::RecoveryFuture;
+    use crate::v02::resource::recovery::RecoveryPayload;
+
+    struct ResolveRecovery;
+    impl RecoveryAction for ResolveRecovery {
+        fn retry(&self, _payload: RecoveryPayload) -> RecoveryFuture {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn test_late_active_recovery_registration_does_not_restore_resolved_manager_entry() {
+        let (manager, _) = ManagerCore::for_test();
+        let resource = ResourceId::new(ManagerId::new_unique(), 1, 1);
+        let recovery = RecoveryHandle::new(Arc::new(RecoveryCore::new(
+            vec![resource],
+            Arc::new(()),
+            Arc::new(ResolveRecovery),
+        )));
+        let terminal_manager = Arc::clone(&manager);
+        let terminal_recovery = recovery.clone();
+        recovery.core.set_terminal_callback(Arc::new(move |active| {
+            let _ = terminal_manager.record_recovery_change(terminal_recovery.clone(), active);
+        }));
+
+        let _replaced = manager.record_recovery_change(recovery.clone(), true);
+        assert_eq!(manager.recovery_group_count(), 1);
+        recovery.try_retry().unwrap().wait().unwrap();
+        assert_eq!(recovery.snapshot().phase, crate::v02::report::RecoveryPhase::Resolved);
+        assert_eq!(manager.recovery_group_count(), 0);
+
+        let _replaced = manager.record_recovery_change(recovery, true);
+        assert_eq!(manager.recovery_group_count(), 0);
     }
 }

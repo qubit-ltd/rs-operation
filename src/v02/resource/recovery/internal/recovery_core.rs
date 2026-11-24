@@ -176,6 +176,28 @@ impl RecoveryCore {
         }
     }
 
+    /// Reports whether the scope manager still owns this unresolved recovery.
+    ///
+    /// A recovery accepted by a store is permanently outside the scope ledger,
+    /// including while a store-owned retry temporarily returns its phase to
+    /// `Pending`. Callers may hold a manager or group ledger lock while asking;
+    /// terminal callbacks are invoked only after releasing the recovery state
+    /// lock, so this lock order cannot be reversed by callback delivery.
+    ///
+    /// # Parameters
+    ///
+    /// - `self`: Recovery whose scope ownership is checked.
+    ///
+    /// # Returns
+    ///
+    /// `true` while unresolved cleanup remains owned by the scope rather than
+    /// a recovery store.
+    #[must_use = "use the ownership state to decide whether the scope ledger should retain this recovery"]
+    pub(crate) fn is_scope_owned(&self) -> bool {
+        let state = lock(&self.state);
+        !state.store_owned && state.phase != RecoveryPhase::Resolved
+    }
+
     /// Admits a retry or routes the request to the store that owns this group.
     ///
     /// At most one retry is active. A retry takes shared references to the
@@ -646,6 +668,50 @@ mod tests {
         assert_eq!(core.snapshot().phase, crate::v02::report::RecoveryPhase::Resolved);
         assert!(core.snapshot().last_failures.is_empty());
         assert_eq!(core.snapshot().failures_total, 0);
+    }
+
+    #[test]
+    fn test_scope_ownership_excludes_resolved_and_store_owned_phases() {
+        let resource_id = ResourceId::new(ManagerId::from_raw(1), 7, 1);
+        let core = Arc::new(RecoveryCore::new(vec![resource_id], Arc::new(()), Arc::new(NoopAction)));
+        assert!(core.is_scope_owned(), "pending recovery belongs to its scope");
+
+        let running = core.try_retry().unwrap();
+        assert!(core.is_scope_owned(), "running recovery remains scope-owned");
+        running.finish(Ok(()));
+        assert!(!core.is_scope_owned(), "resolved recovery leaves its scope ledger");
+
+        let unconfirmed = RecoveryCore::new_unconfirmed(vec![resource_id], Arc::new(()));
+        assert!(unconfirmed.is_scope_owned(), "unconfirmed recovery remains scope-owned");
+
+        let store_owned = Arc::new(RecoveryCore::new(vec![resource_id], Arc::new(()), Arc::new(NoopAction)));
+        assert!(store_owned.mark_transferred());
+        assert!(!store_owned.is_scope_owned(), "store acceptance ends scope ownership");
+        store_owned.restore_from_store().unwrap();
+        assert_eq!(store_owned.snapshot().phase, crate::v02::report::RecoveryPhase::Pending);
+        assert!(
+            !store_owned.is_scope_owned(),
+            "store-owned retry phases remain outside the scope ledger"
+        );
+    }
+
+    #[test]
+    fn test_terminal_callback_runs_after_recovery_state_unlock() {
+        let resource_id = ResourceId::new(ManagerId::from_raw(1), 8, 1);
+        let core = Arc::new(RecoveryCore::new(vec![resource_id], Arc::new(()), Arc::new(NoopAction)));
+        let weak = Arc::downgrade(&core);
+        core.set_terminal_callback(Arc::new(move |present| {
+            assert!(!present);
+            let core = weak.upgrade().expect("callback keeps recovery core alive");
+            assert!(
+                core.state.try_lock().is_ok(),
+                "terminal callback ran while state was locked"
+            );
+        }));
+
+        core.try_retry().unwrap().wait().unwrap();
+        assert_eq!(core.snapshot().phase, crate::v02::report::RecoveryPhase::Resolved);
+        assert!(!core.is_scope_owned());
     }
 
     #[test]

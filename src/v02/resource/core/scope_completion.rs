@@ -484,6 +484,9 @@ fn progress_rank(progress: ResourceProgress) -> u8 {
 mod tests {
     use std::sync::Condvar;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -691,5 +694,71 @@ mod tests {
 
         let report = report_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(report.recoveries.len(), 1);
+    }
+
+    #[test]
+    fn test_reentrant_reservation_release_cannot_publish_during_recovery_registration() {
+        let completion = ScopeCompletion::new();
+        let report_published = std::sync::Arc::new(AtomicBool::new(false));
+        let published_callback = std::sync::Arc::clone(&report_published);
+        completion.set_callback(Box::new(move |_| {
+            published_callback.store(true, Ordering::SeqCst);
+        }));
+        completion.seal(2);
+
+        let callback_completion = std::sync::Arc::clone(&completion);
+        let callback_published = std::sync::Arc::clone(&report_published);
+        completion.set_recovery_callback(std::sync::Arc::new(move |_, present| {
+            assert!(present);
+            callback_completion.release_pending_reservation();
+            assert!(
+                !callback_published.load(Ordering::SeqCst),
+                "reentrant readiness change published before registration returned"
+            );
+        }));
+
+        let id = ResourceId::new(ManagerId::new_unique(), 1, 1);
+        let recovery = RecoveryHandle::new(std::sync::Arc::new(RecoveryCore::new_unconfirmed(
+            vec![id],
+            std::sync::Arc::new(()),
+        )));
+        completion.complete(id, None, None, Some(recovery));
+        assert!(report_published.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_duplicate_resource_completion_publishes_one_recovery_registration() {
+        let completion = ScopeCompletion::new();
+        let (report_sender, report_receiver) = mpsc::channel();
+        completion.set_callback(Box::new(move |report| report_sender.send(report).unwrap()));
+        let registrations = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed_registrations = std::sync::Arc::clone(&registrations);
+        completion.set_recovery_callback(std::sync::Arc::new(move |_, present| {
+            assert!(present);
+            observed_registrations.fetch_add(1, Ordering::SeqCst);
+        }));
+        completion.seal(1);
+
+        let id = ResourceId::new(ManagerId::new_unique(), 1, 1);
+        let first = RecoveryHandle::new(std::sync::Arc::new(RecoveryCore::new_unconfirmed(
+            vec![id],
+            std::sync::Arc::new(()),
+        )));
+        let second = RecoveryHandle::new(std::sync::Arc::new(RecoveryCore::new_unconfirmed(
+            vec![id],
+            std::sync::Arc::new(()),
+        )));
+        let first_id = first.id();
+        completion.complete(id, None, None, Some(first));
+        completion.complete(id, None, None, Some(second));
+
+        let report = report_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(report.recoveries.len(), 1);
+        assert_eq!(report.recoveries[0].id(), first_id);
+        assert_eq!(registrations.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            report_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
     }
 }
