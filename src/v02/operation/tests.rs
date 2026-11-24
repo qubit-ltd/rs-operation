@@ -277,7 +277,8 @@ fn test_observer_conversion_and_resource_progress_keep_the_untyped_core() {
     handle
         .parts()
         .core
-        .set_resource_progress(Some(ResourceProgress::WaitingForUsers));
+        .update_resource_progress(Some(ResourceProgress::WaitingForUsers));
+    handle.parts().core.notify_change();
     assert_eq!(observer.snapshot().resources, Some(ResourceProgress::WaitingForUsers));
 }
 

@@ -220,17 +220,6 @@ impl OperationCore {
         self.notify_change();
     }
 
-    /// Updates resource progress and notifies observers.
-    ///
-    /// # Parameters
-    ///
-    /// - `self`: The core whose resource progress is updated.
-    /// - `resources`: Current resource progress, or `None` when unavailable.
-    pub(crate) fn set_resource_progress(&self, resources: Option<ResourceProgress>) {
-        self.update_resource_progress(resources);
-        self.notify_change();
-    }
-
     /// Updates the resource fact without waking observers.
     ///
     /// Scope callers use this while serializing publication with terminal

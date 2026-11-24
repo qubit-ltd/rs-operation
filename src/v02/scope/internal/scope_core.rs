@@ -469,12 +469,16 @@ impl ScopeCore {
     ///   progress.
     pub(crate) fn bind_operation_core(&self, operation: &Arc<OperationCore>) {
         *lock(&self.operation_core) = Some(Arc::downgrade(operation));
-        let progress = lock(&self.state)
-            .resource_progress
-            .values()
-            .copied()
-            .max_by_key(|progress| resource_progress_rank(*progress));
-        operation.set_resource_progress(progress);
+        {
+            let state = lock(&self.state);
+            let progress = state
+                .resource_progress
+                .values()
+                .copied()
+                .max_by_key(|progress| resource_progress_rank(*progress));
+            operation.update_resource_progress(progress);
+        }
+        operation.notify_change();
     }
 
     /// Registers a child before it starts, returning false when this scope is
@@ -1464,6 +1468,7 @@ mod lifecycle_tests {
     use crate::v02::manager::capacity::ManagerCapacityPools;
     use crate::v02::manager::capacity::ScopeCapacity;
     use crate::v02::manager::core::ManagerCore;
+    use crate::v02::operation::OperationCore;
     use crate::v02::report::ChildOutcomeKind;
     use crate::v02::report::ChildOutcomeSummary;
     use crate::v02::report::ChildRequirement;
@@ -1703,6 +1708,9 @@ mod lifecycle_tests {
         let pending = lock(&core.state).pending_resource_scopes;
         core.record_resource_progress(id, ResourceProgress::Cleaning);
         assert!(lock(&core.state).resource_progress.contains_key(&id));
+        let operation = OperationCore::new(core.id());
+        core.bind_operation_core(&operation);
+        assert_eq!(operation.snapshot().resources, Some(ResourceProgress::Cleaning));
 
         let report = ResourceScopeReport {
             resources: Arc::from([]),
@@ -1719,6 +1727,7 @@ mod lifecycle_tests {
         assert!(!state.active_resource_scopes.contains_key(&id));
         assert!(!state.resource_progress.contains_key(&id));
         drop(state);
+        assert_eq!(operation.snapshot().resources, None);
         core.record_resource_progress(id, ResourceProgress::Unconfirmed);
         assert!(!lock(&core.state).resource_progress.contains_key(&id));
     }
