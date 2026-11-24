@@ -526,11 +526,19 @@ mod tests {
     use crate::v02::resource::recovery::RecoveryCore;
     use crate::v02::resource::recovery::RecoveryHandle;
 
+    struct PanicOnDrop;
+
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("panic payload drop");
+        }
+    }
+
     struct PanickingWake;
 
     impl Wake for PanickingWake {
         fn wake(self: std::sync::Arc<Self>) {
-            panic!("observer waker failed");
+            std::panic::panic_any(PanicOnDrop);
         }
     }
 
@@ -569,7 +577,18 @@ mod tests {
             }
         }));
         let (report_sender, report_receiver) = mpsc::channel();
-        completion.set_callback(Box::new(move |report| report_sender.send(report).unwrap()));
+        let reports = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed_reports = std::sync::Arc::clone(&reports);
+        completion.set_callback(Box::new(move |report| {
+            observed_reports.fetch_add(1, Ordering::SeqCst);
+            report_sender.send(report).unwrap();
+        }));
+        let registrations = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed_registrations = std::sync::Arc::clone(&registrations);
+        completion.set_recovery_callback(std::sync::Arc::new(move |_, present| {
+            assert!(present);
+            observed_registrations.fetch_add(1, Ordering::SeqCst);
+        }));
         completion.seal(1);
 
         let id = ResourceId::new(ManagerId::new_unique(), 1, 1);
@@ -601,6 +620,12 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(reports.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            report_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]
