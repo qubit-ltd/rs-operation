@@ -323,9 +323,13 @@ impl ScopeCompletion {
             }));
             callback(handle, true);
             if publish_recovery {
-                self.advance_progress(ResourceProgress::Unconfirmed);
+                // Registration returned successfully, so ledger publication
+                // is complete. Update readiness and progress atomically, then
+                // notify observers outside the state lock.
+                self.release_recovery_publication_and_advance_progress();
+            } else {
+                self.release_recovery_publication();
             }
-            self.release_recovery_publication();
         } else if publish_recovery {
             self.advance_progress(ResourceProgress::Unconfirmed);
         }
@@ -376,6 +380,25 @@ impl ScopeCompletion {
     fn release_recovery_publication(&self) {
         let mut state = lock(&self.state);
         state.pending_recovery_publications = state.pending_recovery_publications.saturating_sub(1);
+    }
+
+    /// Releases a registered recovery publication and records its progress
+    /// phase in one state transition, then notifies the observer outside lock.
+    fn release_recovery_publication_and_advance_progress(&self) {
+        let callback = {
+            let mut state = lock(&self.state);
+            state.pending_recovery_publications = state.pending_recovery_publications.saturating_sub(1);
+            if progress_rank(ResourceProgress::Unconfirmed) > progress_rank(state.progress) {
+                state.progress = ResourceProgress::Unconfirmed;
+            }
+            state
+                .progress_callback
+                .as_ref()
+                .map(|callback| (Arc::clone(callback), state.progress))
+        };
+        if let Some((callback, progress)) = callback {
+            callback(progress);
+        }
     }
 
     /// Publishes the final report when all owners and recovery observers are
@@ -482,12 +505,17 @@ fn progress_rank(progress: ResourceProgress) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::sync::Condvar;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Wake;
+    use std::task::Waker;
     use std::time::Duration;
 
     use super::ScopeCompletion;
@@ -497,6 +525,83 @@ mod tests {
     use crate::v02::report::ResourceProgress;
     use crate::v02::resource::recovery::RecoveryCore;
     use crate::v02::resource::recovery::RecoveryHandle;
+
+    struct PanickingWake;
+
+    impl Wake for PanickingWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            panic!("observer waker failed");
+        }
+    }
+
+    struct CountingWake(std::sync::Arc<AtomicUsize>);
+
+    impl Wake for CountingWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_progress_waker_panic_does_not_block_recovery_publication() {
+        let completion = ScopeCompletion::new();
+        let notify = std::sync::Arc::new(crate::v02::internal::notify::Notify::new());
+        let observed_wakes = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut panicking = Box::pin(notify.notified());
+        let panicking_waker = Waker::from(std::sync::Arc::new(PanickingWake));
+        assert!(matches!(
+            panicking.as_mut().poll(&mut Context::from_waker(&panicking_waker)),
+            Poll::Pending
+        ));
+        let mut observing = Box::pin(notify.notified());
+        let observing_waker = Waker::from(std::sync::Arc::new(CountingWake(std::sync::Arc::clone(
+            &observed_wakes,
+        ))));
+        assert!(matches!(
+            observing.as_mut().poll(&mut Context::from_waker(&observing_waker)),
+            Poll::Pending
+        ));
+
+        let progress_notify = std::sync::Arc::clone(&notify);
+        completion.set_progress_callback(std::sync::Arc::new(move |progress| {
+            if progress == ResourceProgress::Unconfirmed {
+                progress_notify.notify_waiters();
+            }
+        }));
+        let (report_sender, report_receiver) = mpsc::channel();
+        completion.set_callback(Box::new(move |report| report_sender.send(report).unwrap()));
+        completion.seal(1);
+
+        let id = ResourceId::new(ManagerId::new_unique(), 1, 1);
+        let recovery = RecoveryHandle::new(std::sync::Arc::new(RecoveryCore::new_unconfirmed(
+            vec![id],
+            std::sync::Arc::new(()),
+        )));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            completion.complete(
+                id,
+                None,
+                Some(crate::v02::report::CleanupFailure {
+                    resource_id: id,
+                    stage: crate::v02::report::CleanupStage::Drop,
+                    summary: crate::v02::report::DiagnosticSummary::new("cleanup failed"),
+                    source: None,
+                }),
+                Some(recovery),
+            );
+        }));
+
+        assert!(result.is_ok(), "observer panic escaped recovery publication");
+        assert_eq!(observed_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            report_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .recoveries
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn test_callback_installed_after_empty_scope_seal_runs_immediately() {

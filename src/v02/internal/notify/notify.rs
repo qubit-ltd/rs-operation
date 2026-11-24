@@ -6,6 +6,8 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 
+use std::panic;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use super::Inner;
@@ -69,7 +71,9 @@ impl Notify {
         };
         self.inner.changed.notify_all();
         for waker in wakers {
-            waker.wake();
+            // A task waker is user supplied code. One misbehaving observer
+            // must not prevent the remaining waiters from being notified.
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| waker.wake()));
         }
     }
 

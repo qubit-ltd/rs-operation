@@ -6,16 +6,23 @@
 //    Licensed under the Apache License, Version 2.0.
 // =============================================================================
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
+use std::task::Wake;
+use std::task::Waker;
 use std::time::Duration;
 
 use qubit_operation::AsyncCleanup;
 use qubit_operation::CleanupContext;
 use qubit_operation::CleanupFuture;
 use qubit_operation::CleanupOutcome;
+use qubit_operation::GroupOptions;
 use qubit_operation::ManagerOptions;
+use qubit_operation::OperationGroup;
 use qubit_operation::OperationManager;
 use qubit_operation::OperationOptions;
 use qubit_operation::OperationOutcome;
@@ -44,6 +51,39 @@ struct ChildPayload {
 }
 struct GatedCleanup(crate::support::Gate);
 
+struct GatedFailCleanup(crate::support::Gate);
+
+impl AsyncCleanup<usize> for GatedFailCleanup {
+    fn cleanup(self: Arc<Self>, _resource: usize, _context: CleanupContext) -> CleanupFuture<usize> {
+        let gate = self.0.clone();
+        Box::pin(async move {
+            gate.wait().await;
+            panic!("gated cleanup failed");
+        })
+    }
+}
+
+struct PanicAfterLedgerWake {
+    group: OperationGroup,
+    ledger_seen: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Wake for PanicAfterLedgerWake {
+    fn wake(self: Arc<Self>) {
+        self.ledger_seen
+            .store(!self.group.recovery_handles_snapshot().is_empty(), Ordering::SeqCst);
+        panic!("public observer waker failed");
+    }
+}
+
+struct CountWake(Arc<AtomicUsize>);
+
+impl Wake for CountWake {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 impl AsyncCleanup<ChildPayload> for GatedCleanup {
     fn cleanup(self: Arc<Self>, resource: ChildPayload, _context: CleanupContext) -> CleanupFuture<ChildPayload> {
         let gate = self.0.clone();
@@ -67,6 +107,61 @@ impl AsyncCleanup<usize> for GatedCleanup {
 }
 
 mod support;
+
+#[test]
+fn test_public_settlement_observers_survive_unconfirmed_progress_waker_panic() {
+    let manager = OperationManager::new(ManagerOptions::default()).unwrap();
+    let group = manager.group(GroupOptions { capacity: 1 }).unwrap();
+    let gate = crate::support::Gate::new();
+    let cleanup_gate = gate.clone();
+    let mut operation = group
+        .try_submit(OperationOptions::default(), move |scope| {
+            let resources = scope.resource_scope(ResourceScopeOptions { capacity: 1 }).unwrap();
+            let resource = resources
+                .manage_with(7usize, Arc::new(GatedFailCleanup(cleanup_gate)))
+                .unwrap();
+            drop(resource);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+    let observer = operation.observer().as_async();
+    assert!(matches!(
+        operation.wait_outcome().unwrap(),
+        OperationOutcome::Succeeded(())
+    ));
+    gate.wait_started();
+
+    let ledger_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let panic_waker = Waker::from(Arc::new(PanicAfterLedgerWake {
+        group: group.clone(),
+        ledger_seen: Arc::clone(&ledger_seen),
+    }));
+    let regular_wakes = Arc::new(AtomicUsize::new(0));
+    let regular_waker = Waker::from(Arc::new(CountWake(Arc::clone(&regular_wakes))));
+    let mut panicking_wait = Box::pin(observer.wait_settlement());
+    let mut regular_wait = Box::pin(observer.wait_settlement());
+    assert!(matches!(
+        panicking_wait.as_mut().poll(&mut Context::from_waker(&panic_waker)),
+        Poll::Pending
+    ));
+    assert!(matches!(
+        regular_wait.as_mut().poll(&mut Context::from_waker(&regular_waker)),
+        Poll::Pending
+    ));
+
+    gate.release();
+    let settlement = observer.as_sync().wait_settlement_for(Duration::from_secs(5)).unwrap();
+    assert!(matches!(settlement, SettlementWait::Ready(_)));
+    assert!(
+        ledger_seen.load(Ordering::SeqCst),
+        "recovery was not in the group ledger before observer notification"
+    );
+    assert!(
+        regular_wakes.load(Ordering::SeqCst) > 0,
+        "the non-panicking observer was not woken"
+    );
+    assert_eq!(group.recovery_handles_snapshot().len(), 1);
+}
 
 #[test]
 fn test_open_zero_can_get_again_then_settle_releases_once() {
