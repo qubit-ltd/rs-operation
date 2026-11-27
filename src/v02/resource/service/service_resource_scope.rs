@@ -7,8 +7,10 @@
 // =============================================================================
 
 use super::super::ManageResourceError;
+use super::super::ResourceCapacityError;
 use super::super::ResourceKey;
 use super::super::ResourceRef;
+use super::super::ResourceReservation;
 use super::super::ResourceScope;
 use crate::v02::report::ResourceLookupError;
 
@@ -53,6 +55,23 @@ impl ServiceResourceScope {
     #[inline]
     pub(crate) fn new(resources: ResourceScope) -> Self {
         Self { resources }
+    }
+
+    /// Reserves service resource and cleanup capacity before creating a value.
+    ///
+    /// # Returns
+    ///
+    /// A reservation that can be committed with the value after creation.
+    /// Dropping the unused reservation returns both permits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceCapacityError::ScopeEnded`] if the scope is closed,
+    /// or [`ResourceCapacityError::CapacityExceeded`] if resource or cleanup
+    /// capacity cannot be reserved.
+    #[inline]
+    pub fn reserve_resource(&self) -> Result<ResourceReservation, ResourceCapacityError> {
+        self.resources.reserve_resource()
     }
 
     /// Admits a value and returns a strong handle to the managed resource.
